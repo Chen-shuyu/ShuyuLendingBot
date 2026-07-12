@@ -7,19 +7,33 @@ on:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted, linux, shuyulendingbot]
     steps:
       - name: 取出程式碼
         uses: actions/checkout@v4
 
-      - name: 建立 Docker 映像
-        run: docker compose build
+      - name: 建立 Podman 映像
+        run: |
+          podman build -t shuyulendingbot .
 
-      - name: 啟動容器服務
-        run: docker compose up -d
+      - name: 停止並移除舊容器
+        run: |
+          if podman container exists bfx-lending-bot; then
+            podman stop bfx-lending-bot || true
+            podman rm bfx-lending-bot || true
+          fi
+
+      - name: 啟動 Podman 容器
+        run: |
+          podman run -d \
+            --name bfx-lending-bot \
+            -e BFX_SECRETS_FILE=/run/secrets/secrets.env \
+            -v /home/shuyu/.config/bfx-lending-bot:/run/secrets:ro \
+            -v /home/shuyu/.config/bfx-lending-bot/logs:/app/logs \
+            shuyulendingbot
 
       - name: 檢查容器狀態
-        run: docker compose ps
+        run: podman ps --filter "name=bfx-lending-bot"
 
       - name: 取得最近容器日誌
-        run: docker compose logs --tail=100
+        run: podman logs --tail=100 bfx-lending-bot

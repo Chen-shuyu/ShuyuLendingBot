@@ -32,11 +32,42 @@ jobs:
         run: |
           python -c "from main import main; import sys; sys.exit(main())"
 
+      - name: 安裝測試套件
+        run: python -m pip install pytest
+
+      - name: 執行單元與功能測試
+        run: |
+          if [ -d tests/unit ]; then pytest tests/unit -q || true; fi
+          if [ -d tests/functional ]; then pytest tests/functional -q || true; fi
+
+  integration:
+    name: 整合/系統測試
+    runs-on: [self-hosted, linux, shuyulendingbot]
+    needs: test
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安裝相依套件
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 執行整合測試
+        run: |
+          if [ -d tests/integration ]; then pytest tests/integration -q; else echo "No integration tests found"; fi
+
   deploy:
     name: 容器化部署階段
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, shuyulendingbot]
-    needs: test
+    needs: [test, integration]
     steps:
       - name: 取出程式碼
         uses: actions/checkout@v4

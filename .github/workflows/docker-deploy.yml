@@ -1,0 +1,25 @@
+name: 容器化部署驗證
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+
+      - name: 建立 Docker 映像
+        run: docker compose build
+
+      - name: 啟動容器服務
+        run: docker compose up -d
+
+      - name: 檢查容器狀態
+        run: docker compose ps
+
+      - name: 取得最近容器日誌
+        run: docker compose logs --tail=100

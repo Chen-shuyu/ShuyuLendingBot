@@ -1,13 +1,15 @@
-name: 持續整合
+name: 持續整合與部署
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   test:
+    name: 測試階段
     runs-on: ubuntu-latest
     steps:
       - name: 取出程式碼
@@ -29,3 +31,38 @@ jobs:
       - name: 執行 smoke test
         run: |
           python -c "from main import main; import sys; sys.exit(main())"
+
+  deploy:
+    name: 容器化部署階段
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, shuyulendingbot]
+    needs: test
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+
+      - name: 建立 Podman 映像
+        run: |
+          podman build -t ShuyuLendingBot .
+
+      - name: 停止並移除舊容器
+        run: |
+          if podman container exists ShuyuLendingBot; then
+            podman stop ShuyuLendingBot || true
+            podman rm ShuyuLendingBot || true
+          fi
+
+      - name: 啟動 Podman 容器
+        run: |
+          podman run -d \
+            --name ShuyuLendingBot \
+            -e BFX_SECRETS_FILE=/run/secrets/secrets.env \
+            -v /workspace/deploy/active-bots/ShuyuLendingBot:/run/secrets:ro \
+            -v /workspace/deploy/active-bots/ShuyuLendingBot/logs:/app/logs \
+            ShuyuLendingBot
+
+      - name: 檢查容器狀態
+        run: podman ps --filter "name=ShuyuLendingBot"
+
+      - name: 取得最近容器日誌
+        run: podman logs --tail=100 ShuyuLendingBot

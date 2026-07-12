@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  bfx-lending-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bfx-lending-bot
+    environment:
+      BFX_SECRETS_FILE: /run/secrets/secrets.env
+    volumes:
+      - /home/shuyu/.config/bfx-lending-bot:/run/secrets:ro
+      - /home/shuyu/.config/bfx-lending-bot/logs:/app/logs
+    restart: unless-stopped

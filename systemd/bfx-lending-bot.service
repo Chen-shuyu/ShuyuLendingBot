@@ -1,0 +1,19 @@
+[Unit]
+Description=Bitfinex Lending Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shuyu
+WorkingDirectory=/workspace/projects/LendingBot/ShuyuLendingBot
+Environment=PYTHONUNBUFFERED=1
+Environment=BFX_SECRETS_FILE=/home/shuyu/.config/bfx-lending-bot/secrets.env
+ExecStart=/usr/bin/bash /workspace/projects/LendingBot/ShuyuLendingBot/start.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/shuyu/.config/bfx-lending-bot/bfx-lending-bot.log
+StandardError=append:/home/shuyu/.config/bfx-lending-bot/bfx-lending-bot.log
+
+[Install]
+WantedBy=multi-user.target

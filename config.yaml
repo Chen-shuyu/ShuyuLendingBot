@@ -1,0 +1,26 @@
+# 這是專案設定範本檔案。
+# 真正的敏感資訊請寫在 secrets.env，並由程式自動載入。
+
+bitfinex:
+  api_key: ""
+  api_secret: ""
+  dry_run_balance_usd: 344.12
+  dry_run_frr: 0.0002
+
+strategy:
+  min_required_usd: 150
+  split_threshold_usd: 300
+  short_duration: 2
+  long_duration: 30
+  premium_rate: 0.0002
+  minimum_rate: 0.0001
+  long_duration_threshold: 0.00082
+
+logging:
+  level: INFO
+  file: logs/bfx_lending_bot.log
+
+line:
+  enabled: false
+  token: ""
+  channel: ""

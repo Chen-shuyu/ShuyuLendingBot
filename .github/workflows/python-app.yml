@@ -53,7 +53,7 @@ jobs:
       - name: 設定 Python 環境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.13'
 
       - name: 安裝相依套件
         run: |

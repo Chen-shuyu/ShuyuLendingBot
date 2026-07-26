@@ -19,8 +19,14 @@ from utils.exceptions import FatalError, RetryableError, SkipCycleError
 from utils.logger import BotLogger
 
 
-def run_once(logger, notifier, strategy, client) -> None:
-    """執行一輪巡檢流程：查餘額與 FRR、產生掛單計畫、掛單、送出通知。"""
+def run_once(logger, notifier, strategy, client, cancel_settle_seconds: int = 3) -> None:
+    """執行一輪巡檢流程：取消舊掛單、查餘額與 FRR、產生掛單計畫、掛單、送出通知。"""
+    cancelled = client.cancel_active_offers("USD")
+    if cancelled:
+        # Bitfinex 取消掛單是非同步處理，回應成功不代表餘額已釋放；
+        # 這裡稍等一下再查餘額，避免用到舊餘額把掛單金額算少。
+        time.sleep(cancel_settle_seconds)
+
     balance_usd = client.get_available_balance("USD")
     frr = client.get_frr("USD")
     logger.info(f"目前可用 USD 餘額：{balance_usd}")
@@ -31,7 +37,7 @@ def run_once(logger, notifier, strategy, client) -> None:
 
     plans = strategy.build_offer_plan(balance_usd, frr)
     if not plans:
-        raise SkipCycleError("餘額低於最低放貸門檻，跳過本輪")
+        raise SkipCycleError("可放貸金額低於最低門檻或單筆最小量，跳過本輪")
 
     for plan in plans:
         logger.info(
@@ -58,6 +64,7 @@ def main() -> int:
     engine_config = config.get("engine", {})
     dry_run = bool(engine_config.get("dry_run", True))
     interval_seconds = int(engine_config.get("interval_seconds", 600))
+    cancel_settle_seconds = int(engine_config.get("cancel_settle_seconds", 3))
 
     client = BitfinexClient(config, logger, dry_run=dry_run)
 
@@ -70,7 +77,7 @@ def main() -> int:
     try:
         while True:
             try:
-                run_once(logger, notifier, strategy, client)
+                run_once(logger, notifier, strategy, client, cancel_settle_seconds)
             except SkipCycleError as exc:
                 logger.info(f"本輪略過：{exc}")
             except RetryableError as exc:

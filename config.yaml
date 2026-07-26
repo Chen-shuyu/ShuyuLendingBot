@@ -8,17 +8,22 @@ bitfinex:
   dry_run_frr: 0.0002
 
 strategy:
-  min_required_usd: 150
-  split_threshold_usd: 300
+  min_required_usd: 150     # 餘額低於此值就整輪不掛單
+  min_loan_size_usd: 150    # Bitfinex 單筆放貸的最小金額，決定 spread 最多能拆幾筆
   short_duration: 2
   long_duration: 30
   premium_rate: 0.0002
   minimum_rate: 0.0001
   long_duration_threshold: 0.00082
+  spread_count: 3           # 利率階梯筆數；餘額不足時自動降階
+  spread_step_pct: 0.15     # 每往上一階，利率乘上 (1 + 此值)
+  max_to_lend_usd: 0        # 本輪掛單總額上限（絕對值），0 = 不限制
+  max_percent_to_lend: 0    # 本輪掛單總額上限（佔可用餘額的百分比，例如 70 表示 70%），0 = 不限制
 
 engine:
-  interval_seconds: 600   # 主迴圈巡檢間隔（秒）
-  dry_run: true           # 部署驗證用；正式上線前改 false
+  interval_seconds: 600     # 主迴圈巡檢間隔（秒）
+  dry_run: true             # 部署驗證用；正式上線前改 false
+  cancel_settle_seconds: 3  # 取消舊掛單後等待餘額釋放的秒數（Bitfinex 取消為非同步）
 
 logging:
   level: INFO

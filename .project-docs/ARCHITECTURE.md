@@ -2,8 +2,10 @@
 
 ## 整體架構
 
-單帳戶、單幣種（USD）的 Bitfinex Funding 放貸機器人。以 `ccxt.bitfinex2`（Bitfinex V2 API）
-為交易所適配層，策略層以純函式計算掛單利率/金額/天期，核心迴圈（`while True` + `time.sleep`）
+單帳戶、單幣種（USD）的 Bitfinex Funding 放貸機器人。以 `ccxt.bitfinex`（V1/V2 已合併，
+見 D009）為交易所適配層，Bitfinex funding 相關操作一律呼叫 ccxt 的 raw/implicit API，
+不使用（也不存在）統一方法（見 D010）。策略層以純函式計算掛單利率/金額/天期，
+核心迴圈（`while True` + `time.sleep`）
 每輪巡檢：取消未成交舊單 → 查詢可用餘額 → 抓 FRR → 產生掛單計畫 → 送出掛單 → 寫入 DB →
 LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007），崩潰由容器 restart 策略頂起。
 
@@ -27,7 +29,8 @@ LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007
 ShuyuLendingBot/
 ├── config/settings.py          # YAML + 環境變數 + secrets 載入（已可用）
 ├── modules/
-│   ├── exchange_client.py      # BitfinexClient：連線、餘額、FRR、掛單（FRR 抓取邏輯有誤）
+│   ├── exchange_client.py      # BitfinexClient：連線、餘額、FRR、取消掛單、建立掛單
+│   │                            # （皆已修正為呼叫 ccxt raw API，見 D009／D010）
 │   ├── lending_strategy.py     # LendingStrategy.build_offer_plan()：門檻/拆單/天期判斷骨架
 │   └── line_notifier.py        # LineNotifier：呼叫已停用的 LINE Notify（永遠失敗）
 ├── utils/logger.py             # BotLogger：FileHandler，無 rotation
@@ -65,17 +68,21 @@ ShuyuLendingBot/
 ## 主要模組
 
 - `config/settings.py`：讀取 `config.yaml`，以環境變數與 `BFX_SECRETS_FILE` 覆蓋敏感值。已可用。
-- `api/bitfinex_client.py`（現 `modules/exchange_client.py`）：封裝 `ccxt.bitfinex2`，提供
-  `test_connection`、`get_available_balance`、`get_frr`、`get_active_offers`、`cancel_offer`、
-  `create_loan_offer`。目前 `get_frr` 誤用 `fetch_funding_rate`（永續合約資金費率），需修正為
-  解析 `GET /v2/ticker/fUSD` 的 FRR 欄位。
+- `api/bitfinex_client.py`（現 `modules/exchange_client.py`）：封裝 `ccxt.bitfinex`，提供
+  `test_connection`、`get_available_balance`、`get_frr`、`cancel_active_offers`、
+  `create_loan_offer`。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
+  `private_post_auth_r_funding_offers_symbol`／`private_post_auth_w_funding_offer_cancel`／
+  `private_post_auth_w_funding_offer_submit`），詳細盤點見
+  `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（D009／D010）。尚待：所有實盤呼叫都還沒
+  包上 `with_retry` 指數退避（見 TASKS.md M3）。
 - `api/rate_limiter.py`（尚未建立）：`with_retry` decorator，包住所有實盤 API 呼叫，捕捉
   `ccxt.RateLimitExceeded` / `ccxt.NetworkError`，指數退避重試。
-- `strategies/frr_plus.py`（現 `modules/lending_strategy.py`）：FRR+ 雙發彈夾策略純函式，
-  輸入餘額與 FRR，輸出 `OfferPlan` 清單。目前僅有門檻判斷 + 拆單 + 天期判斷，尚缺「只補掛差額」、
-  spread 多階梯、`maxtolend` 風控。
-- `core/bot_engine.py`（尚未建立，現由 `main.py` 承擔單次流程）：`run_once` 單輪巡檢、
-  `run_forever` 主迴圈；分類處理 `RetryableError` / `FatalError` / `SkipCycleError`。
+- `strategies/frr_plus.py`（現 `modules/lending_strategy.py`）：FRR+ 策略純函式，輸入餘額與
+  FRR，輸出 `OfferPlan` 清單。已含 `maxtolend` 縮量、spread 百分比遞增階梯、依單筆最小量
+  自動降階、逐筆判斷天期（D011）。尚待：`maxtolend` 只管本輪掛出總額，未計入已放貸部位。
+- `core/bot_engine.py`（尚未建立，現由 `main.py` 承擔）：`run_once` 單輪巡檢，順序為
+  取消舊掛單 → 等待餘額釋放 → 查餘額 → 抓 FRR → 產生掛單計畫 → 逐筆掛單 → 通知；
+  `run_forever` 主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`。
 - `db/repository.py`（尚未建立）：SQLite WAL 模式，記錄掛單流水、每日收益彙總、`bot_state`。
 - `notify/line_messaging.py`（現 `modules/line_notifier.py`）：目前呼叫已停用的 LINE Notify
   端點（`notify-api.line.me`），需改寫為 LINE Messaging API push
@@ -91,7 +98,9 @@ ShuyuLendingBot/
 
 ## 關鍵技術選型
 
-- 交易所串接：`ccxt.bitfinex2`（Bitfinex V2 API），取代舊專案的 V1 API —— 見 DECISIONS D001。
+- 交易所串接：`ccxt.bitfinex`（V1/V2 已合併），取代舊專案的獨立 V1 API —— 見 DECISIONS D001、D009。
+- API 呼叫方式：Bitfinex funding 相關操作一律呼叫 ccxt 的 raw/implicit API，不使用（也不存在）
+  統一方法 —— 見 DECISIONS D010。
 - 併發模型：單執行緒 + `time.sleep` 主迴圈，不引入 `asyncio` —— 見 DECISIONS D003。
 - 通知：LINE Messaging API push，取代已停用的 LINE Notify —— 見 DECISIONS D002。
 - 持久化：SQLite（WAL 模式），非外部 DB —— 見 DECISIONS D006。

@@ -55,7 +55,7 @@ jobs:
           if not client.test_connection():
               sys.exit(1)
 
-          run_once(logger, notifier, strategy, client)
+          run_once(logger, notifier, strategy, client, cancel_settle_seconds=0)
           print("smoke test ok")
           PY
 

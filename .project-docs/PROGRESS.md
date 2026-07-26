@@ -80,3 +80,33 @@
 - 下一步：M2 剩餘項目——策略層補「只補掛差額」、多筆階梯利率（spread）、`maxtolend` 風控上限；
   另注意調查過程中發現 `cancel_active_offers()` 目前未被 `main.py` 呼叫，補「只補掛差額」邏輯
   時要一併決定何時呼叫
+
+### 本次（M2 收尾：掛單更新機制、spread、maxtolend，分支 `fix/m1-frr-and-loop`）
+- 釐清：原需求「只補掛差額，避免重複掛出已成交部分」的前提有誤——Bitfinex funding 錢包的
+  `free` 本來就已扣除掛單中與已放貸出去的金額，`get_available_balance()` 取的正是 `free`，
+  所以「重複掛出已成交部分」不會發生。實質問題是**未成交舊掛單的利率會落後市場**，
+  資金卡在不可能成交的單子上空轉
+- 完成：與使用者討論三項設計細節後定案（記錄為 DECISIONS.md D011）：
+  掛單更新採「每輪全取消重掛」（非混合式偏離判斷）、spread 用百分比遞增（非固定增量）、
+  maxtolend 先做單輪量控版（不查已放貸部位）
+- 完成：`main.py` 的 `run_once()` 流程改為 cancel → settle 等待 → balance → frr → plan →
+  offer → notify，`cancel_active_offers()` 從此真正被主迴圈呼叫；新增
+  `engine.cancel_settle_seconds`（預設 3 秒，僅在真的取消到掛單時才等待），因為 Bitfinex
+  取消掛單是非同步的，回應 SUCCESS 不代表餘額已釋放
+- 完成：`modules/lending_strategy.py` 的 `build_offer_plan()` 重寫，拆出四個私有方法——
+  `_apply_lend_limit()`（maxtolend 縮量）、`_resolve_spread_count()`（依單筆最小量自動降階）、
+  `_split_amount()`（均分、向下取到分位避免超額、餘數併入最容易成交的第一筆）、
+  `_resolve_duration()`（逐筆判斷天期，高階鎖 30 天、低階維持 2 天）
+- 完成：`config.yaml` 新增 `min_loan_size_usd`／`spread_count`／`spread_step_pct`／
+  `max_to_lend_usd`／`max_percent_to_lend`／`engine.cancel_settle_seconds`；移除
+  `split_threshold_usd`（原「超過 300 才拆單」的語意已被 spread 自動降階規則等價涵蓋）
+- 驗證：`py_compile` 通過；策略層 11 項情境全部通過（餘額低於門檻不掛單、餘額剛好等於門檻
+  視為可掛單、344.12 自動從 3 筆降為 2 筆、餘數正確併入第一筆、高階利率突破暴利閾值時天期
+  分歧為 [2, 2, 30]、FRR 近乎 0 時底價被 `minimum_rate` 墊住、兩種 maxtolend 上限各自縮量
+  與並存時取較嚴格者、上限壓到低於單筆最小量時不掛單、`spread_count=1` 退回單筆全下）；
+  `run_once()` 取消重掛流程 4 項情境通過（呼叫順序正確、無舊掛單時不等待、取消後餘額不足
+  時跳過本輪且不掛任何單、settle 秒數可設 0）；以 `interval_seconds: 1` 實跑 `main.py`
+  確認多輪常駐正常；CI smoke test 同一段程式碼本地重跑通過
+- 下一步：**M2 已全數完成**，進入 M3（資料與可觀測）——建立 `db/`（SQLite WAL，記錄
+  `loan_offers`／`earnings_daily`／`bot_state`）、`logger` 改 `RotatingFileHandler`、
+  建立 `api/rate_limiter.py` 的 `with_retry` 指數退避、補 heartbeat 與連續失敗告警

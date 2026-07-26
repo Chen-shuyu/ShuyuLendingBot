@@ -25,9 +25,15 @@
 - [x] `create_loan_offer()` 改走 raw API（`private_post_auth_w_funding_offer_submit`，
       `type="LIMIT"`），原本檢查的 `create_funding_offer`/`createFundingOffer` 在 ccxt
       裡從未存在過，實盤模式下必定失敗（2026-07-26，見 DECISIONS.md D010）
-- [ ] 策略層補「只補掛差額」，避免重複掛出已成交部分
-- [ ] 策略層補多筆階梯利率（spread），對應 MikaLendingBot 的 `spreadlend` 完整版
-- [ ] 補 `maxtolend` / `maxpercenttolend` 風控上限檢查
+- [x] 掛單更新機制：改為「每輪全取消重掛」，`run_once()` 補上 `cancel_active_offers()`
+      呼叫與 `cancel_settle_seconds` 等待。原需求寫的「只補掛差額」前提有誤（funding 錢包
+      的 `free` 本來就已扣除掛單與已放貸金額），實質問題是舊掛單利率落後市場
+      （2026-07-26，見 DECISIONS.md D011）
+- [x] 策略層補多筆階梯利率（spread）：百分比遞增（`spread_step_pct`）、金額均分、餘數併入
+      第一筆、筆數依 `min_loan_size_usd` 自動降階、每筆各自判斷天期
+      （2026-07-26，見 DECISIONS.md D011）
+- [x] 補 `maxtolend` / `maxpercenttolend` 風控上限檢查（單輪量控版，觸及上限縮量掛；
+      預設 0 = 不限制）（2026-07-26，見 DECISIONS.md D011）
 
 ### M3：資料與可觀測
 - [ ] 建立 `db/`（`models.py` + `repository.py`），SQLite WAL 模式，記錄
@@ -38,6 +44,10 @@
 - [ ] 建立 `api/rate_limiter.py`：`with_retry` decorator，指數退避重試，捕捉
       `ccxt.RateLimitExceeded` / `ccxt.NetworkError`
 - [ ] 補 heartbeat（每輪成功巡檢送出）與連續 N 次失敗告警
+- [ ] 評估把 `maxtolend` 從「單輪量控版」升級為「含已放貸的真實總曝險版」：需每輪查詢
+      `private_post_auth_r_funding_credits_symbol`（已被借走）與
+      `private_post_auth_r_funding_loans_symbol`（已出借未被借走），這兩份查詢結果 DB 也用得到
+      （2026-07-26 決定延後，見 DECISIONS.md D011）
 
 ### M4：架構重構、測試與部署
 - [ ] 依 ARCHITECTURE.md 完成目錄搬遷：

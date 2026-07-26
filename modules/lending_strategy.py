@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """放貸策略邏輯。
 
-這個模組負責將市場資訊與餘額轉換為一組掛單計畫，
-目前先實作簡單的門檻判斷與拆單邏輯，後續可再擴充為更複雜的策略。
+這個模組負責將市場資訊與餘額轉換為一組掛單計畫：先套用 maxtolend 風控上限縮減
+可放貸金額，再依 spread 設定把金額拆成多筆、利率逐階遞增的掛單，最後對每一筆
+單獨判斷天期（高利率鎖長天期、低利率保持靈活）。
 """
 
+import math
 from dataclasses import dataclass
 from typing import List
 
@@ -18,33 +20,78 @@ class OfferPlan:
 
 
 class LendingStrategy:
-    """依照 PRD 初版策略，產生掛單計畫。"""
+    """FRR+ 策略：動態利率底線 + spread 階梯拆單 + xDays 動態天期 + maxtolend 風控。"""
 
     def __init__(self, config):
         strategy_config = config.get("strategy", {})
-        self.min_required_usd = strategy_config.get("min_required_usd", 150)
-        self.split_threshold_usd = strategy_config.get("split_threshold_usd", 300)
-        self.short_duration = strategy_config.get("short_duration", 2)
-        self.long_duration = strategy_config.get("long_duration", 30)
-        self.premium_rate = strategy_config.get("premium_rate", 0.0002)
-        self.minimum_rate = strategy_config.get("minimum_rate", 0.0001)
-        self.long_duration_threshold = strategy_config.get("long_duration_threshold", 0.00082)
+        self.min_required_usd = float(strategy_config.get("min_required_usd", 150))
+        self.min_loan_size_usd = float(strategy_config.get("min_loan_size_usd", 150))
+        self.short_duration = int(strategy_config.get("short_duration", 2))
+        self.long_duration = int(strategy_config.get("long_duration", 30))
+        self.premium_rate = float(strategy_config.get("premium_rate", 0.0002))
+        self.minimum_rate = float(strategy_config.get("minimum_rate", 0.0001))
+        self.long_duration_threshold = float(strategy_config.get("long_duration_threshold", 0.00082))
+        self.spread_count = int(strategy_config.get("spread_count", 3))
+        self.spread_step_pct = float(strategy_config.get("spread_step_pct", 0.15))
+        self.max_to_lend_usd = float(strategy_config.get("max_to_lend_usd", 0))
+        self.max_percent_to_lend = float(strategy_config.get("max_percent_to_lend", 0))
 
     def build_offer_plan(self, balance_usd: float, frr: float) -> List[OfferPlan]:
         """依據目前餘額與 FRR，產生一組掛單方案。"""
         if balance_usd < self.min_required_usd:
             return []
 
-        target_rate = max(frr + self.premium_rate, self.minimum_rate)
-        duration = self.short_duration
-        if target_rate >= self.long_duration_threshold:
-            duration = self.long_duration
+        lendable_usd = self._apply_lend_limit(balance_usd)
+        if lendable_usd < self.min_loan_size_usd:
+            return []
 
-        if balance_usd >= self.split_threshold_usd:
-            amount = round(balance_usd / 2, 2)
-            return [
-                OfferPlan(currency="USD", amount=amount, rate=target_rate, duration=duration),
-                OfferPlan(currency="USD", amount=amount, rate=target_rate, duration=duration),
-            ]
+        base_rate = max(frr + self.premium_rate, self.minimum_rate)
+        count = self._resolve_spread_count(lendable_usd)
+        amounts = self._split_amount(lendable_usd, count)
 
-        return [OfferPlan(currency="USD", amount=round(balance_usd, 2), rate=target_rate, duration=duration)]
+        plans: List[OfferPlan] = []
+        for index, amount in enumerate(amounts):
+            rate = round(base_rate * (1 + self.spread_step_pct) ** index, 6)
+            plans.append(
+                OfferPlan(
+                    currency="USD",
+                    amount=amount,
+                    rate=rate,
+                    duration=self._resolve_duration(rate),
+                )
+            )
+        return plans
+
+    def _apply_lend_limit(self, balance_usd: float) -> float:
+        """套用 maxtolend / maxpercenttolend 上限，回傳本輪實際可掛出的總金額。"""
+        limits = []
+        if self.max_to_lend_usd > 0:
+            limits.append(self.max_to_lend_usd)
+        if self.max_percent_to_lend > 0:
+            limits.append(balance_usd * self.max_percent_to_lend / 100)
+        if not limits:
+            return balance_usd
+        return min(balance_usd, min(limits))
+
+    def _resolve_spread_count(self, lendable_usd: float) -> int:
+        """決定實際能拆成幾筆：金額不足時逐階降回，確保每筆都達到交易所最小單量。"""
+        count = self.spread_count
+        while count > 1 and lendable_usd < count * self.min_loan_size_usd:
+            count -= 1
+        return count
+
+    def _split_amount(self, lendable_usd: float, count: int) -> List[float]:
+        """把總金額均分成 count 筆；除不盡的餘數併入利率最低、最容易成交的第一筆。"""
+        # 向下取到分位，確保各筆加總不會因四捨五入超過可用餘額而被交易所拒絕。
+        per_offer = math.floor(lendable_usd / count * 100) / 100
+        amounts = [per_offer] * count
+        remainder = round(lendable_usd - per_offer * count, 2)
+        if remainder > 0:
+            amounts[0] = round(amounts[0] + remainder, 2)
+        return amounts
+
+    def _resolve_duration(self, rate: float) -> int:
+        """利率突破暴利閾值就鎖長天期，否則維持短天期保有資金靈活性。"""
+        if rate >= self.long_duration_threshold:
+            return self.long_duration
+        return self.short_duration

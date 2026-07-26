@@ -73,15 +73,16 @@ ShuyuLendingBot/
   `create_loan_offer`。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
   `private_post_auth_r_funding_offers_symbol`／`private_post_auth_w_funding_offer_cancel`／
   `private_post_auth_w_funding_offer_submit`），詳細盤點見
-  `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（D009／D010）。尚待：`cancel_active_offers`
-  目前未被主迴圈呼叫，`create_loan_offer` 尚無「只補掛差額」判斷（見 TASKS.md M2）。
+  `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（D009／D010）。尚待：所有實盤呼叫都還沒
+  包上 `with_retry` 指數退避（見 TASKS.md M3）。
 - `api/rate_limiter.py`（尚未建立）：`with_retry` decorator，包住所有實盤 API 呼叫，捕捉
   `ccxt.RateLimitExceeded` / `ccxt.NetworkError`，指數退避重試。
-- `strategies/frr_plus.py`（現 `modules/lending_strategy.py`）：FRR+ 雙發彈夾策略純函式，
-  輸入餘額與 FRR，輸出 `OfferPlan` 清單。目前僅有門檻判斷 + 拆單 + 天期判斷，尚缺「只補掛差額」、
-  spread 多階梯、`maxtolend` 風控。
-- `core/bot_engine.py`（尚未建立，現由 `main.py` 承擔單次流程）：`run_once` 單輪巡檢、
-  `run_forever` 主迴圈；分類處理 `RetryableError` / `FatalError` / `SkipCycleError`。
+- `strategies/frr_plus.py`（現 `modules/lending_strategy.py`）：FRR+ 策略純函式，輸入餘額與
+  FRR，輸出 `OfferPlan` 清單。已含 `maxtolend` 縮量、spread 百分比遞增階梯、依單筆最小量
+  自動降階、逐筆判斷天期（D011）。尚待：`maxtolend` 只管本輪掛出總額，未計入已放貸部位。
+- `core/bot_engine.py`（尚未建立，現由 `main.py` 承擔）：`run_once` 單輪巡檢，順序為
+  取消舊掛單 → 等待餘額釋放 → 查餘額 → 抓 FRR → 產生掛單計畫 → 逐筆掛單 → 通知；
+  `run_forever` 主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`。
 - `db/repository.py`（尚未建立）：SQLite WAL 模式，記錄掛單流水、每日收益彙總、`bot_state`。
 - `notify/line_messaging.py`（現 `modules/line_notifier.py`）：目前呼叫已停用的 LINE Notify
   端點（`notify-api.line.me`），需改寫為 LINE Messaging API push

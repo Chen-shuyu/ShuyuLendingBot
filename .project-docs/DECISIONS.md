@@ -159,3 +159,58 @@
   M2 其餘項目（差額補掛、spread、maxtolend）可繼續推進；日後任何新增的 Bitfinex funding
   相關操作，一律先查 `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md` 的官方端點清單，
   走 raw/implicit API，不嘗試尋找統一方法。
+
+## D011 — 掛單更新採「每輪全取消重掛」；spread 用百分比遞增；maxtolend 先做單輪量控版
+- 日期：2026-07-26
+- 背景釐清：原規劃書把這項需求寫成「只補掛差額，避免重複掛出已成交部分」，但該前提有誤——
+  Bitfinex funding 錢包的 `free`（可用餘額）本來就已扣除掛單中與已放貸出去的金額，
+  `get_available_balance()` 取的就是 `free`，因此「重複掛出已成交部分」的風險並不存在。
+  這項需求的實質問題是另一個：**未成交舊掛單的利率會落後市場**（掛 0.05% 的單子在市場
+  跌到 0.02% 後永遠不會成交，資金空轉）。決策即針對此問題。
+- 決策：
+  1. **掛單更新採「每輪全取消重掛」**（附錄 B.3 偽碼原本的做法，亦即 MikaLendingBot
+     `cancel_all()` + `lend_all()` 的模式）：每輪先取消所有未成交掛單，等餘額釋放後用全部
+     可用餘額重算掛單。`run_once()` 流程改為 cancel → settle 等待 → balance → frr →
+     plan → offer → notify。
+  2. **取消後等待餘額釋放再查餘額**：Bitfinex 取消掛單為非同步處理，回應 SUCCESS 只代表
+     請求被接受、不代表餘額已釋放，因此新增 `engine.cancel_settle_seconds`（預設 3 秒），
+     且僅在真的有取消到掛單時才等待。不自行把取消金額加回 `free` 計算，避免取消實際失敗
+     時超額掛單。
+  3. **spread 階梯利率採百分比遞增**：以 `max(frr + premium_rate, minimum_rate)` 為最低階，
+     每往上一階乘上 `(1 + spread_step_pct)`（預設 0.15），金額均分、除不盡的餘數併入利率
+     最低（最容易成交）的第一筆。不採 MikaLendingBot 的 order book 深度分析
+     （`get_gap_mode_rates`），因為那需要額外抓取整本掛單簿。
+  4. **spread 筆數自動降階**：Bitfinex 單筆放貸有最小金額限制（`min_loan_size_usd`，
+     USD 為 150），金額不足 `筆數 × 最小單量` 時逐階降回，最低降到 1 筆全下。
+  5. **每筆掛單各自判斷天期**：spread 各階利率不同，逐筆比對 `long_duration_threshold`，
+     突破暴利閾值的高階掛 30 天鎖住高利、未突破的低階仍掛 2 天保持靈活（同
+     MikaLendingBot `create_lend_offer()` 逐筆算 days 的做法）。
+  6. **maxtolend 先做單輪量控版**：`max_to_lend_usd`（絕對值）與 `max_percent_to_lend`
+     （佔可用餘額百分比，0~100），兩者皆設 0 = 不限制，同時設定時取較嚴格者；觸及上限時
+     **縮量掛到剛好到上限**，不整輪跳過（同 MikaLendingBot `amount_to_lend()`）。此版本
+     只管「本輪掛出去的總額」，不查詢 `/funding/credits`、`/funding/loans` 計算真實總曝險。
+  7. **移除 `strategy.split_threshold_usd`**：原本「餘額超過 300 才對半拆單」的語意，已被
+     spread 的自動降階規則（餘額不足 `筆數 × 150` 就降階）完全涵蓋且等價，不需要維護兩套
+     參數。
+- 原因：
+  - 選「全取消重掛」而非「偏離容忍值才重掛」的混合方案：巡檢間隔 10 分鐘、每輪僅數次 API
+    呼叫，遠低於 Bitfinex 每分鐘 90 次的速率限制，取消與重掛皆不收手續費，取消到重掛之間
+    的數秒空窗對收益影響可忽略——「代價」實質為零。混合方案省下的少量 API 呼叫，換來額外的
+    判斷邏輯與一個需要調校的容忍值參數，不划算。日後若真的觀察到問題再優化為混合方案。
+  - spread 選百分比遞增而非固定增量：固定增量（如每階 +0.00003）在市場低利時相對幅度過大
+    （底價 0.00015 時第三階比底價高 40%），高階根本不可能成交；百分比遞增可讓階梯隨利率
+    水準自動縮放。
+  - maxtolend 選單輪量控版：使用者目前錢包資金 100% 用於 USD 放貸、無其他用途，真實總曝險
+    版本每輪要多打兩個端點，而該功能對現階段並無實益；先把設定介面與縮量邏輯做好，日後要
+    升級成真實曝險版時只需替換基數來源。
+- 考慮過的替代方案：「純補差額」（不動舊掛單，只掛新增餘額）—— 放棄，因為利率落後的舊單會
+  永久卡住資金；「偏離容忍值才重掛」的混合方案 —— 放棄，理由見上；spread 固定增量 —— 放棄，
+  理由見上；maxtolend 含已放貸真實曝險版 —— 延後，待 M3 建好 DB 與部位查詢後再評估升級。
+- 影響範圍：`modules/lending_strategy.py`（`build_offer_plan()` 重寫，新增
+  `_apply_lend_limit()`／`_resolve_spread_count()`／`_split_amount()`／`_resolve_duration()`）、
+  `main.py`（`run_once()` 新增取消步驟與 `cancel_settle_seconds` 參數）、`config.yaml`
+  （新增 `min_loan_size_usd`／`spread_count`／`spread_step_pct`／`max_to_lend_usd`／
+  `max_percent_to_lend`／`engine.cancel_settle_seconds`，移除 `split_threshold_usd`）、
+  `.github/workflows/python-app.yml`（smoke test 的 `run_once()` 呼叫補
+  `cancel_settle_seconds=0`）。完成 M2 全部項目，`cancel_active_offers()` 從此被主迴圈呼叫，
+  解除 CHANGELOG「未被呼叫」的 Known Issue。

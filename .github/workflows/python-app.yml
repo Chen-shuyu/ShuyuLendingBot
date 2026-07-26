@@ -27,11 +27,37 @@ jobs:
           fi
 
       - name: 執行語法檢查
-        run: python -m py_compile main.py config/settings.py modules/exchange_client.py modules/lending_strategy.py modules/line_notifier.py utils/logger.py
+        run: python -m py_compile main.py config/settings.py modules/exchange_client.py modules/lending_strategy.py modules/line_notifier.py utils/logger.py utils/exceptions.py
 
       - name: 執行 smoke test
         run: |
-          python -c "from main import main; import sys; sys.exit(main())"
+          # main() 現在是常駐 while True 主迴圈，不會自己返回，
+          # 所以 smoke test 改成強制 dry-run 只跑一輪 run_once()。
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          from config.settings import load_config, load_secrets_from_disk, resolve_config_path
+          from main import run_once
+          from modules.exchange_client import BitfinexClient
+          from modules.lending_strategy import LendingStrategy
+          from modules.line_notifier import LineNotifier
+          from utils.logger import BotLogger
+
+          root = Path(".").resolve()
+          load_secrets_from_disk(root)
+          config = load_config(str(resolve_config_path(root)))
+          logger = BotLogger(config.get("logging", {}), config.get("logging", {}).get("file"))
+          notifier = LineNotifier(config.get("line", {}))
+          strategy = LendingStrategy(config)
+          client = BitfinexClient(config, logger, dry_run=True)
+
+          if not client.test_connection():
+              sys.exit(1)
+
+          run_once(logger, notifier, strategy, client)
+          print("smoke test ok")
+          PY
 
       - name: 安裝測試套件
         run: python -m pip install pytest

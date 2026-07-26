@@ -6,12 +6,14 @@
 ## 待處理（依優先級，對應 PLAN.md 的 M1～M4）
 
 ### M1：修正致命問題
-- [ ] 修正 `get_frr()`：改抓 Bitfinex V2 `GET /v2/ticker/fUSD` 的 FRR 欄位（目前用
+- [x] 修正 `get_frr()`：改抓 Bitfinex V2 `GET /v2/ticker/fUSD` 的 FRR 欄位（原本用
       `fetch_funding_rate` 讀到永續合約資金費率，數據錯誤，不是真正的放貸 FRR）
+      （2026-07-26，分支 `fix/m1-frr-and-loop`）
 - [ ] 通知模組改寫為 `notify/line_messaging.py`，走 LINE Messaging API push
       （取代已停用的 LINE Notify）—— **被下方使用者端待辦卡住，尚無法實測**
-- [ ] `main.py` 加入 `while True` 主迴圈 + `time.sleep(interval)` + 例外分類隔離
-      （`RetryableError` / `FatalError` / `SkipCycleError`）
+- [x] `main.py` 加入 `while True` 主迴圈 + `time.sleep(interval)` + 例外分類隔離
+      （`RetryableError` / `FatalError` / `SkipCycleError`，見 `utils/exceptions.py`）
+      （2026-07-26，分支 `fix/m1-frr-and-loop`）
 
 ### M2：補策略與風控
 - [ ] `cancel_active_offers()` 真正實作取消未成交掛單（`cancel_funding_offer`），
@@ -53,3 +55,8 @@
 - [x] CI workflow 骨架 `.github/workflows/python-app.yml`（test/integration/deploy 三個 job）
       （2026-07-14）
 - [x] `.project-docs/` 文件結構建立，舊規劃書內容分類歸位（2026-07-26）
+- [x] 修正 `ccxt.bitfinex2`（已於目前釘選的 ccxt 版本移除）改用 `ccxt.bitfinex`，並修正
+      `get_available_balance()` 未指定 `type: "funding"`、解析格式對不上新版 ccxt 統一
+      balance 結構的問題（意外發現，見 DECISIONS.md D009）（2026-07-26）
+- [x] 同步調整 CI smoke test：`main()` 已變成常駐迴圈不會自己返回，smoke test 改為呼叫
+      `run_once()` 跑單輪（2026-07-26）

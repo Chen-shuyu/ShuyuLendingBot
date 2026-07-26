@@ -3,33 +3,11 @@
 ## 進行中
 （無）
 
-## 🔴 下一步・最高優先（阻塞 M2 其餘項目與 M3／M4，先查完才能繼續）
+## 🔴 下一步・最高優先
 
-- [ ] **調查 ccxt 第三方套件在 Bitfinex funding 功能上的可靠性，決定往後統一的呼叫方式**
-      （2026-07-26 使用者指示：目前已連續在三個地方踩到 ccxt 版本相關的隱藏 bug
-      ——`ccxt.bitfinex2` 被移除（D009）、`fetch_balance` 預設查錯錢包且回傳格式對不上
-      （D009）、`cancel_active_offers()` 原本查錯訂單類型且從未真的取消（本次修正）；
-      使用者要求先把這個第三方套件的問題徹底查清楚，再繼續開發，而不是每次都撞一次修一次）。
-      調查範圍：
-      1. 盤點 `modules/exchange_client.py` 目前每個方法呼叫的到底是 ccxt「統一
-         （unified）」方法，還是「implicit/raw」方法（如 `private_post_auth_*`／
-         `public_get_ticker_symbol`）——列出清單，標明各自風險
-      2. 確認並修正 `create_loan_offer()`：目前檢查 `create_funding_offer` /
-         `createFundingOffer` 是否存在，但這兩個統一方法在目前釘選的 ccxt 4.5.64
-         的 bitfinex（V1/V2 合併版）裡都不存在，**代表實盤模式下目前一定會在「掛單」
-         這一步失敗**，是本次修 `cancel_active_offers()` 時意外發現、尚未修正的問題
-      3. 評估是否乾脆整支 `exchange_client.py` 統一改走 Bitfinex V2 raw API
-         （也就是使用者說的「直接打 Bitfinex API」——實際上就是 ccxt 的 implicit
-         方法，如 `private_post_auth_w_funding_offer_submit`；`get_frr()` 和這次的
-         `cancel_active_offers()` 已經是這種做法），減少「這個統一方法在這個 ccxt
-         版本到底存不存在」的不確定性；或評估是否要更進一步完全繞開 ccxt 自行實作
-         簽章直接呼叫 REST（trade-off：失去 ccxt 內建的重試/rate-limit 工具）
-      4. 確認 `requirements.txt` 釘選的 `ccxt>=4.2.0`（實測 4.5.64）與 Bitfinex 相關
-         的版本更動紀錄，理解為什麼 funding 相關統一方法支援不完整/不穩定
-      - **在這項調查有結論並記錄成 DECISIONS.md 新決策之前，M2 其餘項目（只補掛差額、
-        spread、maxtolend）與 M3／M4 一律暫緩。**
+（無，已於 2026-07-26 完成調查並記錄為 DECISIONS.md D010，解除阻塞，見下方「已完成」）
 
-## 待處理（依優先級，對應 PLAN.md 的 M1～M4；上面調查完成前暫緩開工）
+## 待處理（依優先級，對應 PLAN.md 的 M1～M4）
 
 ### M1：修正致命問題
 - [x] 修正 `get_frr()`：改抓 Bitfinex V2 `GET /v2/ticker/fUSD` 的 FRR 欄位（原本用
@@ -44,9 +22,9 @@
       （`private_post_auth_r_funding_offers_symbol` 查詢 + `private_post_auth_w_funding_offer_cancel`
       取消），原本誤用 `fetch_open_orders` 查錯訂單類型、且從未真的取消
       （2026-07-26，分支 `fix/m1-frr-and-loop`）
-- [ ] `create_loan_offer()` 改走 raw API（`private_post_auth_w_funding_offer_submit`），
-      目前檢查的 `create_funding_offer`/`createFundingOffer` 在這版 ccxt 不存在，實盤
-      模式下必定失敗——併入上方 ccxt 調查項目一起處理
+- [x] `create_loan_offer()` 改走 raw API（`private_post_auth_w_funding_offer_submit`，
+      `type="LIMIT"`），原本檢查的 `create_funding_offer`/`createFundingOffer` 在 ccxt
+      裡從未存在過，實盤模式下必定失敗（2026-07-26，見 DECISIONS.md D010）
 - [ ] 策略層補「只補掛差額」，避免重複掛出已成交部分
 - [ ] 策略層補多筆階梯利率（spread），對應 MikaLendingBot 的 `spreadlend` 完整版
 - [ ] 補 `maxtolend` / `maxpercenttolend` 風控上限檢查
@@ -81,6 +59,13 @@
       （目前尚未申請，是 LINE 通知模組串接測試的前置阻塞項目）
 
 ## 已完成
+- [x] 調查 ccxt 第三方套件在 Bitfinex funding 功能上的可靠性，決定往後統一的呼叫方式：
+      確認 ccxt 對 Bitfinex funding 從未實作過統一（unified）方法（非版本移除），一律改走
+      raw/implicit API；同時查證 Bitfinex 官方 REST 文件，盤點 19 個 funding 端點規格，
+      逐一比對現有程式碼用法。結論記錄為 DECISIONS.md D010，詳細盤點見
+      `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（2026-07-26）
+- [x] 修正 `test_connection()`：`fetch_balance()` 補上 `type="funding"`，與
+      `get_available_balance()` 查詢同一個錢包（2026-07-26，見 DECISIONS.md D010）
 - [x] PRD.md／SHUYU_PROJECT_PLAN.md 規劃書撰寫，含附錄 B 實作指引（2026-07-14）
 - [x] dry-run 雛型：`main.py` 單次執行流程、`config/settings.py` 讀取、
       `modules/lending_strategy.py` 策略骨架（門檻/拆單/天期判斷）（2026-07-14 之前）

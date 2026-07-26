@@ -57,7 +57,9 @@ class BitfinexClient:
             return False
 
         try:
-            self.exchange.fetch_balance()
+            # 明確指定 type='funding'，與 get_available_balance() 查的是同一個錢包，
+            # 語意一致，也能在啟動階段順便驗證 funding 錢包權限是否正常開通。
+            self.exchange.fetch_balance({"type": "funding"})
             self.logger.info("已成功連線至 Bitfinex。")
             return True
         except Exception as exc:
@@ -170,12 +172,21 @@ class BitfinexClient:
         if self.exchange is None:
             raise FatalError("交易所客戶端尚未初始化，無法建立掛單。")
 
+        symbol = f"f{currency}"
         try:
-            if hasattr(self.exchange, "create_funding_offer"):
-                return self.exchange.create_funding_offer(currency, amount, rate, duration)
-            if hasattr(self.exchange, "createFundingOffer"):
-                return self.exchange.createFundingOffer(symbol=currency, amount=amount, rate=rate, period=duration)
-            raise FatalError("目前的 ccxt 版本沒有提供此交易所所需的 funding-offer 方法。")
+            # create_funding_offer / createFundingOffer 這兩個統一方法在 ccxt 對
+            # bitfinex 的實作裡從未存在過（見 .project-docs/CCXT_BITFINEX_API_INVESTIGATION.md、
+            # DECISIONS.md D010），改直接呼叫官方 REST 端點對應的 raw API；
+            # type 固定用 LIMIT（固定利率掛單），對應策略層算好的絕對利率數值。
+            response = self.exchange.private_post_auth_w_funding_offer_submit(
+                {
+                    "type": "LIMIT",
+                    "symbol": symbol,
+                    "amount": str(amount),
+                    "rate": str(rate),
+                    "period": int(duration),
+                }
+            )
         except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
             self.logger.warning(f"建立放貸掛單逾時或超過速率限制：{exc}")
             raise RetryableError(str(exc)) from exc
@@ -185,3 +196,20 @@ class BitfinexClient:
         except ccxt.ExchangeError as exc:
             self.logger.error(f"建立放貸掛單時交易所回傳錯誤：{exc}")
             raise FatalError(str(exc)) from exc
+
+        # 回應為通知信封：[4]=FUNDING_OFFER_ARRAY，[6]=STATUS，[7]=TEXT
+        # https://docs.bitfinex.com/reference/rest-auth-submit-funding-offer
+        status = response[6] if len(response) > 6 else None
+        if status != "SUCCESS":
+            text = response[7] if len(response) > 7 else status
+            raise FatalError(f"建立放貸掛單失敗：{text}")
+
+        offer = response[4]
+        return {
+            "status": "submitted",
+            "id": offer[0],
+            "symbol": offer[1],
+            "amount": float(offer[4]),
+            "rate": float(offer[14]),
+            "period": int(offer[15]),
+        }

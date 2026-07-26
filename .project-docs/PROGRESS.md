@@ -59,3 +59,24 @@
   `exchange_client.py` 各方法目前用的是統一方法還是 raw API、修正 `create_loan_offer()`、
   評估是否整支改走 raw API 或完全繞開 ccxt），有結論後記錄成 DECISIONS.md 新決策，
   才能繼續 M2 其餘項目（只補掛差額、spread、`maxtolend`）
+
+### 本次（ccxt 可靠性調查，分支 `fix/m1-frr-and-loop`）
+- 完成：ccxt 對 Bitfinex funding 的可靠性調查——讀 ccxt 4.5.64 的 `bitfinex.py`／
+  `abstract/bitfinex.py` 原始碼、全套件搜尋、比對 Bitfinex 官方 REST 文件（19 個
+  funding 端點），逐一比對 `exchange_client.py` 每個方法的呼叫方式與官方規格，寫成
+  `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`
+- 關鍵結論：`create_funding_offer`／`fetch_funding_offers` 這組「統一方法」在 ccxt 裡
+  從未被任何交易所實作過（非版本移除），`create_loan_offer()` 原本的 `hasattr()` 判斷式
+  必定每次都失敗；已改走 raw API 的 `get_frr()`／`cancel_active_offers()` 從未出過問題
+- 決策：使用者確認 4 項決定，記錄為 DECISIONS.md D010——(1) 保留 ccxt、只用 raw API，
+  不自行改寫 REST client；(2) `create_loan_offer()` 用 `type="LIMIT"` 固定利率；
+  (3) `cancel_active_offers()` 維持查詢+逐筆取消；(4) `test_connection()` 補上
+  `type="funding"`
+- 完成：依決策修正 `modules/exchange_client.py` 的 `create_loan_offer()`（改呼叫
+  `private_post_auth_w_funding_offer_submit`，解析回應信封的 STATUS／FUNDING_OFFER_ARRAY）
+  與 `test_connection()`（`fetch_balance()` 補 `type="funding"`）
+- 驗證：`py_compile` 通過；用 mock 過的假 exchange 物件測試 `create_loan_offer()` 三種情境
+  （成功掛單、Bitfinex 回報 ERROR、速率限制轉 `RetryableError`），全部通過
+- 下一步：M2 剩餘項目——策略層補「只補掛差額」、多筆階梯利率（spread）、`maxtolend` 風控上限；
+  另注意調查過程中發現 `cancel_active_offers()` 目前未被 `main.py` 呼叫，補「只補掛差額」邏輯
+  時要一併決定何時呼叫

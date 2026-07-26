@@ -37,9 +37,10 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 
 ## 目前所在位置
 
-M1 三個致命問題中兩個已修正（LINE 通知延後至 M4），M2 的 `cancel_active_offers()` 也已修正。
-但過程中連續在 `get_frr()`、`get_available_balance()`（D009）、`cancel_active_offers()` 上
-踩到 ccxt 第三方套件版本相關的隱藏 bug，且發現 `create_loan_offer()` 在目前 ccxt 版本下實盤
-必定失敗。2026-07-26 使用者指示：**暫緩 M2 其餘項目與 M3／M4，先徹底調查 ccxt 在 Bitfinex
-funding 功能上的可靠性、決定往後統一的 API 呼叫方式**（見 TASKS.md「🔴 下一步・最高優先」），
-調查有結論並記錄成決策後才繼續往下開發。
+M1 三個致命問題中兩個已修正（LINE 通知延後至 M4）。M2 的 `cancel_active_offers()`、
+`create_loan_offer()` 均已修正，過程中意外發現並一併修正的隱藏 bug（`ccxt.bitfinex2`、
+`get_available_balance()` 錢包查詢、`create_loan_offer()` 呼叫不存在的方法）已全數處理完畢。
+2026-07-26 完成「ccxt 在 Bitfinex funding 功能上的可靠性」調查（見
+`.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`），結論記錄為 DECISIONS.md D010：
+**Bitfinex funding 相關操作統一改走 ccxt 的 raw/implicit API，不使用（也不存在）統一方法**；
+阻塞已解除，下一步回到 M2 剩餘項目（只補掛差額、spread、maxtolend）。

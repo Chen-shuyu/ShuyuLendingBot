@@ -110,21 +110,51 @@ class BitfinexClient:
             raise RetryableError(f"無法解析 {currency} 的 FRR 回應：{exc}") from exc
 
     def cancel_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
-        """取消目前的掛單。"""
+        """取消目前尚未成交的放貸掛單（active funding offers），不影響已成交的 active loan。"""
         if self.dry_run:
             self.logger.info("目前為 dry-run 模式，未實際取消任何掛單。")
             return []
 
         if self.exchange is None:
-            raise RuntimeError("交易所客戶端尚未初始化，無法取消掛單。")
+            raise FatalError("交易所客戶端尚未初始化，無法取消掛單。")
 
+        symbol = f"f{currency}" if currency else "fUSD"
         try:
-            if hasattr(self.exchange, "fetch_open_orders"):
-                return self.exchange.fetch_open_orders(currency)
-            return []
-        except Exception as exc:
-            self.logger.error(f"取消掛單失敗：{exc}")
-            return []
+            # 目前釘選的 ccxt 版本（合併版 bitfinex）沒有提供統一的
+            # fetch_funding_offers / cancel_funding_offer，只能直接呼叫
+            # Bitfinex V2 底層 implicit API（與 get_frr() 呼叫 public_get_ticker_symbol
+            # 是同一種做法）。
+            offers = self.exchange.private_post_auth_r_funding_offers_symbol({"symbol": symbol})
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢未成交放貸掛單逾時或超過速率限制：{exc}") from exc
+        except ccxt.AuthenticationError as exc:
+            raise FatalError(f"查詢未成交放貸掛單認證失敗：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise FatalError(f"查詢未成交放貸掛單時交易所回傳錯誤：{exc}") from exc
+
+        cancelled: List[Dict[str, Any]] = []
+        for offer in offers:
+            # Bitfinex V2 funding offer 陣列欄位：0=ID, 1=SYMBOL, 4=AMOUNT, 14=RATE, 15=PERIOD
+            # https://docs.bitfinex.com/reference/rest-auth-funding-offers
+            offer_id = offer[0]
+            offer_info = {
+                "id": offer_id,
+                "symbol": offer[1],
+                "amount": float(offer[4]),
+                "rate": float(offer[14]),
+                "period": int(offer[15]),
+            }
+            try:
+                self.exchange.private_post_auth_w_funding_offer_cancel({"id": offer_id})
+            except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+                raise RetryableError(f"取消掛單 {offer_id} 逾時或超過速率限制：{exc}") from exc
+            except ccxt.ExchangeError as exc:
+                self.logger.error(f"取消掛單 {offer_id} 失敗：{exc}")
+                continue
+            cancelled.append(offer_info)
+
+        self.logger.info(f"已取消 {len(cancelled)} 筆未成交放貸掛單。")
+        return cancelled
 
     def create_loan_offer(self, currency: str, amount: float, rate: float, duration: int) -> Dict[str, Any]:
         """建立放貸掛單。"""

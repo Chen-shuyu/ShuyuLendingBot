@@ -21,7 +21,7 @@
 - [x] `cancel_active_offers()` 真正實作取消未成交掛單，改用 Bitfinex V2 raw API
       （`private_post_auth_r_funding_offers_symbol` 查詢 + `private_post_auth_w_funding_offer_cancel`
       取消），原本誤用 `fetch_open_orders` 查錯訂單類型、且從未真的取消
-      （2026-07-26，分支 `fix/m1-frr-and-loop`）
+      （2026-07-26，分支 `feature/m2-strategy-and-risk`）
 - [x] `create_loan_offer()` 改走 raw API（`private_post_auth_w_funding_offer_submit`，
       `type="LIMIT"`），原本檢查的 `create_funding_offer`/`createFundingOffer` 在 ccxt
       裡從未存在過，實盤模式下必定失敗（2026-07-26，見 DECISIONS.md D010）

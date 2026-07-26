@@ -214,3 +214,30 @@
   `.github/workflows/python-app.yml`（smoke test 的 `run_once()` 呼叫補
   `cancel_settle_seconds=0`）。完成 M2 全部項目，`cancel_active_offers()` 從此被主迴圈呼叫，
   解除 CHANGELOG「未被呼叫」的 Known Issue。
+
+## D012 — 每個 milestone 一條獨立分支，完成即合併進 main
+- 日期：2026-07-26
+- 決策：
+  1. **每個 milestone（M1／M2／M3／M4）開一條獨立分支**，命名慣例
+     `feature/m<N>-<主題>`（如 `feature/m2-strategy-and-risk`）；純文件同步用
+     `docs/<主題>`。
+  2. **milestone 完成且驗證通過後立刻合併進 main**，不在舊 milestone 的分支上繼續做下一個
+     milestone 的工作。下一個 milestone 一律從最新的 main 開新分支。
+  3. 合併採 `--no-ff`，保留分支結構，讓 `git log --graph` 能一眼看出每個 milestone 的範圍。
+- 原因：M1 與 M2 的工作原本混在同一條分支 `fix/m1-frr-and-loop` 上（該分支除了 M1 的
+  `get_frr`／主迴圈，還累積了 `cancel_active_offers`、`create_loan_offer` 兩個屬於 M2 的
+  commit），造成無法分辨哪個 commit 屬於哪個 milestone，回頭追查與 code review 都困難。
+  使用者明確要求改採「一個 milestone 一條分支、完成即合併」的流程。
+- 踩坑紀錄（本次實際遇到，日後務必注意）：**GitHub PR 的合併範圍只涵蓋建立 PR 當時分支上的
+  commit**，事後才 push 到同一分支的 commit 不會自動被納入。本次 PR #5 合併
+  `fix/m1-frr-and-loop` 時只帶進 `9bb7027`，`479a6e2` 與 `e942310` 都留在分支上沒進 main。
+  因此**合併後要用 `git log <舊main>..<新main>` 或 `git merge-base --is-ancestor` 實際比對
+  遠端 main 是否真的包含所有預期的 commit**，不能只看 PR 顯示「已合併」。
+- 附帶做法：若某條分支尚未推送過，重整（`git rebase --onto`）是安全的，可用來把分支移到
+  正確的基底上；重整後必須用 `git diff <重整前> <重整後>` 確認內容零差異，並重跑驗證。
+- 考慮過的替代方案：全部工作都在一條長命分支上做完再一次合併 —— 放棄，milestone 邊界會完全
+  消失；每個 milestone 都走 GitHub PR 流程 —— 未排除，但需注意上述「PR 只帶部分 commit」的
+  陷阱，本次改為本地 `--no-ff` 合併後直接推送。
+- 影響範圍：日後所有開發流程；M3 起一律從 main 開
+  `feature/m3-data-and-observability` 之類的新分支。`fix/m1-frr-and-loop` 已是完成後的殘留
+  分支，可刪除。

@@ -110,3 +110,30 @@
 - 下一步：**M2 已全數完成**，進入 M3（資料與可觀測）——建立 `db/`（SQLite WAL，記錄
   `loan_offers`／`earnings_daily`／`bot_state`）、`logger` 改 `RotatingFileHandler`、
   建立 `api/rate_limiter.py` 的 `with_retry` 指數退避、補 heartbeat 與連續失敗告警
+
+### 本次（分支重整與合併進 main，分支 `feature/m2-strategy-and-risk`）
+> 更正：上方三筆條目標註的分支 `fix/m1-frr-and-loop` 是當時的工作分支；經本次重整後，
+> M2 相關 commit（`cancel_active_offers`、`create_loan_offer`、spread／maxtolend／取消重掛）
+> 實際都落在 `feature/m2-strategy-and-risk` 分支上並由該分支合併進 main。
+> 依 append-only 原則不回頭改寫舊條目，於此註明。
+
+- 起因：使用者指出 M1 與 M2 的工作混在同一條分支（`fix/m1-frr-and-loop`）上，要求改成
+  「先把 M1 合併進 main，再開新分支做 M2」，避免兩個 milestone 的 commit 難以分辨。
+  當下 M2 收尾的改動尚未 commit，仍在工作區，因此來得及分開
+- 完成：`git stash` 暫存 M2 改動 → 合併 M1 進 main → 從 main 開
+  `feature/m2-strategy-and-risk` → `stash pop` 還原 → commit
+- 意外：推送時發現遠端 main 已由 GitHub PR #5 合併過 `fix/m1-frr-and-loop`，但**該 PR 只
+  帶進 `9bb7027`**（get_frr + 主迴圈），並未包含事後才 push 的 `479a6e2`
+  （`cancel_active_offers`）與 `e942310`（`create_loan_offer`）——後兩者在 TASKS.md 裡
+  本來就列在 M2 底下，因此把它們歸進 M2 分支反而讓 M1／M2 分界更準確
+- 完成：因 M2 分支尚未推送，以 `git rebase --onto a247b0c 9bb7027` 把它重整到遠端 main
+  （PR #5 的合併點）之上，捨棄本地重複的 M1 合併 commit；重整前後以 `git diff` 比對確認
+  **內容零差異**，並在每次分支切換後重跑驗證
+- 完成：`main` 以 `--no-ff` 合併 M2 分支（`e17742b`），推送 `main` 與
+  `feature/m2-strategy-and-risk`；最終歷史為 M1 一條分支、M2 一條分支各自合併，
+  `git stash list` 已清空無遺留
+- 決策：把此分支流程記錄為 DECISIONS.md D012，讓 M3、M4 自動沿用
+- 待處理（使用者端）：`fix/m1-frr-and-loop` 分支已是完成後的殘留（其唯一未推送的 commit
+  內容已以 rebase 後的形式進入 main），可考慮刪除；另 git 未設定 `user.name`／`user.email`，
+  所有 commit 作者皆為 `shuyu <shuyu@localhost.localdomain>`，GitHub 可能無法關聯到帳號
+- 下一步：進入 M3，依 D012 從 main 開 `feature/m3-data-and-observability` 分支

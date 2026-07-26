@@ -7,6 +7,8 @@
 
 from typing import Any, Dict, List, Optional
 
+from utils.exceptions import FatalError, RetryableError
+
 try:
     import ccxt
 except ModuleNotFoundError:  # pragma: no cover - environment fallback
@@ -31,7 +33,9 @@ class BitfinexClient:
                     if ccxt is None:
                         raise RuntimeError("ccxt 尚未安裝，請先完成套件安裝。")
 
-                    self.exchange = ccxt.bitfinex2(
+                    # 注意：新版 ccxt（4.x）已將 V1/V2 合併為單一 `bitfinex`，
+                    # 不再有獨立的 `bitfinex2`，這裡底層走的就是 V2 API。
+                    self.exchange = ccxt.bitfinex(
                         {
                             "apiKey": api_key,
                             "secret": api_secret,
@@ -61,36 +65,49 @@ class BitfinexClient:
             return False
 
     def get_available_balance(self, currency: str) -> float:
-        """取得指定貨幣的可用餘額。"""
+        """取得指定貨幣在 funding 錢包（放貸專用）的可用餘額。"""
         if self.dry_run:
             return float(self.config.get("dry_run_balance_usd", 344.12))
 
         if self.exchange is None:
-            raise RuntimeError("交易所客戶端尚未初始化，無法查詢餘額。")
+            raise FatalError("交易所客戶端尚未初始化，無法查詢餘額。")
 
-        balance = self.exchange.fetch_balance()
-        funding_wallet = balance.get("info", {}).get("funding", [])
-        for entry in funding_wallet:
-            if entry.get("currency") == currency:
-                return float(entry.get("amount", 0.0))
-        return 0.0
+        try:
+            # 必須明確指定 type='funding'，否則 ccxt 預設查的是 exchange（交易）錢包，
+            # 不是放貸用的 funding 錢包。
+            balance = self.exchange.fetch_balance({"type": "funding"})
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢 {currency} 餘額逾時或超過速率限制：{exc}") from exc
+        except ccxt.AuthenticationError as exc:
+            raise FatalError(f"查詢 {currency} 餘額認證失敗：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise FatalError(f"查詢 {currency} 餘額時交易所回傳錯誤：{exc}") from exc
+
+        account = balance.get(currency, {})
+        return float(account.get("free", 0.0) or 0.0)
 
     def get_frr(self, currency: str) -> float:
-        """取得指定貨幣的 FRR。"""
+        """取得指定貨幣的 FRR（Flash Return Rate，放貸市場日利率）。"""
         if self.dry_run:
             return float(self.config.get("dry_run_frr", 0.0002))
 
         if self.exchange is None:
-            raise RuntimeError("交易所客戶端尚未初始化，無法查詢 FRR。")
+            raise FatalError("交易所客戶端尚未初始化，無法查詢 FRR。")
 
         try:
-            if hasattr(self.exchange, "fetch_funding_rate"):
-                rate = self.exchange.fetch_funding_rate(currency)
-                return float(rate.get("rate", 0.0))
-            return 0.0
-        except Exception as exc:
-            self.logger.warning(f"無法取得 {currency} 的 FRR：{exc}")
-            return 0.0
+            # 直接呼叫 Bitfinex V2 公開端點 GET /v2/ticker/f{CCY}，
+            # 回傳陣列 index 0 才是真正的放貸 FRR；先前誤用
+            # fetch_funding_rate 讀到的是永續合約資金費率，數據錯誤。
+            ticker = self.exchange.public_get_ticker_symbol({"symbol": f"f{currency}"})
+            return float(ticker[0])
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢 {currency} FRR 逾時或超過速率限制：{exc}") from exc
+        except ccxt.AuthenticationError as exc:
+            raise FatalError(f"查詢 {currency} FRR 認證失敗：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise FatalError(f"查詢 {currency} FRR 時交易所回傳錯誤：{exc}") from exc
+        except (IndexError, ValueError, TypeError) as exc:
+            raise RetryableError(f"無法解析 {currency} 的 FRR 回應：{exc}") from exc
 
     def cancel_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """取消目前的掛單。"""
@@ -121,14 +138,20 @@ class BitfinexClient:
             }
 
         if self.exchange is None:
-            raise RuntimeError("交易所客戶端尚未初始化，無法建立掛單。")
+            raise FatalError("交易所客戶端尚未初始化，無法建立掛單。")
 
         try:
             if hasattr(self.exchange, "create_funding_offer"):
                 return self.exchange.create_funding_offer(currency, amount, rate, duration)
             if hasattr(self.exchange, "createFundingOffer"):
                 return self.exchange.createFundingOffer(symbol=currency, amount=amount, rate=rate, period=duration)
-            raise NotImplementedError("目前的 ccxt 版本沒有提供此交易所所需的 funding-offer 方法。")
-        except Exception as exc:
-            self.logger.error(f"建立放貸掛單失敗：{exc}")
-            raise
+            raise FatalError("目前的 ccxt 版本沒有提供此交易所所需的 funding-offer 方法。")
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            self.logger.warning(f"建立放貸掛單逾時或超過速率限制：{exc}")
+            raise RetryableError(str(exc)) from exc
+        except ccxt.AuthenticationError as exc:
+            self.logger.error(f"建立放貸掛單認證失敗：{exc}")
+            raise FatalError(str(exc)) from exc
+        except ccxt.ExchangeError as exc:
+            self.logger.error(f"建立放貸掛單時交易所回傳錯誤：{exc}")
+            raise FatalError(str(exc)) from exc

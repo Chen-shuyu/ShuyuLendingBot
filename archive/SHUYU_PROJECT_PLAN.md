@@ -1,4 +1,10 @@
-# ShuyuLendingBot 專案架構與開發規劃書
+# ShuyuLendingBot 專案架構與開發規劃書（已歸檔）
+
+> **本文件已於 2026-07-26 歸檔，內容已分類遷移進 [`.project-docs/`](../.project-docs/)（PLAN／DECISIONS／TASKS／ARCHITECTURE 等）。**
+> **之後請以 `.project-docs/` 為唯一正式文件來源；本文件僅保留作為歷史脈絡與推導過程備查，不再更新。**
+> 詳見 `.project-docs/DECISIONS.md` D008。
+
+---
 
 > 本文件為 ShuyuLendingBot（Bitfinex 美元放貸機器人）的最高開發指導原則，統整策略藍圖、系統架構、Python 實作最佳實踐、資料記錄、Red Hat 部署維運與後續開發步驟。
 >

@@ -25,6 +25,11 @@ engine:
   dry_run: true             # 部署驗證用；正式上線前改 false
   cancel_settle_seconds: 3  # 取消舊掛單後等待餘額釋放的秒數（Bitfinex 取消為非同步）
 
+retry:
+  max_attempts: 5           # 單次 API 呼叫的總嘗試次數（含第一次），1 = 不重試
+  base_delay: 2.0           # 首次退避秒數，之後每次加倍（2 → 4 → 8 → 16）
+  max_delay: 60.0           # 單次退避秒數上限
+
 logging:
   level: INFO
   file: logs/bfx_lending_bot.log

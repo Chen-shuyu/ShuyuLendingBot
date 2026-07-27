@@ -7,6 +7,7 @@
 
 from typing import Any, Dict, List, Optional
 
+from api.rate_limiter import RetrySettings, with_retry
 from utils.exceptions import FatalError, RetryableError
 
 try:
@@ -24,6 +25,8 @@ class BitfinexClient:
         self.logger = logger
         self.dry_run = dry_run
         self.exchange = None
+        # 供 @with_retry 讀取；必須用完整 config，因為 retry 區段不在 bitfinex 底下
+        self.retry_settings = RetrySettings.from_config(config)
 
         if not self.dry_run:
             api_key = self.config.get("api_key")
@@ -66,6 +69,7 @@ class BitfinexClient:
             self.logger.error(f"連線失敗：{exc}")
             return False
 
+    @with_retry()
     def get_available_balance(self, currency: str) -> float:
         """取得指定貨幣在 funding 錢包（放貸專用）的可用餘額。"""
         if self.dry_run:
@@ -88,6 +92,7 @@ class BitfinexClient:
         account = balance.get(currency, {})
         return float(account.get("free", 0.0) or 0.0)
 
+    @with_retry()
     def get_frr(self, currency: str) -> float:
         """取得指定貨幣的 FRR（Flash Return Rate，放貸市場日利率）。"""
         if self.dry_run:
@@ -111,6 +116,11 @@ class BitfinexClient:
         except (IndexError, ValueError, TypeError) as exc:
             raise RetryableError(f"無法解析 {currency} 的 FRR 回應：{exc}") from exc
 
+    # 取消是冪等操作（重試時會重新查詢，已取消的單不會再出現在清單裡），可安全重試。
+    # 唯一的邊界情況：某筆取消其實已在交易所生效、只是回應逾時，重試後該筆不會被算進
+    # 回傳清單，主迴圈因此可能略過「等待餘額釋放」而讀到偏舊的餘額——結果只是本輪少掛
+    # 一點，不會超額掛出，且下一輪即自行修正。
+    @with_retry()
     def cancel_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """取消目前尚未成交的放貸掛單（active funding offers），不影響已成交的 active loan。"""
         if self.dry_run:
@@ -158,6 +168,10 @@ class BitfinexClient:
         self.logger.info(f"已取消 {len(cancelled)} 筆未成交放貸掛單。")
         return cancelled
 
+    # 這裡刻意「不」套用 @with_retry：掛單不是冪等操作。若請求其實已送達 Bitfinex、
+    # 只是回應逾時，重試就會重複掛單，實盤下是真的多借出去。失敗時直接把
+    # RetryableError 交給主迴圈，下一輪的「全取消重掛」會自然補回這筆額度。
+    # 見 DECISIONS.md D013。
     def create_loan_offer(self, currency: str, amount: float, rate: float, duration: int) -> Dict[str, Any]:
         """建立放貸掛單。"""
         if self.dry_run:

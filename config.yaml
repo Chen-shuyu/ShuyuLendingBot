@@ -24,6 +24,7 @@ engine:
   interval_seconds: 600     # 主迴圈巡檢間隔（秒）
   dry_run: true             # 部署驗證用；正式上線前改 false
   cancel_settle_seconds: 3  # 取消舊掛單後等待餘額釋放的秒數（Bitfinex 取消為非同步）
+  alert_after_failures: 3   # 連續失敗幾輪就發出告警（只在跨過門檻與恢復時各通知一次）
 
 database:
   path: data/lending.sqlite3   # SQLite 檔案位置（相對於專案根目錄）

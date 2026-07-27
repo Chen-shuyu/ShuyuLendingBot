@@ -137,3 +137,43 @@
   內容已以 rebase 後的形式進入 main），可考慮刪除；另 git 未設定 `user.name`／`user.email`，
   所有 commit 作者皆為 `shuyu <shuyu@localhost.localdomain>`，GitHub 可能無法關聯到帳號
 - 下一步：進入 M3，依 D012 從 main 開 `feature/m3-data-and-observability` 分支
+
+## 2026-07-27
+
+### 本次（M3 資料與可觀測，分支 `feature/m3-data-and-observability`）
+- 前置：依使用者要求先做完整分析與計畫再動手；同時設定 git `user.name`／`user.email`
+  為 `Chen-shuyu` / `suyuchen322@gmail.com`，解掉 PROGRESS 先前記錄的「commit 作者是
+  `shuyu@localhost.localdomain`、GitHub 關聯不到帳號」問題
+- 完成：與使用者確認 4 項設計選擇並記錄為 DECISIONS.md D013——日誌改固定檔名輪替、
+  掛單刻意不重試、`earnings_daily` 先建表不填、告警只在跨門檻與恢復時各送一次
+- 完成：`utils/logger.py` 改 `RotatingFileHandler`（預設單檔 10MB、保留 5 份），移除
+  `logger.py` 與 `start.sh` 兩處的檔名時間戳邏輯；補 `debug()`／`exception()` 方法
+- 完成：新增 `api/rate_limiter.py`（`RetrySettings` + `with_retry` 指數退避）。原本五個
+  交易所方法只把 ccxt 例外轉成 `RetryableError` 就往外拋，**完全沒有重試**，一次網路抖動
+  就整輪跳過。decorator 攔的是分類後的 `RetryableError` 而非 ccxt 原始例外，因此每個方法
+  只要加一行、內部邏輯不動；`create_loan_offer()` 刻意不套（掛單不冪等，見 D013）
+- 完成：新增 `db/models.py`／`db/repository.py`（SQLite WAL + `synchronous=NORMAL`），
+  三張表 `loan_offers`／`earnings_daily`／`bot_state`。`loan_offers` 主鍵改用自增序號、
+  交易所 ID 另存可為 NULL 的 `offer_id`，因為 dry-run 與掛單失敗都拿不到交易所 ID 但同樣
+  要留痕；`bot_state` 用 `CHECK (id = 1)` 從結構上保證單列
+- 完成：`main.py` 的 `run_once()` 逐筆落帳（成功走 `record_offer()`、失敗走
+  `record_offer_failure()`），結束時寫 `bot_state`；兩條略過路徑也照樣寫狀態，因為機器人
+  是活著且判斷正確的，心跳不該因略過而中斷。新增 `FailureTracker` 處理連續失敗告警，
+  `main()` 補 `try/finally` 關閉 DB 連線
+- 完成：連帶修正三處部署／CI 缺口——`.gitignore` 補 `data/` 與 `*.sqlite3` 系列
+  （原本完全沒排除，DB 檔會被 commit 進 git）、`podman run` 與 `docker-compose.yml` 補掛
+  `/app/data` volume（否則每次重新部署 SQLite 紀錄就歸零）、CI smoke test 補 repository
+  參數並加上落帳與心跳的斷言
+- 驗證：`py_compile` 全數通過；logger 輪替 4 項（檔數上限、單檔大小、重啟沿用同組檔案、
+  `exception()` 帶堆疊）；`rate_limiter` 8 項（首次成功不退避、中途恢復、重試耗盡後拋出、
+  `max_delay` 封頂、`FatalError` 不重試、`max_attempts=1` 停用、設定載入、確認
+  `create_loan_offer` 未被包上重試）；資料層 10 項（目錄自動建立、WAL 生效、三張表、
+  重複初始化冪等、成功／dry-run／失敗三種落帳、收益 upsert 累加、`bot_state` 單列限制、
+  WAL 下讀寫並行）；`run_once` 與告警共 32 項情境；以 `interval_seconds: 1` 實跑 5 輪並以
+  SIGINT 優雅結束，確認 DB 落帳 10 筆、心跳與 `last_frr` 正確；CI smoke test 本地重跑通過
+- 遇到的問題：驗證過程中有兩次是**測試腳本自己寫錯**而非程式有問題——一次是斷言 log 內容
+  時沒考慮訊息已被輪替到 `.1` 檔，一次是刻意觸發 `IntegrityError` 後沒 rollback，導致後續
+  `PRAGMA wal_checkpoint` 撞到鎖。修正測試後皆通過
+- 下一步：**M3 已全數完成**，進入 M4（架構重構、測試與部署）——依 ARCHITECTURE.md 完成
+  `config/api/strategies/core/db/notify/utils` 分層搬遷、建立 `tests/` 三層測試、收斂
+  Podman 部署、最後才做 LINE Messaging API（仍卡在使用者尚未申請 Channel 憑證）

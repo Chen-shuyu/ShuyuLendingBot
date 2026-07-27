@@ -241,3 +241,40 @@
 - 影響範圍：日後所有開發流程；M3 起一律從 main 開
   `feature/m3-data-and-observability` 之類的新分支。`fix/m1-frr-and-loop` 已是完成後的殘留
   分支，可刪除。
+
+## D013 — M3 可觀測性四項設計：固定檔名輪替、掛單不重試、收益表先建不填、告警去重
+- 日期：2026-07-27
+- 決策：
+  1. **日誌改固定檔名 + `RotatingFileHandler`**，移除 `utils/logger.py` 與 `start.sh` 兩處
+     在檔名附加啟動時間戳的邏輯。
+  2. **`with_retry` 攔的是我們自己的 `RetryableError`，不是 ccxt 原始例外**；且
+     **`create_loan_offer()` 刻意不套用重試**，只有 `get_available_balance()`／`get_frr()`／
+     `cancel_active_offers()` 套用。
+  3. **`earnings_daily` 本輪只建表與備妥 `upsert_daily_earning()` 介面，不接資料來源。**
+  4. **連續失敗告警只在「剛跨過門檻」與「剛恢復」各送一次**；`SkipCycleError` 視為成功，
+     不累計失敗；失敗次數寫進 `bot_state.consecutive_failures` 而非只存記憶體。
+- 原因：
+  1. 時間戳命名是「跑一次就結束」時代的產物。M1 之後程式已是 `while True` 常駐，若每次
+     重啟都另起一串新檔案，`backup_count` 只管得住本次啟動那一串，長期下來等於沒有上限——
+     跟導入 rotation 的目的直接矛盾。
+  2. `exchange_client.py` 各方法早已把 ccxt 例外分類成 `RetryableError`／`FatalError`
+     （見 D009／D010），decorator 只要攔分類後的結果，就能一行套用而不動內部邏輯；
+     `FatalError`（金鑰無效、權限不足）重試沒有意義，直接往外拋。
+     **掛單不套重試是風控考量**：掛單不是冪等操作，若請求其實已送達 Bitfinex、只是回應
+     逾時，重試就會重複掛單，實盤下是真的多借出去。失敗改由下一輪的「全取消重掛」
+     （D011）自然補回，最多損失一輪的掛單機會，代價遠低於重複放貸。
+  3. 收益資料在 `exchange_client.py` 裡沒有任何來源——需另走 Bitfinex
+     `/v2/auth/r/ledgers/{ccy}/hist` 查利息入帳，且 dry-run 模式下無從驗證正確性。
+     先備妥 schema 與介面，避免 M3 範圍膨脹成半套的實盤功能。
+  4. 交易所若長時間異常，每輪都送告警會把通知管道洗版，反而讓人忽略。失敗次數落 DB
+     是為了讓未來的容器 healthcheck 不必啟動 Python 就能判斷健康狀態。
+     `SkipCycleError` 不算失敗，是因為能走到那個判斷，代表交易所 API 本身是通的。
+- 考慮過的替代方案：
+  - `TimedRotatingFileHandler`（每日切檔）—— 未採用，單日暴量時檔案大小仍無上限；
+    真正要防的是磁碟被塞爆，依大小切更直接。
+  - 掛單失敗時先查詢 funding offers 確認沒成功再重試 —— 最安全但最複雜，且 dry-run 下
+    驗證不到，留待實盤前再評估。
+  - 失敗計數只存記憶體 —— 較簡單，但重啟後歸零，且外部無從觀測。
+- 影響範圍：`utils/logger.py`、`start.sh`、`api/rate_limiter.py`（新增）、
+  `modules/exchange_client.py`、`db/`（新增）、`main.py`、`config.yaml`、`.gitignore`、
+  CI workflow 與 `docker-compose.yml`（新增 `/app/data` volume）。

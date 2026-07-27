@@ -22,9 +22,12 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
         （原需求「只補掛差額」的前提有誤，見 DECISIONS.md D011）
   - [x] 多筆階梯利率（spread）：百分比遞增、依單筆最小量自動降階、每筆各自判斷天期
   - [x] `maxtolend` / `maxpercenttolend` 風控上限（單輪量控版，觸及上限縮量掛）
-- [ ] M3：資料與可觀測
-  - 建立 `db/`（SQLite WAL 模式），記錄掛單與每日收益
-  - `logger` 改用 `RotatingFileHandler`；補 API Rate Limit 重試、heartbeat 與失敗告警
+- [x] M3：資料與可觀測
+  - [x] 建立 `db/`（SQLite WAL 模式），記錄掛單流水與機器人狀態
+        （`earnings_daily` 只建表與介面，資料來源延後，見 DECISIONS.md D013）
+  - [x] `logger` 改用 `RotatingFileHandler`（固定檔名 + 大小輪替）
+  - [x] 補 API Rate Limit 重試（`api/rate_limiter.py`，掛單刻意不套）、heartbeat
+        （`bot_state.last_run_at`）與連續失敗告警（`FailureTracker`）
 - [ ] M4：架構重構、測試與部署
   - 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils` 分層搬遷
   - 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
@@ -40,7 +43,7 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 
 ## 目前所在位置
 
-**M1、M2 已完成**（M1 的 LINE 通知項目依使用者指示延後至 M4 最後一步）。過程中意外發現並
+**M1、M2、M3 已完成**（M1 的 LINE 通知項目依使用者指示延後至 M4 最後一步）。過程中意外發現並
 一併修正的隱藏 bug（`ccxt.bitfinex2`、`get_available_balance()` 錢包查詢、
 `create_loan_offer()` 呼叫不存在的方法）已全數處理完畢；「ccxt 在 Bitfinex funding 功能上的
 可靠性」調查結論記錄為 DECISIONS.md D010（**funding 相關操作統一走 raw/implicit API**，
@@ -49,5 +52,10 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 2026-07-26 完成 M2 收尾三項（DECISIONS.md D011）：掛單更新改「每輪全取消重掛」、spread
 百分比遞增階梯、maxtolend 單輪量控版。`cancel_active_offers()` 現已真正被主迴圈呼叫。
 
-下一步進入 **M3（資料與可觀測）**：建立 `db/`（SQLite WAL）、`logger` 改
-`RotatingFileHandler`、`api/rate_limiter.py` 的指數退避重試、heartbeat 與連續失敗告警。
+2026-07-27 完成 M3（DECISIONS.md D013）：日誌固定檔名輪替、`api/rate_limiter.py` 指數退避
+重試（掛單刻意不套，因為不冪等）、`db/` SQLite WAL 資料層、心跳與連續失敗告警。連帶補上
+`.gitignore` 的 DB 排除規則與容器的 `/app/data` volume。
+
+下一步進入 **M4（架構重構、測試與部署）**：完成 `strategies/`、`core/`、`notify/` 的分層
+搬遷，建立 `tests/` 三層測試，收斂 Podman 部署（含容器崩潰重啟策略與 healthcheck），
+最後才做 LINE Messaging API —— 仍卡在使用者尚未申請 LINE Developers Channel 憑證。

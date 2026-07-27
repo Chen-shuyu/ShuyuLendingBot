@@ -224,15 +224,24 @@
   2. **milestone 完成且驗證通過後立刻合併進 main**，不在舊 milestone 的分支上繼續做下一個
      milestone 的工作。下一個 milestone 一律從最新的 main 開新分支。
   3. 合併採 `--no-ff`，保留分支結構，讓 `git log --graph` 能一眼看出每個 milestone 的範圍。
+
+  > **2026-07-27 更正（見 D014）**：第 2 點的「合併」方式改為 **push 分支 → 開 GitHub PR →
+  > 由 PR 合併進 main**，不再在本地直接合併 main 後推送。下方「踩坑紀錄」的成因也一併更正。
 - 原因：M1 與 M2 的工作原本混在同一條分支 `fix/m1-frr-and-loop` 上（該分支除了 M1 的
   `get_frr`／主迴圈，還累積了 `cancel_active_offers`、`create_loan_offer` 兩個屬於 M2 的
   commit），造成無法分辨哪個 commit 屬於哪個 milestone，回頭追查與 code review 都困難。
   使用者明確要求改採「一個 milestone 一條分支、完成即合併」的流程。
-- 踩坑紀錄（本次實際遇到，日後務必注意）：**GitHub PR 的合併範圍只涵蓋建立 PR 當時分支上的
-  commit**，事後才 push 到同一分支的 commit 不會自動被納入。本次 PR #5 合併
-  `fix/m1-frr-and-loop` 時只帶進 `9bb7027`，`479a6e2` 與 `e942310` 都留在分支上沒進 main。
-  因此**合併後要用 `git log <舊main>..<新main>` 或 `git merge-base --is-ancestor` 實際比對
-  遠端 main 是否真的包含所有預期的 commit**，不能只看 PR 顯示「已合併」。
+- 踩坑紀錄（本次實際遇到，日後務必注意）：PR #5 合併 `fix/m1-frr-and-loop` 時只帶進
+  `9bb7027`，`479a6e2` 與 `e942310` 都留在分支上沒進 main。因此**合併後要用
+  `git log <舊main>..<新main>` 或 `git merge-base --is-ancestor` 實際比對遠端 main 是否真的
+  包含所有預期的 commit**，不能只看 PR 顯示「已合併」。
+
+  > **2026-07-27 更正**：原本把成因寫成「GitHub PR 的合併範圍只涵蓋建立 PR 當時分支上的
+  > commit，事後 push 的不會被納入」，這個說法不正確。GitHub PR 追蹤的是 head 分支的最新
+  > 狀態，PR 開啟期間再 push 的 commit **會**出現在 PR 裡並被一併合併。PR #5 少帶 commit
+  > 的真正成因，是那兩個 commit 在 PR 被合併的時間點還沒推到遠端分支上。
+  > **正確的預防做法**：確認所有 commit 都已 `git push` 到分支之後，才建立／合併 PR；
+  > 合併後仍照上述方式實際比對。
 - 附帶做法：若某條分支尚未推送過，重整（`git rebase --onto`）是安全的，可用來把分支移到
   正確的基底上；重整後必須用 `git diff <重整前> <重整後>` 確認內容零差異，並重跑驗證。
 - 考慮過的替代方案：全部工作都在一條長命分支上做完再一次合併 —— 放棄，milestone 邊界會完全
@@ -241,3 +250,59 @@
 - 影響範圍：日後所有開發流程；M3 起一律從 main 開
   `feature/m3-data-and-observability` 之類的新分支。`fix/m1-frr-and-loop` 已是完成後的殘留
   分支，可刪除。
+
+## D013 — M3 可觀測性四項設計：固定檔名輪替、掛單不重試、收益表先建不填、告警去重
+- 日期：2026-07-27
+- 決策：
+  1. **日誌改固定檔名 + `RotatingFileHandler`**，移除 `utils/logger.py` 與 `start.sh` 兩處
+     在檔名附加啟動時間戳的邏輯。
+  2. **`with_retry` 攔的是我們自己的 `RetryableError`，不是 ccxt 原始例外**；且
+     **`create_loan_offer()` 刻意不套用重試**，只有 `get_available_balance()`／`get_frr()`／
+     `cancel_active_offers()` 套用。
+  3. **`earnings_daily` 本輪只建表與備妥 `upsert_daily_earning()` 介面，不接資料來源。**
+  4. **連續失敗告警只在「剛跨過門檻」與「剛恢復」各送一次**；`SkipCycleError` 視為成功，
+     不累計失敗；失敗次數寫進 `bot_state.consecutive_failures` 而非只存記憶體。
+- 原因：
+  1. 時間戳命名是「跑一次就結束」時代的產物。M1 之後程式已是 `while True` 常駐，若每次
+     重啟都另起一串新檔案，`backup_count` 只管得住本次啟動那一串，長期下來等於沒有上限——
+     跟導入 rotation 的目的直接矛盾。
+  2. `exchange_client.py` 各方法早已把 ccxt 例外分類成 `RetryableError`／`FatalError`
+     （見 D009／D010），decorator 只要攔分類後的結果，就能一行套用而不動內部邏輯；
+     `FatalError`（金鑰無效、權限不足）重試沒有意義，直接往外拋。
+     **掛單不套重試是風控考量**：掛單不是冪等操作，若請求其實已送達 Bitfinex、只是回應
+     逾時，重試就會重複掛單，實盤下是真的多借出去。失敗改由下一輪的「全取消重掛」
+     （D011）自然補回，最多損失一輪的掛單機會，代價遠低於重複放貸。
+  3. 收益資料在 `exchange_client.py` 裡沒有任何來源——需另走 Bitfinex
+     `/v2/auth/r/ledgers/{ccy}/hist` 查利息入帳，且 dry-run 模式下無從驗證正確性。
+     先備妥 schema 與介面，避免 M3 範圍膨脹成半套的實盤功能。
+  4. 交易所若長時間異常，每輪都送告警會把通知管道洗版，反而讓人忽略。失敗次數落 DB
+     是為了讓未來的容器 healthcheck 不必啟動 Python 就能判斷健康狀態。
+     `SkipCycleError` 不算失敗，是因為能走到那個判斷，代表交易所 API 本身是通的。
+- 考慮過的替代方案：
+  - `TimedRotatingFileHandler`（每日切檔）—— 未採用，單日暴量時檔案大小仍無上限；
+    真正要防的是磁碟被塞爆，依大小切更直接。
+  - 掛單失敗時先查詢 funding offers 確認沒成功再重試 —— 最安全但最複雜，且 dry-run 下
+    驗證不到，留待實盤前再評估。
+  - 失敗計數只存記憶體 —— 較簡單，但重啟後歸零，且外部無從觀測。
+- 影響範圍：`utils/logger.py`、`start.sh`、`api/rate_limiter.py`（新增）、
+  `modules/exchange_client.py`、`db/`（新增）、`main.py`、`config.yaml`、`.gitignore`、
+  CI workflow 與 `docker-compose.yml`（新增 `/app/data` volume）。
+
+## D014 — 合併方式改走 GitHub PR，不在本地直接合併 main
+- 日期：2026-07-27
+- 決策：milestone 分支完成後，流程固定為 **push 分支 → 在 GitHub 開 PR → 由 PR 合併進
+  main → 本地 `git pull` 同步**，取代 D012 原本的「本地 `--no-ff` 合併 main 後推送」。
+  D012 的其餘內容（一個 milestone 一條分支、命名慣例、合併後實際比對 commit）維持不變。
+- 原因：使用者明確要求走 PR 流程。PR 留下可回顧的審查紀錄與討論串，且合併前會先跑 CI 的
+  `test` 與 `integration` 兩個 job（`pull_request` 事件會觸發；`deploy` 不會，因為它的條件
+  是 `github.ref == 'refs/heads/main'`）——等於部署前多一道自動關卡，本地直接合併則會
+  完全跳過這道檢查。
+- 執行順序上的注意事項：**所有 commit 必須先 push 到分支，才建立／合併 PR**
+  （見 D012 更正後的踩坑紀錄）。
+- 踩坑紀錄（本次實際遇到）：M3 一度已依 D012 在本地完成 `--no-ff` 合併，經使用者指正後改走
+  PR 流程。因該合併尚未推送，以 `git reset --hard origin/main` 退回即可，分支上的 commit
+  完好無損。**退回後務必確認自己站在哪條分支**——當下 HEAD 停在 main，若直接編輯文件會改到
+  main 的工作區而非分支（本次即發生，已還原後切回分支重做）。
+- 考慮過的替代方案：維持本地合併（較快、少一次來回）—— 放棄，會跳過 PR 的 CI 關卡，
+  也沒有審查紀錄。
+- 影響範圍：M3 起所有 milestone 的合併流程；D012 第 2 點作廢並改以本條為準。

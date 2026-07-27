@@ -10,4 +10,6 @@ services:
     volumes:
       - /home/shuyu/.config/bfx-lending-bot:/run/secrets:ro
       - /home/shuyu/.config/bfx-lending-bot/logs:/app/logs
+      # SQLite 檔必須掛在容器外，否則每次重建容器紀錄就歸零
+      - /home/shuyu/.config/bfx-lending-bot/data:/app/data
     restart: unless-stopped

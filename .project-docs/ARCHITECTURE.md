@@ -23,18 +23,23 @@ LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007
 
 ## 現況（尚未重構）
 
-目前程式碼仍是 `config/ modules/ utils/` 三層的 dry-run 雛型，尚未拆成下方目標架構：
+M3 已補齊 `api/`（重試）與 `db/`（資料層）兩個目標目錄，其餘仍是 `config/ modules/ utils/`
+三層結構，尚未完成 `strategies/`、`core/`、`notify/` 的搬遷：
 
 ```
 ShuyuLendingBot/
 ├── config/settings.py          # YAML + 環境變數 + secrets 載入（已可用）
+├── api/rate_limiter.py         # RetrySettings + with_retry 指數退避（M3 新增）
+├── db/
+│   ├── models.py               # loan_offers / earnings_daily / bot_state 的 DDL（M3 新增）
+│   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── modules/
 │   ├── exchange_client.py      # BitfinexClient：連線、餘額、FRR、取消掛單、建立掛單
 │   │                            # （皆已修正為呼叫 ccxt raw API，見 D009／D010）
 │   ├── lending_strategy.py     # LendingStrategy.build_offer_plan()：門檻/拆單/天期判斷骨架
 │   └── line_notifier.py        # LineNotifier：呼叫已停用的 LINE Notify（永遠失敗）
-├── utils/logger.py             # BotLogger：FileHandler，無 rotation
-└── main.py                     # 單次執行流程，無主迴圈
+├── utils/logger.py             # BotLogger：RotatingFileHandler（M3 改）
+└── main.py                     # 常駐主迴圈 + run_once + FailureTracker（尚未搬進 core/）
 ```
 
 ## 目標架構（依 [SHUYU_PROJECT_PLAN.md 附錄 B.9](../archive/SHUYU_PROJECT_PLAN.md)）
@@ -73,22 +78,28 @@ ShuyuLendingBot/
   `create_loan_offer`。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
   `private_post_auth_r_funding_offers_symbol`／`private_post_auth_w_funding_offer_cancel`／
   `private_post_auth_w_funding_offer_submit`），詳細盤點見
-  `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（D009／D010）。尚待：所有實盤呼叫都還沒
-  包上 `with_retry` 指數退避（見 TASKS.md M3）。
-- `api/rate_limiter.py`（尚未建立）：`with_retry` decorator，包住所有實盤 API 呼叫，捕捉
-  `ccxt.RateLimitExceeded` / `ccxt.NetworkError`，指數退避重試。
+  `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（D009／D010）。讀取類與取消類已包上
+  `with_retry`；`create_loan_offer()` 刻意不包（掛單不冪等，見 D013）。
+- `api/rate_limiter.py`：`RetrySettings`（讀 `config.yaml` 的 `retry:` 區段）與 `with_retry`
+  decorator。攔的是 `exchange_client` 已分類好的 `RetryableError` 而非 ccxt 原始例外——
+  例外轉換早在各方法內做完，decorator 只負責重試，因此一行即可套用而不動內部邏輯；
+  `FatalError` 直接往外拋（見 D013）。
 - `strategies/frr_plus.py`（現 `modules/lending_strategy.py`）：FRR+ 策略純函式，輸入餘額與
   FRR，輸出 `OfferPlan` 清單。已含 `maxtolend` 縮量、spread 百分比遞增階梯、依單筆最小量
   自動降階、逐筆判斷天期（D011）。尚待：`maxtolend` 只管本輪掛出總額，未計入已放貸部位。
 - `core/bot_engine.py`（尚未建立，現由 `main.py` 承擔）：`run_once` 單輪巡檢，順序為
-  取消舊掛單 → 等待餘額釋放 → 查餘額 → 抓 FRR → 產生掛單計畫 → 逐筆掛單 → 通知；
-  `run_forever` 主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`。
-- `db/repository.py`（尚未建立）：SQLite WAL 模式，記錄掛單流水、每日收益彙總、`bot_state`。
+  取消舊掛單 → 等待餘額釋放 → 查餘額 → 抓 FRR → 產生掛單計畫 → 逐筆掛單並落帳 →
+  寫入 `bot_state` → 通知；主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`，
+  並以 `FailureTracker` 累計連續失敗、跨過門檻時告警一次、恢復時再通知一次（D013）。
+- `db/repository.py`：SQLite WAL 模式（搭配 `synchronous=NORMAL`），記錄掛單流水、
+  每日收益彙總、`bot_state`。掛單成功走 `record_offer()`、失敗走 `record_offer_failure()`——
+  掛單 API 無法 rollback，同一輪前幾筆成功時錢已經出去了，只有逐筆落帳才對得出真實狀態。
+  尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
 - `notify/line_messaging.py`（現 `modules/line_notifier.py`）：目前呼叫已停用的 LINE Notify
   端點（`notify-api.line.me`），需改寫為 LINE Messaging API push
-  （`POST https://api.line.me/v2/bot/message/push`）。
-- `utils/logger.py`：目前用 `logging.FileHandler`，24 小時常駐後單檔會無限增大，需改
-  `RotatingFileHandler`。
+  （`POST https://api.line.me/v2/bot/message/push`）。在那之前，M3 的連續失敗告警實際上
+  只會留在日誌裡。
+- `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
 
 ## 刻意排除的部分
 
@@ -103,5 +114,7 @@ ShuyuLendingBot/
   統一方法 —— 見 DECISIONS D010。
 - 併發模型：單執行緒 + `time.sleep` 主迴圈，不引入 `asyncio` —— 見 DECISIONS D003。
 - 通知：LINE Messaging API push，取代已停用的 LINE Notify —— 見 DECISIONS D002。
-- 持久化：SQLite（WAL 模式），非外部 DB —— 見 DECISIONS D006。
+- 持久化：SQLite（WAL 模式），非外部 DB —— 見 DECISIONS D006。SQLite 檔須以 volume 掛出
+  容器（`/app/data`），否則重新部署即歸零。
 - 部署：Podman 容器化為主線 —— 見 DECISIONS D007。
+- 可觀測：固定檔名日誌輪替、指數退避重試、`bot_state` 心跳與連續失敗告警 —— 見 DECISIONS D013。

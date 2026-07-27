@@ -28,6 +28,8 @@ engine:
 logging:
   level: INFO
   file: logs/bfx_lending_bot.log
+  max_bytes: 10485760       # 單一 log 檔上限（10MB），超過就輪替
+  backup_count: 5           # 最多保留幾份輪替後的舊檔（.1 ~ .5）
 
 line:
   enabled: false

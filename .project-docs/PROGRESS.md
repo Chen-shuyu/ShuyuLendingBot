@@ -174,6 +174,14 @@
 - 遇到的問題：驗證過程中有兩次是**測試腳本自己寫錯**而非程式有問題——一次是斷言 log 內容
   時沒考慮訊息已被輪替到 `.1` 檔，一次是刻意觸發 `IntegrityError` 後沒 rollback，導致後續
   `PRAGMA wal_checkpoint` 撞到鎖。修正測試後皆通過
+- 流程更正：原先依 D012 在本地做了 `--no-ff` 合併進 main，使用者指正應改走
+  **push 分支 → 開 GitHub PR → 由 PR 合併**的流程。因該合併尚未推送，以
+  `git reset --hard origin/main` 退回即可，分支 commit 完好無損；記錄為 DECISIONS.md D014。
+  過程中還犯了一個錯：退回後 HEAD 停在 main，卻直接編輯 DECISIONS.md，等於改到 main 的
+  工作區而非分支，還原後切回分支才重做——已一併寫進 D014 的踩坑紀錄
+- 一併更正 D012 的踩坑紀錄：原本寫「GitHub PR 只涵蓋建立 PR 當時的 commit，事後 push 的
+  不會被納入」，這個說法不正確。PR 追蹤的是 head 分支最新狀態，開啟期間再 push 的 commit
+  會被納入；PR #5 少帶 commit 的真正成因是那兩個 commit 在合併當下還沒推到遠端
 - 下一步：**M3 已全數完成**，進入 M4（架構重構、測試與部署）——依 ARCHITECTURE.md 完成
   `config/api/strategies/core/db/notify/utils` 分層搬遷、建立 `tests/` 三層測試、收斂
   Podman 部署、最後才做 LINE Messaging API（仍卡在使用者尚未申請 Channel 憑證）

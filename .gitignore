@@ -12,6 +12,12 @@ secrets.env
 logs/
 *.log
 
+# SQLite 資料庫（含 WAL 模式產生的 -wal / -shm 附屬檔）
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 # VS Code
 .vscode/
 

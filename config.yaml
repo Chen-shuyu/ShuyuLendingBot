@@ -25,6 +25,9 @@ engine:
   dry_run: true             # 部署驗證用；正式上線前改 false
   cancel_settle_seconds: 3  # 取消舊掛單後等待餘額釋放的秒數（Bitfinex 取消為非同步）
 
+database:
+  path: data/lending.sqlite3   # SQLite 檔案位置（相對於專案根目錄）
+
 retry:
   max_attempts: 5           # 單次 API 呼叫的總嘗試次數（含第一次），1 = 不重試
   base_delay: 2.0           # 首次退避秒數，之後每次加倍（2 → 4 → 8 → 16）

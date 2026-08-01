@@ -84,6 +84,15 @@ jobs:
             podman rm shuyu-lending-bot || true
           fi
 
+      - name: 準備主機端掛載目錄
+        # podman 的 bind mount **不會**自動建立主機端目錄（docker 會），目錄不存在時
+        # 直接以 `statfs ...: no such file or directory` 搭配 exit code 125 失敗。
+        # M3 加上 data volume 後主機端從沒建過這個目錄，部署因此一直掛在這一步。
+        # 這裡用 mkdir -p 而非手動建立，才能在主機重建或換機時自動成立。
+        run: |
+          mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/logs
+          mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/data
+
       - name: 啟動 Podman 容器
         run: |
           # data 也要掛出來：SQLite 檔留在容器內的話，每次重新部署掛單與收益紀錄就全沒了

@@ -73,6 +73,11 @@
       `COALESCE`，NOT NULL 在衝突解析前先擋下，導致首次插入與後續累加兩條路徑都必定
       `IntegrityError`。改為 `principal_avg REAL`；當時尚無任何 DB 檔存在，遷移成本為零
 - [ ] **子分支 `deploy/m4-podman`**：收斂部署路線為 Podman 容器化（見 DECISIONS.md D007）：
+      - [x] 修正部署一直失敗的主機端目錄問題（2026-08-01）：podman 的 bind mount 不會
+            自動建立主機端目錄，`.../ShuyuLendingBot/data` 從未存在，deploy job 自 M3
+            加上該 volume 起每次都以 exit code 125 失敗。workflow 補 `mkdir -p` 一步
+      - [ ] 補 `secrets.env` 到部署目錄（`/workspace/deploy/active-bots/ShuyuLendingBot/`）。
+            目前該檔不存在，`dry_run: true` 下不影響，**實單前必須補上**（使用者端待辦）
       - 決定容器崩潰重啟策略（`podman run --restart` 或 `podman generate systemd`）
       - 確認 `systemd/bfx-lending-bot.service` 的去留（改為本機測試用途）
       - **`FatalError` 目前是 `return 1` 直接退出，但 `docker-compose.yml` 設

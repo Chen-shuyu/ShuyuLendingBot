@@ -227,3 +227,26 @@
   改以 `make_logger` fixture 在每次建立前即時清空共用 logger 解決
 - 下一步：推送分支並開 PR 合併進 main；之後進 M4 第二條子分支（依 ARCHITECTURE.md 做
   `strategies/`、`core/`、`notify/` 的分層搬遷），有這 227 項測試當回歸保護
+
+### 本次追加（部署修正，分支 `deploy/m4-podman`）
+- 背景：`test/m4-test-suite` 由 PR #7 合併進 main（合併點 `e798f0c`，三個 commit 全數驗證
+  在 main 內）後，main 的 CI 中 `測試階段`／`整合/系統測試` 皆通過，但 `容器化部署階段`
+  以 exit code 125 失敗
+- 完成：診斷出根因為 **podman 的 bind mount 不會自動建立主機端目錄**（docker 會），
+  `/workspace/deploy/active-bots/ShuyuLendingBot/data` 從未在主機上建立過。該 volume 是
+  M3 的 `451da1d` 加入的，本次測試 PR 完全沒有動到 deploy job——也就是說 **PR #6（M3）
+  合併時部署就已經失敗，只是當時沒有注意到**
+- 完成：在 workflow 的 `podman run` 之前加一步 `mkdir -p` 建立 `logs/` 與 `data/`。
+  選 workflow 內建立而非手動在主機建一次，是為了讓主機重建或換機時自動成立
+- 驗證：在 runner 主機上以相同掛載參數重現同一則 `statfs ...: no such file or directory`；
+  執行 mkdir 後再跑一次即通過，並確認 `/app/data` 在容器內可寫（rootless podman 的 UID
+  映射不影響寫入）；另以暫存目錄實跑映像一輪，確認 dry-run 巡檢掛出 2 筆、SQLite 落帳 2 筆、
+  `bot_state` 心跳與 `last_frr` 正確——掛出的 172.06 × 2 與利率 0.0004／0.00046 和單元測試
+  算出的預期值完全一致
+- 一併發現（尚未處理，留給本分支的下一個 PR）：
+  - **機器人自 2026-07-26 之後就沒有部署成功過**，`podman ps -a` 為空
+  - `podman run` 完全沒有 `--restart` 參數，容器崩潰後不會自己起來；而
+    `docker-compose.yml` 設的是 `restart: unless-stopped`，兩邊策略不一致
+  - 部署目錄裡沒有 `secrets.env`。目前 `dry_run: true` 不受影響，實單前必須補上
+- 下一步：推送並開 PR 讓 main 的 CI 轉綠；之後在同一條分支處理 restart 策略、
+  容器 healthcheck、`FatalError` 與自動重啟的衝突

@@ -21,8 +21,16 @@
 - `config.yaml` 新增 `database.path`、`retry.*`、`logging.max_bytes` / `backup_count`、
   `engine.alert_after_failures`
 - `podman run` 與 `docker-compose.yml` 掛上 `/app/data` volume，讓 SQLite 紀錄跨容器保存
+- `tests/` 三層測試套件共 227 項：`unit`（策略、重試、資料層、設定、日誌、交易所客戶端）、
+  `functional`（`run_once()` 巡檢流程、`FailureTracker` 告警去重）、
+  `integration`（dry-run 端到端、Bitfinex 公開端點格式守門，連不上時 skip）
+- `pytest.ini`（`pythonpath = .` 與 `live` marker）與 `requirements-dev.txt`
 
 ### Fixed
+- `upsert_daily_earning()` 傳 `principal_avg=None`（含不傳、走預設值）必定
+  `IntegrityError` 的問題：`earnings_daily.principal_avg` 原宣告為 `NOT NULL`，
+  但 ON CONFLICT 用 `COALESCE` 表達的原意是「傳 None 保留舊值」，NOT NULL 會在衝突解析
+  之前先擋下，導致首次插入與後續累加兩條路徑都無法使用。改為可為 NULL
 - `get_frr()` 誤用 `fetch_funding_rate`（永續合約資金費率）的問題，改抓真正的放貸 FRR
 - `main.py` 補上 `while True` 常駐主迴圈，不再僅單次執行
 - `ccxt.bitfinex2` 於目前 ccxt 版本已移除的問題，改用合併後的 `ccxt.bitfinex`
@@ -40,12 +48,15 @@
   自動降階規則（餘額不足 `筆數 × min_loan_size_usd` 就降階）等價涵蓋
 - log 檔名不再附加啟動時間戳（`utils/logger.py` 與 `start.sh` 各一處），改為固定檔名 +
   大小輪替；否則每次重啟另起一串新檔，`backup_count` 等於沒有上限
+- CI 的測試步驟移除 `|| true`：測試失敗現在會擋下合併。原本的寫法讓 CI 永遠綠燈，
+  等於寫了測試也攔不住壞掉的程式碼
+- CI 內嵌的 heredoc smoke test 收斂進 `tests/integration/test_dry_run_cycle.py`，
+  workflow 不再需要維護兩份驗證邏輯；測試依賴改由 `requirements-dev.txt` 統一安裝
 
 ### Known Issues
 - `line_notifier.py` 呼叫已停用的 LINE Notify 端點，通知永遠失敗（待使用者申請 LINE
   Developers 憑證後改寫為 Messaging API，見 TASKS.md）。**連帶影響**：M3 的連續失敗告警
   目前實際上只會留在日誌裡，換成 Messaging API 後即自動生效
-- 尚無任何測試檔案，`tests/` 目錄未建立
 - `maxtolend` 目前只管本輪掛出的總額，未計入已放貸出去的部位，尚非真實總曝險上限
   （見 DECISIONS.md D011、TASKS.md M3）
 - `earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，尚無資料來源與呼叫端

@@ -39,8 +39,16 @@ ShuyuLendingBot/
 │   ├── lending_strategy.py     # LendingStrategy.build_offer_plan()：門檻/拆單/天期判斷骨架
 │   └── line_notifier.py        # LineNotifier：呼叫已停用的 LINE Notify（永遠失敗）
 ├── utils/logger.py             # BotLogger：RotatingFileHandler（M3 改）
+├── tests/                      # 三層測試 227 項（M4 新增，見 DECISIONS.md D015）
+│   ├── conftest.py             # 共用 fixture 與測試替身（FakeLogger／FakeNotifier／repository）
+│   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端
+│   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重
+│   └── integration/            # dry-run 端到端、Bitfinex 公開端點格式守門（live marker）
 └── main.py                     # 常駐主迴圈 + run_once + FailureTracker（尚未搬進 core/）
 ```
+
+測試層與待搬遷的目錄結構是耦合的：`refactor/m4-layering` 做搬遷時，`tests/` 的 import
+路徑要一併調整，改完重跑全部測試即可確認搬遷沒有改變行為。
 
 ## 目標架構（依 [SHUYU_PROJECT_PLAN.md 附錄 B.9](../archive/SHUYU_PROJECT_PLAN.md)）
 

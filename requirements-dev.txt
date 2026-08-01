@@ -1,0 +1,5 @@
+# 開發／測試用依賴，正式執行不需要。
+# 正式依賴見 requirements.txt。
+-r requirements.txt
+
+pytest>=7.0

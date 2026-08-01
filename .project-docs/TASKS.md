@@ -57,14 +57,22 @@
       `upsert_daily_earning()`。M3 只建了表與介面，尚無呼叫端；dry-run 下無法驗證正確性，
       建議與小額實單測試一起做（2026-07-27 決定延後，見 DECISIONS.md D013）
 
-### M4：架構重構、測試與部署
-- [ ] 依 ARCHITECTURE.md 完成目錄搬遷：
+### M4：架構重構、測試與部署（依 DECISIONS.md D015 拆成子分支）
+- [ ] **子分支 `refactor/m4-layering`**：依 ARCHITECTURE.md 完成目錄搬遷：
       `modules/exchange_client.py` → `api/bitfinex_client.py`（+ 新增 `api/base.py`）、
       `modules/lending_strategy.py` → `strategies/frr_plus.py`（+ 新增 `strategies/base.py`）、
-      新增 `core/bot_engine.py`、`modules/line_notifier.py` → `notify/line_messaging.py`
-- [ ] 建立 `tests/unit`、`tests/functional`、`tests/integration` 目錄與基本測試
-      （目前完全沒有測試檔案，CI 的 pytest 步驟因目錄不存在等於沒東西可跑）
-- [ ] 收斂部署路線為 Podman 容器化（見 DECISIONS.md D007）：
+      新增 `core/bot_engine.py`、`modules/line_notifier.py` → `notify/line_messaging.py`。
+      搬遷時 `tests/` 的 import 路徑要同步改，改完重跑 227 項即可確認沒搬壞
+- [x] 建立 `tests/unit`、`tests/functional`、`tests/integration` 目錄與測試，共 227 項
+      （2026-08-01，分支 `test/m4-test-suite`）。一併補掉三個 CI 缺口：拿掉
+      `pytest ... || true`（測試失敗必須擋下合併）、新增 `requirements-dev.txt`
+      取代臨時的 `pip install pytest`、把 workflow 內嵌的 heredoc smoke test 收斂進
+      `tests/integration/test_dry_run_cycle.py`
+- [x] 修正 `upsert_daily_earning()` 的 `principal_avg` 缺陷（2026-08-01，測試抓到）：
+      `db/models.py` 宣告 `NOT NULL` 但函式簽章預設 `None` 且 ON CONFLICT 用了
+      `COALESCE`，NOT NULL 在衝突解析前先擋下，導致首次插入與後續累加兩條路徑都必定
+      `IntegrityError`。改為 `principal_avg REAL`；當時尚無任何 DB 檔存在，遷移成本為零
+- [ ] **子分支 `deploy/m4-podman`**：收斂部署路線為 Podman 容器化（見 DECISIONS.md D007）：
       - 決定容器崩潰重啟策略（`podman run --restart` 或 `podman generate systemd`）
       - 確認 `systemd/bfx-lending-bot.service` 的去留（改為本機測試用途）
       - **`FatalError` 目前是 `return 1` 直接退出，但 `docker-compose.yml` 設
@@ -74,7 +82,7 @@
       - 加上容器 healthcheck：讀 `bot_state.last_run_at`（心跳）與 `consecutive_failures`
         判斷存活，M3 已把兩者寫進 DB，只差檢查腳本（2026-07-27）
 - [ ] 小額真金測試前，再次確認 API Key 權限已禁止「提現（Withdraw）」
-- [ ] 通知模組改寫為 `notify/line_messaging.py`，走 LINE Messaging API push
+- [ ] **子分支 `feature/m4-line-messaging`**：通知模組改寫為 `notify/line_messaging.py`，走 LINE Messaging API push
       （取代已停用的 LINE Notify）—— 原列在 M1，2026-07-26 使用者指示改排到最後一步；
       **被下方使用者端待辦卡住，尚無法實測**。一併注意 `config/settings.py` 讀的環境變數
       名還是舊的 `LINE_NOTIFY_TOKEN`／`LINE_NOTIFY_CHANNEL`，要同步改成

@@ -20,7 +20,8 @@ jobs:
           if command -v python3 >/dev/null 2>&1; then
             python3 --version
             python3 -m pip install --upgrade pip
-            python3 -m pip install -r requirements.txt
+            # requirements-dev.txt 已經 -r requirements.txt，一次裝完執行與測試依賴
+            python3 -m pip install -r requirements-dev.txt
           else
             echo "python3 not found on this runner. Install Python or change the job to run on ubuntu-latest." >&2
             exit 1
@@ -29,52 +30,14 @@ jobs:
       - name: 執行語法檢查
         run: python -m py_compile main.py config/settings.py api/rate_limiter.py db/models.py db/repository.py modules/exchange_client.py modules/lending_strategy.py modules/line_notifier.py utils/logger.py utils/exceptions.py
 
-      - name: 執行 smoke test
-        run: |
-          # main() 現在是常駐 while True 主迴圈，不會自己返回，
-          # 所以 smoke test 改成強制 dry-run 只跑一輪 run_once()。
-          python - <<'PY'
-          import sys
-          from pathlib import Path
-
-          from config.settings import load_config, load_secrets_from_disk, resolve_config_path
-          from db.repository import Repository
-          from main import run_once
-          from modules.exchange_client import BitfinexClient
-          from modules.lending_strategy import LendingStrategy
-          from modules.line_notifier import LineNotifier
-          from utils.logger import BotLogger
-
-          root = Path(".").resolve()
-          load_secrets_from_disk(root)
-          config = load_config(str(resolve_config_path(root)))
-          logger = BotLogger(config.get("logging", {}), config.get("logging", {}).get("file"))
-          notifier = LineNotifier(config.get("line", {}))
-          strategy = LendingStrategy(config)
-          client = BitfinexClient(config, logger, dry_run=True)
-          # CI 用暫時的 DB 檔，不要動到設定檔指定的正式路徑
-          repository = Repository("/tmp/ci_smoke_test.sqlite3")
-
-          if not client.test_connection():
-              sys.exit(1)
-
-          run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
-
-          state = repository.get_state()
-          assert state and state["last_run_at"], "巡檢後 bot_state 應該要有心跳時間"
-          offers = repository.connection.execute("SELECT COUNT(*) FROM loan_offers").fetchone()[0]
-          assert offers > 0, "dry-run 巡檢後 loan_offers 應該要有紀錄"
-          repository.close()
-          print(f"smoke test ok（落帳 {offers} 筆掛單，心跳 {state['last_run_at']}）")
-          PY
-
-      - name: 安裝測試套件
-        run: python -m pip install pytest
-
       - name: 執行單元與功能測試
-        run: |
-          if [ -d tests/unit ]; then pytest tests/unit -q || true; fi
-          if [ -d tests/functional ]; then pytest tests/functional -q || true; fi
+        # 這裡刻意不加 `|| true`：測試失敗就要擋下合併，否則寫了測試也攔不住壞掉的程式碼
+        run: pytest tests/unit tests/functional -q
+
+      - name: 執行 dry-run 端到端測試
+        # 取代原本內嵌在 workflow 裡的 heredoc smoke test，驗證內容相同但改得動、看得懂。
+        # -m "not live" 排除會連外網的測試，那些留給 integration job 跑。
+        run: pytest tests/integration -q -m "not live"
 
   integration:
     name: 整合/系統測試
@@ -90,15 +53,16 @@ jobs:
           if command -v python3 >/dev/null 2>&1; then
             python3 --version
             python3 -m pip install --upgrade pip
-            python3 -m pip install -r requirements.txt
+            python3 -m pip install -r requirements-dev.txt
           else
             echo "python3 not found on this runner. Install Python or change the job to run on ubuntu-latest." >&2
             exit 1
           fi
 
-      - name: 執行整合測試
-        run: |
-          if [ -d tests/integration ]; then pytest tests/integration -q; else echo "No integration tests found"; fi
+      - name: 執行整合測試（含 Bitfinex 公開端點）
+        # 含 live 標記的測試：只打公開唯讀的 /v2/ticker/fUSD，不帶金鑰、不碰帳戶、
+        # 不掛單。連不上時測試內部自行 skip，不會讓 CI 因外部服務抖動變紅燈。
+        run: pytest tests/integration -q
 
   deploy:
     name: 容器化部署階段

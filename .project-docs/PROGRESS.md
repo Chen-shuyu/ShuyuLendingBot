@@ -185,3 +185,45 @@
 - 下一步：**M3 已全數完成**，進入 M4（架構重構、測試與部署）——依 ARCHITECTURE.md 完成
   `config/api/strategies/core/db/notify/utils` 分層搬遷、建立 `tests/` 三層測試、收斂
   Podman 部署、最後才做 LINE Messaging API（仍卡在使用者尚未申請 Channel 憑證）
+
+## 2026-08-01
+
+### 本次（M4 測試套件，分支 `test/m4-test-suite`）
+- 前置：先確認 M3 的實際合併狀態。對話中一度依本地快取的 `origin/main` 判斷「M3 尚未合併」，
+  經使用者質疑後 `git fetch` 才發現本地落後 7 個 commit——**M3 早已由 PR #6 合併進 main**
+  （合併點 `6497d54`）。依 D012 的要求以 `git merge-base --is-ancestor` 逐一驗證 M3 分支的
+  6 個 commit 全數在 `origin/main` 內。教訓：判斷分支狀態前一定要先 `git fetch`，
+  本地的 `origin/*` 只是上次同步時的快照
+- 完成：與使用者確認 M4 的三項做法——M4 拆成 3~4 條子分支（不套用 D012 的「一 milestone
+  一分支」）、先補測試再做搬遷、整合測試打 Bitfinex 公開唯讀端點且連不上時 skip。
+  記錄為 DECISIONS.md D015
+- 完成：本機同步 main 至 `6497d54` 後開出 `test/m4-test-suite`
+- 完成：建立 `tests/` 三層測試共 227 項，全數通過（`pytest.ini` 以 `pythonpath = .`
+  解決 import，並定義 `live` marker 供離線執行 `-m "not live"`）：
+  - `tests/unit`（8 個檔）：策略層門檻／階梯利率／筆數降階／金額拆分／天期／風控上限、
+    退避重試與「哪些方法刻意沒有重試」的界線、資料層三張表與 WAL、設定與 secrets 解析、
+    日誌輪替上限、交易所客戶端的 ccxt 例外分類與 V2 陣列解析
+  - `tests/functional`（2 個檔）：`run_once()` 的完整巡檢流程（取消→查餘額→掛單→落帳→通知）、
+    兩條略過路徑仍寫心跳、掛單中途失敗要先落帳再往外拋；`FailureTracker` 的告警去重與恢復
+  - `tests/integration`（2 個檔）：dry-run 端到端（真設定檔＋真 SQLite＋真日誌）、
+    Bitfinex 公開端點的回應格式守門
+- 完成（缺陷修正）：測試抓到 `upsert_daily_earning()` 的實際缺陷——`db/models.py` 把
+  `principal_avg` 宣告為 `NOT NULL`，但函式簽章預設 `None` 且 ON CONFLICT 用了
+  `COALESCE(excluded.principal_avg, ...)`，原意明顯是「傳 None 保留舊值」。NOT NULL 會在
+  衝突解析之前先擋下，導致**首次插入與後續累加兩條路徑都必定 IntegrityError**，整條 None
+  路徑從來沒能用過。因尚無任何 DB 檔存在（本機與部署目錄都沒有），直接改 DDL 為
+  `principal_avg REAL`，遷移成本為零。已補上具名的回歸測試
+- 完成（CI 缺口三項）：`pytest tests/unit -q || true` 的 `|| true` 拿掉——有測試卻擋不住
+  壞掉的程式碼等於白寫；新增 `requirements-dev.txt`（`-r requirements.txt` + pytest），
+  取代 workflow 裡臨時的 `pip install pytest`；把內嵌在 workflow 裡的 heredoc smoke test
+  收斂進 `tests/integration/test_dry_run_cycle.py`，驗證內容相同但改得動、看得懂
+- 驗證：三個 CI 步驟的指令逐一本機實跑（`tests/unit tests/functional` 208 項、
+  `tests/integration -m "not live"` 13 項、`tests/integration` 19 項含實連 Bitfinex）；
+  以 `yaml.safe_load` 確認 workflow 語法正確；把 ccxt 的 public API host 指向不可達位址，
+  確認拋的是 `ccxt.NetworkError`（會被 fixture 攔下轉 skip），CI 不會因外部服務抖動變紅燈
+- 遇到的問題：9 個日誌測試一開始全失敗。原因是 pytest 8.4 起會對 `propagate=False` 的
+  logger 直接掛上 `LogCaptureHandler`，而 `BotLogger` 的邏輯是「已有 handler 就直接返回」，
+  兩者相遇讓測試裡的 `BotLogger` 一個 handler 都不掛。這是測試框架行為而非程式缺陷，
+  改以 `make_logger` fixture 在每次建立前即時清空共用 logger 解決
+- 下一步：推送分支並開 PR 合併進 main；之後進 M4 第二條子分支（依 ARCHITECTURE.md 做
+  `strategies/`、`core/`、`notify/` 的分層搬遷），有這 227 項測試當回歸保護

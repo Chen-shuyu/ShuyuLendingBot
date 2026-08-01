@@ -28,9 +28,10 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
   - [x] `logger` 改用 `RotatingFileHandler`（固定檔名 + 大小輪替）
   - [x] 補 API Rate Limit 重試（`api/rate_limiter.py`，掛單刻意不套）、heartbeat
         （`bot_state.last_run_at`）與連續失敗告警（`FailureTracker`）
-- [ ] M4：架構重構、測試與部署
+- [ ] M4：架構重構、測試與部署（依 DECISIONS.md D015 拆成 3~4 條子分支，各自開 PR）
   - 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils` 分層搬遷
-  - 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
+  - [x] 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
+        （2026-08-01，分支 `test/m4-test-suite`，227 項；CI 的 `|| true` 一併拿掉）
   - 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007），先 dry-run 驗證再小額實單
   - 通知模組改寫為 LINE Messaging API push（取代已於 2025-03 停用的 LINE Notify）——
     原列在 M1，2026-07-26 使用者指示改排到最後一步，待使用者申請好 LINE Developers
@@ -56,6 +57,16 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 重試（掛單刻意不套，因為不冪等）、`db/` SQLite WAL 資料層、心跳與連續失敗告警。連帶補上
 `.gitignore` 的 DB 排除規則與容器的 `/app/data` volume。
 
-下一步進入 **M4（架構重構、測試與部署）**：完成 `strategies/`、`core/`、`notify/` 的分層
-搬遷，建立 `tests/` 三層測試，收斂 Podman 部署（含容器崩潰重啟策略與 healthcheck），
-最後才做 LINE Messaging API —— 仍卡在使用者尚未申請 LINE Developers Channel 憑證。
+2026-07-27 之後 M3 已由 **PR #6 合併進 main**（合併點 `6497d54`），六個 commit 全數驗證在 main 內。
+
+**目前進行中：M4**，依 DECISIONS.md D015 拆成子分支推進：
+
+- [x] `test/m4-test-suite`（2026-08-01）：`tests/` 三層測試 227 項、CI 拿掉 `|| true`、
+      新增 `requirements-dev.txt` 與 `pytest.ini`、把 workflow 內嵌的 heredoc smoke test
+      收斂進整合測試。過程中修掉一個測試抓出的實際缺陷：`upsert_daily_earning()` 因
+      `principal_avg` 被宣告為 `NOT NULL`，整條「傳 None 保留舊值」的路徑從來無法使用
+- [ ] `refactor/m4-layering`：`strategies/`、`core/`、`notify/` 分層搬遷（有測試當回歸保護）
+- [ ] `deploy/m4-podman`：容器崩潰重啟策略、healthcheck、`FatalError` 與
+      `restart: unless-stopped` 的衝突
+- [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
+      LINE Developers Channel 憑證，刻意排在最後一條

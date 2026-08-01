@@ -34,12 +34,15 @@ CREATE INDEX IF NOT EXISTS idx_loan_offers_created_at
 """
 
 # 每日收益彙總。同一天同一幣別只有一列，重複寫入以 upsert 累加。
+# principal_avg 允許 NULL：`upsert_daily_earning()` 以「傳 None 代表本次不更新平均本金、
+# 保留舊值」為介面約定（靠 ON CONFLICT 的 COALESCE 實現）。原本宣告成 NOT NULL 會讓
+# NULL 在衝突解析之前就先撞上約束，等於整條 None 路徑無法使用。
 CREATE_EARNINGS_DAILY = """
 CREATE TABLE IF NOT EXISTS earnings_daily (
     date          TEXT NOT NULL,
     currency      TEXT NOT NULL,
     interest      REAL NOT NULL DEFAULT 0,
-    principal_avg REAL NOT NULL DEFAULT 0,
+    principal_avg REAL,
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (date, currency)
 );

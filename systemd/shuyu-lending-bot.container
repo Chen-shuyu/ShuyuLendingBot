@@ -1,0 +1,69 @@
+# Podman Quadlet 單元 —— 正式部署的容器生命週期由 systemd --user 管理。
+#
+# 為什麼不再由 CI 的 `podman run` 直接起容器（見 DECISIONS.md D017）：
+# CI job 收尾時會清掉自己的行程樹，容器的 conmon 跟著被殺。conmon 一死，
+# 容器的日誌就沒人寫（`podman logs` 永遠是空的）、`--restart` 也永遠不會觸發
+# （沒人監看容器退出）。改由 systemd 啟動後，conmon 落在
+# user@1000.service 的 cgroup 底下，與 CI job 無關，job 結束也不受影響。
+#
+# 安裝位置：~/.config/containers/systemd/shuyu-lending-bot.container
+# CI 的 deploy job 會從這個檔案複製過去，因此這裡才是唯一的真實來源，
+# 不要直接改主機上那份（下次部署就會被蓋掉）。
+
+[Unit]
+Description=Shuyu Bitfinex Lending Bot
+After=network-online.target
+Wants=network-online.target
+
+# 重啟節流。原本 podman 端用 `--restart=on-failure:3` 表達「最多重啟 3 次」，
+# 但 podman 對這個計數何時重置沒有明確定義；systemd 的「時間窗內最多幾次啟動」
+# 語意清楚得多：30 分鐘內最多 4 次啟動（首次 + 3 次重啟），超過就停住不再嘗試。
+# 注意 CI 每次部署的 restart 也算一次，所以 deploy job 會先 reset-failed 清計數。
+StartLimitIntervalSec=1800
+StartLimitBurst=4
+
+[Container]
+ContainerName=shuyu-lending-bot
+# CI 在同一台機器上 `podman build -t shuyu-lending-bot .` 產出的本機映像
+Image=localhost/shuyu-lending-bot:latest
+# 映像一律由本機建置。設 never 是刻意的：萬一映像不存在，要當場失敗，
+# 而不是去 docker.io 拉一個剛好同名的陌生映像下來跑。
+Pull=never
+
+Environment=BFX_SECRETS_FILE=/run/secrets/secrets.env
+
+Volume=/workspace/deploy/active-bots/ShuyuLendingBot:/run/secrets:ro
+Volume=/workspace/deploy/active-bots/ShuyuLendingBot/logs:/app/logs
+# SQLite 檔必須掛在容器外，否則每次重建容器，掛單與收益紀錄就歸零
+Volume=/workspace/deploy/active-bots/ShuyuLendingBot/data:/app/data
+
+# 讀 bot_state 的心跳判斷「還在巡檢嗎」，行程活著但卡死也看得出來。
+# 門檻由 scripts/healthcheck.py 自行計算（巡檢間隔 × 3 + 60 秒）。
+# 刻意不加 --health-on-failure=restart：見 TASKS.md A6，等觀察期滿再決定。
+HealthCmd=python /app/scripts/healthcheck.py
+HealthInterval=60s
+HealthRetries=3
+HealthStartPeriod=180s
+
+# 容器 stdout/stderr 存成檔案。程式自己的 logs/bfx_lending_bot.log 是主要日誌，
+# 這邊接的是它寫不到的部分（直接噴到 stderr 的 traceback、直譯器層級的錯誤）。
+LogDriver=k8s-file
+LogOpt=max-size=10mb
+
+[Service]
+Restart=on-failure
+RestartSec=30
+# main.py 的離開碼：0=正常結束、1=未預期例外（重啟有機會恢復）、
+# 2=EXIT_FATAL（金鑰無效這類問題，人不介入就不會好）。
+# podman 的 restart policy 看不到離開碼，只能靠次數上限硬擋；
+# 改由 systemd 管理後可以直接表達「2 就不要重啟」，這是換過來的實質好處之一。
+RestartPreventExitStatus=2
+
+# podman 的 bind mount 不會自動建立主機端目錄，目錄不存在會以 exit code 125 失敗
+# （M3 起部署一路失敗的根因）。放在這裡而不是只放在 CI，是為了讓開機自動啟動、
+# 以及任何非 CI 觸發的重啟也都成立。
+ExecStartPre=/usr/bin/mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/logs
+ExecStartPre=/usr/bin/mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/data
+
+[Install]
+WantedBy=default.target

@@ -77,57 +77,71 @@ jobs:
         run: |
           podman build -t shuyu-lending-bot .
 
-      - name: 停止並移除舊容器
+      - name: 安裝／更新 Quadlet 單元
+        # 容器的生命週期改由 systemd --user 管理，不再由這個 job 直接 `podman run`
+        # （見 DECISIONS.md D017）。job 收尾時會清掉自己的行程樹，先前容器的 conmon
+        # 就是這樣被殺掉的——conmon 一死，容器日誌沒人寫、restart policy 也不會觸發。
+        # 由 systemd 啟動的話，conmon 落在 user@.service 的 cgroup 底下，與 job 無關。
+        #
+        # 單元檔的真實來源是 repo 裡的 systemd/shuyu-lending-bot.container，
+        # 每次部署都覆蓋過去，主機上那份不要手改。
+        # 掛載目錄的 mkdir 已移進單元的 ExecStartPre，開機自動啟動時也才會成立。
         run: |
-          if podman container exists shuyu-lending-bot; then
-            podman stop shuyu-lending-bot || true
-            podman rm shuyu-lending-bot || true
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          mkdir -p ~/.config/containers/systemd
+          cp systemd/shuyu-lending-bot.container ~/.config/containers/systemd/
+          systemctl --user daemon-reload
+
+      - name: 重新啟動服務
+        # 不需要也不能用 `systemctl --user enable`：Quadlet 產生的單元是動態產物，
+        # 開機自動啟動由單元檔裡的 [Install] WantedBy=default.target 交給 generator 處理。
+        # restart 前先 reset-failed：單元可能因觸及 StartLimitBurst 停在 failed，
+        # 而且 CI 每次部署的 restart 本身也會計入那個次數。
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          systemctl --user reset-failed shuyu-lending-bot.service || true
+          systemctl --user restart shuyu-lending-bot.service
+          systemctl --user --no-pager status shuyu-lending-bot.service || true
+
+      - name: 驗證容器生命週期真的由 systemd 接管
+        # 這一步是刻意加的迴歸防線：先前「自動重啟與容器日誌沒生效」拖了兩個 milestone
+        # 才被發現，就是因為部署完只看 `podman ps` 顯示 running 就算過。
+        # 現在把三個前提直接斷言在部署流程裡，壞掉當下就會紅燈。
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+          echo "--- 服務狀態 ---"
+          systemctl --user is-active shuyu-lending-bot.service
+
+          echo "--- conmon 是否存在（沒有它，日誌與重啟都是假的）---"
+          CONMON_PID=$(podman inspect shuyu-lending-bot --format '{{.State.ConmonPid}}')
+          if [ -z "$CONMON_PID" ] || [ "$CONMON_PID" = "0" ] || ! kill -0 "$CONMON_PID" 2>/dev/null; then
+            echo "::error::conmon 行程不存在（PID=$CONMON_PID），容器日誌與自動重啟都不會生效"
+            exit 1
           fi
+          echo "conmon PID=$CONMON_PID，cgroup："
+          cat "/proc/$CONMON_PID/cgroup"
 
-      - name: 準備主機端掛載目錄
-        # podman 的 bind mount **不會**自動建立主機端目錄（docker 會），目錄不存在時
-        # 直接以 `statfs ...: no such file or directory` 搭配 exit code 125 失敗。
-        # M3 加上 data volume 後主機端從沒建過這個目錄，部署因此一直掛在這一步。
-        # 這裡用 mkdir -p 而非手動建立，才能在主機重建或換機時自動成立。
-        run: |
-          mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/logs
-          mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/data
-
-      - name: 啟動 Podman 容器
-        run: |
-          # data 也要掛出來：SQLite 檔留在容器內的話，每次重新部署掛單與收益紀錄就全沒了
-          #
-          # --restart=on-failure:3
-          #   容器崩潰要能自己爬起來，但不能無限重啟：API 金鑰無效這類問題
-          #   （main.py 以離開碼 2 表示）重開幾次都不會好，只會洗版日誌。
-          #   restart policy 看不到離開碼，因此用「最多 3 次」從次數上節流。
-          # --log-driver=k8s-file
-          #   預設的 journald 在這台 rootless 環境實際取不到內容，`podman logs`
-          #   一直是空的。改用 k8s-file 存成檔案，並加 max-size 免得無限長大。
-          # --health-*
-          #   讀 bot_state 的心跳判斷「還在巡檢嗎」，行程活著但卡死也看得出來。
-          #   刻意不加 --health-on-failure=restart：先累積一段觀察期，確認判斷
-          #   不會誤判再開自動重啟（見 DECISIONS.md D016）。
-          podman run -d \
-            --name shuyu-lending-bot \
-            --restart=on-failure:3 \
-            --log-driver=k8s-file \
-            --log-opt max-size=10mb \
-            --health-cmd "python /app/scripts/healthcheck.py" \
-            --health-interval=60s \
-            --health-retries=3 \
-            --health-start-period=180s \
-            -e BFX_SECRETS_FILE=/run/secrets/secrets.env \
-            -v /workspace/deploy/active-bots/ShuyuLendingBot:/run/secrets:ro \
-            -v /workspace/deploy/active-bots/ShuyuLendingBot/logs:/app/logs \
-            -v /workspace/deploy/active-bots/ShuyuLendingBot/data:/app/data \
-            shuyu-lending-bot
+          echo "--- podman logs 是否取得到內容 ---"
+          for _ in $(seq 1 15); do
+            [ -n "$(podman logs --tail=5 shuyu-lending-bot 2>/dev/null)" ] && break
+            sleep 2
+          done
+          if [ -z "$(podman logs --tail=5 shuyu-lending-bot 2>/dev/null)" ]; then
+            echo "::error::30 秒內 podman logs 仍然沒有內容，conmon 或 log driver 有問題"
+            exit 1
+          fi
+          podman logs --tail=20 shuyu-lending-bot
 
       - name: 檢查容器狀態
         run: |
           podman ps --filter "name=shuyu-lending-bot"
+          # 重啟策略已改由 systemd 表達，podman 端應為 no；這裡一併印出來確認兩邊沒打架
           podman inspect shuyu-lending-bot \
-            --format '重啟策略：{{.HostConfig.RestartPolicy.Name}}（上限 {{.HostConfig.RestartPolicy.MaximumRetryCount}} 次）／日誌驅動：{{.HostConfig.LogConfig.Type}}'
+            --format 'podman 重啟策略：{{.HostConfig.RestartPolicy.Name}}（應為 no，重啟已交給 systemd）／日誌驅動：{{.HostConfig.LogConfig.Type}}'
 
       - name: 取得最近容器日誌
         # 讀掛載出來的日誌檔，而不是 `podman logs`：即使容器已經被收掉，檔案還在，

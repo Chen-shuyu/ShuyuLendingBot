@@ -441,3 +441,54 @@
   改了設定、測試容器看起來好了，就當作修好」。當時的驗證用的是**自己手動起的容器**，
   而問題只在 **CI 起的容器**上發生，等於驗證環境與故障環境根本不同。
   往後驗證部署層的修正，要在真正的部署路徑上驗收，或至少確認驗證環境與實際環境的差異。
+
+## D017 — 容器生命週期改由 systemd（Quadlet）管理，不再由 CI job 直接 `podman run`
+- 日期：2026-08-02
+- 背景：D016 補上的四項可靠性措施，合併後驗收發現其中兩項（自動重啟、容器日誌）
+  **實際上從不生效**。根因不在程式碼也不在參數，而在部署方式：CI 的 deploy job
+  用 `podman run -d` 起容器，job 收尾時 runner 會清掉自己的行程樹，容器的 conmon
+  一併被殺。conmon 是 podman 為每個容器配的看門人，負責寫容器日誌、以及在容器退出時
+  依 `--restart` 規則重新拉起——它不在，這兩件事就都不會發生。
+  問題自 M3 起就存在（PR #8 那版同樣沒有 conmon），只是到 PR #10 才查清楚。
+- 決策：
+  1. **容器由 systemd --user 的 Quadlet 單元啟動**，單元檔
+     `systemd/shuyu-lending-bot.container` 納入版控，CI 每次部署複製到
+     `~/.config/containers/systemd/` 後 `daemon-reload`。主機上那份是產物，不要手改。
+  2. **CI 的 deploy job 只做三件事**：`podman build`、更新單元檔、
+     `systemctl --user restart`。不再自己 `podman run`，conmon 因此落在
+     `user@1000.service` 的 cgroup 底下，與 job 的生命週期脫鉤。
+  3. **開啟 linger**（`loginctl enable-linger shuyu`）。`systemd --user` 原本只在使用者
+     還有登入 session 時存在，沒有 linger 的話所有 session 結束後容器會一起消失。
+     這是第 1 點成立的前提。
+  4. **重啟節流改用 systemd 語意**：`Restart=on-failure` + `StartLimitIntervalSec=1800`
+     + `StartLimitBurst=4`（30 分鐘內最多 4 次啟動），並**移除 podman 端的
+     `--restart=on-failure:3`**——兩者會打架。順帶解掉 D016 留下的疑點：
+     podman 的 `on-failure:N` 計數何時重置沒有明確定義，systemd 的「時間窗內幾次」清楚得多。
+  5. **`RestartPreventExitStatus=2`**：D016 當時寫「restart policy 看不到離開碼，
+     只能靠次數上限節流」。改由 systemd 管理後這個限制消失了——**systemd 看得到離開碼**，
+     可以直接表達「`EXIT_FATAL=2` 就不要重啟」。這是換過來額外拿到的好處。
+  6. **掛載目錄的 `mkdir -p` 從 CI 移進單元的 `ExecStartPre`**：開機自動啟動與任何
+     非 CI 觸發的重啟也才會成立，不必依賴「一定有跑過一次 CI」。
+  7. **CI 新增「驗證容器生命週期真的由 systemd 接管」步驟**，斷言三件事：服務為 active、
+     conmon 行程存在、`podman logs` 取得到內容。任一項不成立就讓部署紅燈。
+- 理由：方向 B（想辦法讓 conmon 在 job 結束後存活，例如清掉 runner 追蹤子行程用的環境變數）
+  改動只有一行，但屬於繞過 runner 的既定行為，runner 改版就可能再壞一次，
+  而且不解決「主機重開機後容器不會自己起來」。Quadlet 是 podman 官方現行做法
+  （`podman generate systemd` 已標為 deprecated），一次把常駐、開機自動啟動、
+  重啟節流、離開碼語意都放進同一個地方表達。
+- 驗證（改用對照實驗，而不是只看設定檔——這是 D016 的教訓）：
+  - 以測試用 Quadlet 單元跑「印一行 → 睡 5 秒 → 以指定離開碼結束」：
+    離開碼 1 → `ExecMainStatus=1`、重啟 4 次後觸及 StartLimitBurst 停在 failed；
+    離開碼 2 → `ExecMainStatus=2`、`NRestarts=0`，**完全不重啟**。
+    這同時證實了離開碼確實會透過 `--sdnotify=conmon` 傳回 systemd。
+  - **直接針對根因的對照實驗**：用 `systemd-run --user --scope` 建一個模擬 CI job 的
+    scope，在裡面 `systemctl --user start` 服務，然後把整個 scope 的行程樹 SIGKILL 掉。
+    結果 conmon 存活，cgroup 為
+    `user@1000.service/app.slice/shuyu-lending-bot.service/runtime`，容器續跑。
+  - 正式容器實際接管後：服務 active、conmon 存在、**`podman logs` 終於有內容**
+    （自 M3 以來第一次）、`podman inspect` 的重啟策略為 `no`（已交給 systemd）、
+    健康狀態 healthy、DB 心跳與掛單累計正常。
+- 影響：`docker-compose.yml` 僅存本機測試用途，其註解同步說明「次數節流與離開碼判斷
+  只在正式部署那側由 systemd 表達」，compose 兩者都做不到。
+  `systemd/bfx-lending-bot.service`（非容器、直接跑 `start.sh` 的舊單元）維持原狀，
+  用途仍是本機測試，去留待確認。

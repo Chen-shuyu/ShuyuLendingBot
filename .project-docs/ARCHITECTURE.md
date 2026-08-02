@@ -7,7 +7,8 @@
 不使用（也不存在）統一方法（見 D010）。策略層以純函式計算掛單利率/金額/天期，
 核心迴圈（`while True` + `time.sleep`）
 每輪巡檢：取消未成交舊單 → 查詢可用餘額 → 抓 FRR → 產生掛單計畫 → 送出掛單 → 寫入 DB →
-LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007），崩潰由容器 restart 策略頂起。
+LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007），容器由 systemd --user
+管理生命週期，崩潰後由 systemd 的 restart 策略頂起（見 D017）。
 
 ```
 [main.py bootstrap]
@@ -76,7 +77,8 @@ ShuyuLendingBot/
 ├── utils/logger.py              # 改用 RotatingFileHandler
 ├── scripts/healthcheck.py        # 容器 healthcheck（維運腳本，不在主程式執行路徑上）
 ├── tests/{unit,functional,integration}/
-├── systemd/                      # 保留供本機測試/備援用（部署主線見 D007、D016）
+├── systemd/                      # shuyu-lending-bot.container 是正式部署的 Quadlet
+│                                 # 單元（D017）；bfx-lending-bot.service 為本機測試用
 ├── main.py                       # 精簡為 bootstrap，主迴圈移入 core/
 └── .project-docs/                # 本文件所在
 ```
@@ -131,6 +133,10 @@ ShuyuLendingBot/
 - 通知：LINE Messaging API push，取代已停用的 LINE Notify —— 見 DECISIONS D002。
 - 持久化：SQLite（WAL 模式），非外部 DB —— 見 DECISIONS D006。SQLite 檔須以 volume 掛出
   容器（`/app/data`），否則重新部署即歸零。
-- 部署：Podman 容器化為主線 —— 見 DECISIONS D007。容器以 `--restart=on-failure:3` 節流重啟、
-  `--log-driver=k8s-file` 讓日誌取得回來、`--health-cmd` 掛上心跳檢查 —— 見 DECISIONS D016。
+- 部署：Podman 容器化為主線 —— 見 DECISIONS D007。容器**由 systemd --user 的 Quadlet 單元
+  `systemd/shuyu-lending-bot.container` 啟動**，不由 CI job 直接 `podman run`（否則 job
+  收尾會殺掉 conmon，日誌與重啟都形同虛設）—— 見 DECISIONS D017。重啟節流以
+  `Restart=on-failure` + `StartLimitBurst` 表達、`RestartPreventExitStatus=2` 讓
+  `EXIT_FATAL` 不重啟；`--log-driver=k8s-file` 讓日誌取得回來、`--health-cmd` 掛上
+  心跳檢查 —— 見 DECISIONS D016。
 - 可觀測：固定檔名日誌輪替、指數退避重試、`bot_state` 心跳與連續失敗告警 —— 見 DECISIONS D013。

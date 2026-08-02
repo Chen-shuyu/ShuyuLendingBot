@@ -27,6 +27,9 @@
 - `pytest.ini`（`pythonpath = .` 與 `live` marker）與 `requirements-dev.txt`
 
 ### Fixed
+- CI 部署階段自 M3 起持續以 exit code 125 失敗的問題：podman 的 bind mount 不會自動建立
+  主機端目錄（docker 會），而主機上從未建立 `.../ShuyuLendingBot/data`。workflow 在
+  `podman run` 之前補一步 `mkdir -p`。修正後機器人已恢復常駐運行
 - `upsert_daily_earning()` 傳 `principal_avg=None`（含不傳、走預設值）必定
   `IntegrityError` 的問題：`earnings_daily.principal_avg` 原宣告為 `NOT NULL`，
   但 ON CONFLICT 用 `COALESCE` 表達的原意是「傳 None 保留舊值」，NOT NULL 會在衝突解析
@@ -63,6 +66,11 @@
   （需另接 Bitfinex ledger 端點，見 DECISIONS.md D013、TASKS.md M3）
 - `FatalError` 會讓程式 `return 1` 退出，但容器設 `restart: unless-stopped`，
   金鑰失效這類錯誤會導致無限重啟迴圈（見 TASKS.md M4）
+- CI 的 `podman run` 沒有任何 `--restart` 參數，容器崩潰後不會自行復原；與
+  `docker-compose.yml` 的 `restart: unless-stopped` 兩邊策略不一致（見 TASKS.md M4）
+- `podman logs shuyu-lending-bot` 取不到任何內容（log driver 為 `journald`），
+  deploy job 最後的「取得最近容器日誌」步驟等於空跑；除錯需改讀掛載出來的 log 檔
+- 部署目錄尚無 `secrets.env`，`dry_run: true` 下不影響，實單前必須補上
 
 本專案尚未發版（無 git tag），暫不建立版本號段落；待 M1～M4（見 PLAN.md）完成、
 可穩定 dry-run 常駐後，再開始標記版本。

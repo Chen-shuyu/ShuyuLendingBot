@@ -66,7 +66,9 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       收斂進整合測試。過程中修掉一個測試抓出的實際缺陷：`upsert_daily_earning()` 因
       `principal_avg` 被宣告為 `NOT NULL`，整條「傳 None 保留舊值」的路徑從來無法使用
 - [ ] `refactor/m4-layering`：`strategies/`、`core/`、`notify/` 分層搬遷（有測試當回歸保護）
-- [ ] `deploy/m4-podman`：容器崩潰重啟策略、healthcheck、`FatalError` 與
-      `restart: unless-stopped` 的衝突
+- [ ] `deploy/m4-podman`：部分完成。已修掉讓部署自 M3 起一直失敗的主機端目錄問題
+      （PR #8，2026-08-01）——**機器人已恢復常駐運行**，dry-run 下心跳與落帳皆正常。
+      剩餘：容器崩潰重啟策略、healthcheck、`FatalError` 與 `restart: unless-stopped`
+      的衝突、`podman logs` 取不到內容
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條

@@ -78,6 +78,12 @@
             加上該 volume 起每次都以 exit code 125 失敗。workflow 補 `mkdir -p` 一步
       - [ ] 補 `secrets.env` 到部署目錄（`/workspace/deploy/active-bots/ShuyuLendingBot/`）。
             目前該檔不存在，`dry_run: true` 下不影響，**實單前必須補上**（使用者端待辦）
+      - [ ] `podman logs shuyu-lending-bot` 取不到任何內容（log driver 為 `journald`，
+            rootless 環境下實際拿不到），deploy job 最後的「取得最近容器日誌」步驟等於
+            空跑。可考慮改用 `--log-driver=k8s-file`，或直接改成讀掛載出來的
+            `logs/bfx_lending_bot.log`（2026-08-02 發現）
+      - [ ] 清理 `logs/` 底下 M3 之前產生的帶時間戳舊檔（`bfx_lending_bot_2026*.log`），
+            已是歷史殘留、不再增加，但會干擾查看
       - 決定容器崩潰重啟策略（`podman run --restart` 或 `podman generate systemd`）
       - 確認 `systemd/bfx-lending-bot.service` 的去留（改為本機測試用途）
       - **`FatalError` 目前是 `return 1` 直接退出，但 `docker-compose.yml` 設

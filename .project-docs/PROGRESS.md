@@ -250,3 +250,26 @@
   - 部署目錄裡沒有 `secrets.env`。目前 `dry_run: true` 不受影響，實單前必須補上
 - 下一步：推送並開 PR 讓 main 的 CI 轉綠；之後在同一條分支處理 restart 策略、
   容器 healthcheck、`FatalError` 與自動重啟的衝突
+
+## 2026-08-02
+
+### 本次（部署修正驗收與文件同步，分支 `docs/sync-m4-deploy`）
+- 確認：`deploy/m4-podman` 的修正已由 **PR #8 合併進 main**（合併點 `6983394`），
+  兩個 commit 依 D012 逐一比對確認都在 `origin/main` 內；PR 的三個 job 全部通過
+- 確認：**部署真的成功了，機器人已恢復常駐運行**。容器 `shuyu-lending-bot` 自
+  2026-08-01 22:27 起持續運行約 17 小時，`bot_state` 顯示：
+  - `last_run_at` = 2026-08-02T07:37:34+00:00（心跳正常）
+  - `consecutive_failures` = 0
+  - `last_action` = 「掛出 2 筆掛單，合計 344.12 USD」
+  - `loan_offers` 累積 208 筆（全為 `dry_run`），約 104 輪巡檢，與 600 秒間隔相符
+- 確認：M3 的固定檔名輪替在正式環境確實生效，`logs/bfx_lending_bot.log` 正常寫入。
+  目錄下仍留有 M3 之前產生的一批帶時間戳舊檔（`bfx_lending_bot_2026*.log`），
+  已是歷史殘留、不再增加
+- 新發現（尚未處理）：**`podman logs shuyu-lending-bot` 完全沒有輸出**。容器的
+  log driver 是 `journald`，rootless 環境下實際取不到內容，導致 CI deploy job 最後
+  那個「取得最近容器日誌」步驟等於拿不到東西。要看日誌只能讀掛載出來的檔案。
+  已列入 TASKS.md 的 `deploy/m4-podman` 待辦
+- 流程更新：使用者指示「PR 沒問題且已順利合併進 main 後，一律切回 main」，
+  記錄為 DECISIONS.md D014 的補充步驟；同時寫入 `.ai-brain/CORE.md` 作為跨專案慣例
+- 下一步：`deploy/m4-podman` 的剩餘項目（容器重啟策略、healthcheck、`FatalError`
+  與自動重啟的衝突、podman logs 取不到內容），以及 `refactor/m4-layering` 分層搬遷

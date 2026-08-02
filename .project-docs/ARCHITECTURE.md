@@ -39,12 +39,14 @@ ShuyuLendingBot/
 │   ├── lending_strategy.py     # LendingStrategy.build_offer_plan()：門檻/拆單/天期判斷骨架
 │   └── line_notifier.py        # LineNotifier：呼叫已停用的 LINE Notify（永遠失敗）
 ├── utils/logger.py             # BotLogger：RotatingFileHandler（M3 改）
-├── tests/                      # 三層測試 227 項（M4 新增，見 DECISIONS.md D015）
+├── scripts/healthcheck.py      # 容器 healthcheck：唯讀讀 bot_state 心跳（M4 新增，見 D016）
+├── tests/                      # 三層測試 236 項（M4 新增，見 DECISIONS.md D015、D016）
 │   ├── conftest.py             # 共用 fixture 與測試替身（FakeLogger／FakeNotifier／repository）
 │   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端
 │   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重
 │   └── integration/            # dry-run 端到端、Bitfinex 公開端點格式守門（live marker）
 └── main.py                     # 常駐主迴圈 + run_once + FailureTracker（尚未搬進 core/）
+                                # 離開碼 0/1/2 語意化，退出前落帳（M4 改，見 D016）
 ```
 
 測試層與待搬遷的目錄結構是耦合的：`refactor/m4-layering` 做搬遷時，`tests/` 的 import
@@ -72,8 +74,9 @@ ShuyuLendingBot/
 ├── notify/
 │   └── line_messaging.py        # 由 modules/line_notifier.py 改寫，走 LINE Messaging API
 ├── utils/logger.py              # 改用 RotatingFileHandler
+├── scripts/healthcheck.py        # 容器 healthcheck（維運腳本，不在主程式執行路徑上）
 ├── tests/{unit,functional,integration}/
-├── systemd/                      # 保留供本機測試/備援用（部署主線見 D007）
+├── systemd/                      # 保留供本機測試/備援用（部署主線見 D007、D016）
 ├── main.py                       # 精簡為 bootstrap，主迴圈移入 core/
 └── .project-docs/                # 本文件所在
 ```
@@ -108,6 +111,10 @@ ShuyuLendingBot/
   （`POST https://api.line.me/v2/bot/message/push`）。在那之前，M3 的連續失敗告警實際上
   只會留在日誌裡。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
+- `scripts/healthcheck.py`：容器 healthcheck 的執行檔，唯讀開啟 SQLite 讀 `bot_state.last_run_at`，
+  心跳超過「巡檢間隔 × 3 + 60 秒」就以離開碼 1 回報 unhealthy。刻意不看
+  `consecutive_failures`（那是交易所端問題，重啟無益），也刻意不建立任何檔案或資料表——
+  健康檢查有副作用會把「DB 掛載掉了」這個真正的問題蓋掉（D016）。
 
 ## 刻意排除的部分
 
@@ -124,5 +131,6 @@ ShuyuLendingBot/
 - 通知：LINE Messaging API push，取代已停用的 LINE Notify —— 見 DECISIONS D002。
 - 持久化：SQLite（WAL 模式），非外部 DB —— 見 DECISIONS D006。SQLite 檔須以 volume 掛出
   容器（`/app/data`），否則重新部署即歸零。
-- 部署：Podman 容器化為主線 —— 見 DECISIONS D007。
+- 部署：Podman 容器化為主線 —— 見 DECISIONS D007。容器以 `--restart=on-failure:3` 節流重啟、
+  `--log-driver=k8s-file` 讓日誌取得回來、`--health-cmd` 掛上心跳檢查 —— 見 DECISIONS D016。
 - 可觀測：固定檔名日誌輪替、指數退避重試、`bot_state` 心跳與連續失敗告警 —— 見 DECISIONS D013。

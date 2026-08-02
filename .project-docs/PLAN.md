@@ -32,7 +32,9 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
   - 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils` 分層搬遷
   - [x] 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
         （2026-08-01，分支 `test/m4-test-suite`，227 項；CI 的 `|| true` 一併拿掉）
-  - 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007），先 dry-run 驗證再小額實單
+  - [x] 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007、D016）：
+        部署已恢復、容器可靠性四項（重啟次數上限、離開碼語意化、日誌取得、心跳健康檢查）
+        完成（2026-08-01～02）。仍在 dry-run 驗證階段，小額實單待使用者補 `secrets.env`
   - 通知模組改寫為 LINE Messaging API push（取代已於 2025-03 停用的 LINE Notify）——
     原列在 M1，2026-07-26 使用者指示改排到最後一步，待使用者申請好 LINE Developers
     Channel 憑證後才實作／實測
@@ -66,9 +68,15 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       收斂進整合測試。過程中修掉一個測試抓出的實際缺陷：`upsert_daily_earning()` 因
       `principal_avg` 被宣告為 `NOT NULL`，整條「傳 None 保留舊值」的路徑從來無法使用
 - [ ] `refactor/m4-layering`：`strategies/`、`core/`、`notify/` 分層搬遷（有測試當回歸保護）
-- [ ] `deploy/m4-podman`：部分完成。已修掉讓部署自 M3 起一直失敗的主機端目錄問題
-      （PR #8，2026-08-01）——**機器人已恢復常駐運行**，dry-run 下心跳與落帳皆正常。
-      剩餘：容器崩潰重啟策略、healthcheck、`FatalError` 與 `restart: unless-stopped`
-      的衝突、`podman logs` 取不到內容
+- [x] `deploy/m4-podman`（PR #8，2026-08-01）：修掉讓部署自 M3 起一直失敗的主機端目錄
+      問題——**機器人已恢復常駐運行**，dry-run 下心跳與落帳皆正常
+- [x] `deploy/m4-podman-hardening`（2026-08-02）：容器可靠性四項一次收斂
+      （`--restart=on-failure:3` 次數上限、離開碼語意化 0/1/2 並在退出前落帳、
+      日誌驅動改 `k8s-file` 且 CI 改讀掛載出來的日誌檔、新增 `scripts/healthcheck.py`
+      心跳檢查），見 DECISIONS.md D016。測試 227 → 236 項。
+      剩餘：觀察期滿後評估 `--health-on-failure=restart`；`secrets.env` 屬使用者端待辦
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
+
+M4 目前只剩 `refactor/m4-layering`（分層搬遷）與被憑證卡住的 LINE 通知兩條；
+測試與部署兩條已完成。

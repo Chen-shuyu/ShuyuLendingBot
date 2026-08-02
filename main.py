@@ -8,12 +8,22 @@
 每輪的結果都會寫進 SQLite：掛單流水逐筆落帳（含 dry-run 與失敗），
 `bot_state.last_run_at` 則兼作心跳時間戳，連續失敗次數也一併寫入，
 讓外部健康檢查不必啟動 Python 就能判斷機器人是否還健康。
+
+離開碼分成三種（見 DECISIONS.md D016）。容器的 restart policy 只看「是不是 0」，
+分不出這三種，重啟次數的節流交給 `--restart=on-failure:N`；離開碼的用途是讓人
+（與 `podman inspect` 的 `.State.ExitCode`）一眼看出容器為什麼收掉，
+判斷該去修設定還是查日誌。
 """
 
 import os
 import sys
 import time
 from pathlib import Path
+
+# 離開碼語意
+EXIT_OK = 0  # 正常結束（收到中斷訊號）
+EXIT_UNEXPECTED = 1  # 未預期的例外，重啟有機會自行恢復
+EXIT_FATAL = 2  # 金鑰無效這類問題，人不介入就不會好，重啟只會空轉
 
 from config.settings import load_config, load_secrets_from_disk, resolve_config_path
 from db.repository import Repository
@@ -145,7 +155,11 @@ def main() -> int:
     try:
         if not client.test_connection():
             logger.error("啟動檢查失敗")
-            return 1
+            # 落帳再退出：容器收掉之後日誌也可能一起看不到（見 D016），
+            # DB 是唯一一定留得下來的地方，健康檢查與事後追查都靠它。
+            repository.save_state(last_action="啟動檢查失敗，機器人未進入主迴圈")
+            notifier.send("Bitfinex 放貸機器人啟動檢查失敗，已停止運作。")
+            return EXIT_FATAL
 
         logger.info(f"進入常駐主迴圈，巡檢間隔 {interval_seconds} 秒")
         while True:
@@ -160,15 +174,24 @@ def main() -> int:
                 failures.record_failure(str(exc))
             except FatalError as exc:
                 logger.error(f"致命錯誤，機器人即將停止：{exc}")
+                repository.save_state(last_action=f"致命錯誤已停止：{exc}")
                 notifier.send(f"Bitfinex 放貸機器人發生致命錯誤，已停止運作：{exc}")
-                return 1
+                return EXIT_FATAL
             else:
                 failures.record_success()
 
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         logger.info("收到中斷訊號，機器人正常結束。")
-        return 0
+        return EXIT_OK
+    except Exception as exc:  # noqa: BLE001 - 最外層攔截，只為了留下痕跡再往下走
+        # 沒被分類過的例外原本會直接把 traceback 印到 stderr，而容器的 stderr
+        # 在這個部署環境裡拿不到（見 D016），等於崩潰現場完全消失。
+        # 這裡改寫進日誌檔與 DB，兩者都掛載在主機上。
+        logger.exception(f"未預期的例外，機器人即將停止：{exc}")
+        repository.save_state(last_action=f"未預期的例外已停止：{exc}")
+        notifier.send(f"Bitfinex 放貸機器人發生未預期的例外，已停止運作：{exc}")
+        return EXIT_UNEXPECTED
     finally:
         repository.close()
 

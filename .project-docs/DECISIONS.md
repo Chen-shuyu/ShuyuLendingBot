@@ -353,3 +353,58 @@
   - 先搬遷再補測試 —— 放棄，測試檔的 import 只要寫一次，但搬遷過程完全沒有回歸保護。
 - 影響範圍：M4 的分支與 PR 流程（D012 第 1 點在 M4 例外處理，第 2 點仍依 D014 走 PR）、
   `.github/workflows/python-app.yml`、新增 `tests/`、`pytest.ini`、`requirements-dev.txt`。
+
+## D016 — 容器可靠性四項：重啟次數上限、離開碼語意化、日誌改讀掛載檔、健康檢查只看心跳
+- 日期：2026-08-02
+- 背景：M3 起機器人已能常駐運行，但等於沒有安全網——`podman run` 完全沒有 `--restart`
+  參數（崩了就永遠躺平）、`docker-compose.yml` 卻寫 `restart: unless-stopped`（兩邊不一致）、
+  `podman logs` 一直取不到內容、沒有任何機制能看出「行程活著但已經不巡檢」。
+  這四件事彼此牽動，拆開做會做出互相打架的設計，因此一次收斂。
+- 決策：
+  1. **重啟策略採 `--restart=on-failure:3`**，正式部署與 `docker-compose.yml` 都改成
+     `on-failure` 系列，不再用 `unless-stopped`。
+  2. **`main.py` 的離開碼語意化為三種**：`EXIT_OK = 0`（收到中斷訊號的正常結束）、
+     `EXIT_UNEXPECTED = 1`（未分類的例外）、`EXIT_FATAL = 2`（金鑰無效這類人不介入
+     就不會好的錯）。並且**退出前一律把原因寫進 `bot_state.last_action`**，
+     連未預期的例外也在最外層攔一次，寫日誌與 DB 後才結束。
+  3. **容器日誌驅動改 `k8s-file`（搭配 `--log-opt max-size=10mb`）**，CI 的「取得最近
+     容器日誌」改成讀掛載出來的 `logs/bfx_lending_bot.log`，`podman logs` 降為備援。
+  4. **新增 `scripts/healthcheck.py` 作為容器 healthcheck**，只讀 `bot_state.last_run_at`
+     判斷心跳是否過期（預設門檻為巡檢間隔的 3 倍 + 60 秒，可用
+     `engine.health_max_silence_seconds` 覆寫），**刻意不看 `consecutive_failures`**，
+     且**這一輪先不加 `--health-on-failure=restart`**。
+- 原因：
+  1. `unless-stopped` 與 `always` 會和「致命錯誤直接退出」打架：API 金鑰無效時變成
+     啟動→退出→啟動的無限迴圈，日誌被洗版，真正的原因反而更難找。完全不設 restart
+     則是另一個極端——一次偶發崩潰就讓機器人靜靜躺平到有人發現為止。次數上限是這兩者
+     之間唯一站得住的位置：能自行恢復的問題三次內大多會過，過不了的問題重開再多次也沒用。
+  2. restart policy 只看離開碼是不是 0，分不出上面那三種，所以**節流靠次數、不靠離開碼**；
+     離開碼的價值在給人看——`podman inspect` 的 `.State.ExitCode` 是 2 就直接去查設定與金鑰，
+     是 1 就去翻 traceback。退出前落帳則是因為容器收掉後日誌不一定拿得到（見第 3 點），
+     DB 掛在主機上，是唯一一定留得下來的地方。
+  3. 預設的 `journald` 在這台 rootless 環境實際取不到內容（2026-08-02 確認），CI 那步
+     等於空跑了好幾個月。改用 `k8s-file` 讓 `podman logs` 恢復可用，但真正該讀的是程式
+     自己寫的日誌檔：它有輪替、格式完整，而且**容器被收掉之後檔案還在**——容器崩潰那一刻
+     的現場，恰好就是最需要日誌的時候。`max-size` 是順手補的，免得為了修日誌又製造出
+     一個無限長大的檔案。
+  4. `consecutive_failures` 高代表交易所連線或金鑰有問題，機器人本身正在正常工作，
+     **重啟容器不會讓它變好**，那條路已經由 `FailureTracker` 的告警負責；健康檢查要回答的
+     是另一個問題：「這個行程還在動嗎」。門檻取 3 輪是為了讓單輪的網路延遲、取消掛單的
+     等待、交易所偶發變慢都不會誤判。先不開自動重啟，是因為誤判的代價（重啟一個好好的
+     容器）目前沒有實測資料可判斷發生率——先讓 `podman ps` 顯示 healthy/unhealthy 累積
+     一段觀察期，確認判斷準確再開，已列入 TASKS.md。
+- 考慮過的替代方案：
+  - 維持 `restart: unless-stopped` —— 放棄，就是它造成無限重啟迴圈的疑慮。
+  - 致命錯誤改成離開碼 0，讓 `on-failure` 自然不重啟 —— 放棄。語意上騙人，
+    未來任何看離開碼的監控都會把「金鑰無效停機」當成正常結束。
+  - 改用 `podman generate systemd` + `StartLimitBurst` 做節流 —— 放棄（至少這一輪）。
+    效果與 `on-failure:3` 相同，卻多一層部署元件要維護，也讓 CI 的部署步驟不再是
+    「一行 podman run 就重現得出來」。`systemd/bfx-lending-bot.service` 因此維持
+    本機測試用途，不進正式路線。
+  - healthcheck 把 `consecutive_failures` 也算進去 —— 放棄，理由同上，那是外部問題。
+  - healthcheck 直接執行一次真的巡檢來確認活著 —— 放棄，健康檢查有副作用是大忌，
+    而且會真的去打交易所 API。讀 DB 是唯讀、零副作用、也不需要金鑰。
+- 影響範圍：`.github/workflows/python-app.yml` 的 deploy job、`docker-compose.yml`、
+  `main.py` 的離開碼與退出路徑、新增 `scripts/healthcheck.py` 與
+  `tests/unit/test_healthcheck.py`、`tests/functional/test_main_exit_codes.py`。
+  `config.yaml` 未新增鍵；`engine.health_max_silence_seconds` 是可選的覆寫，不設就用預設。

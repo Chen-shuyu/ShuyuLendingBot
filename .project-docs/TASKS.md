@@ -78,20 +78,30 @@
             加上該 volume 起每次都以 exit code 125 失敗。workflow 補 `mkdir -p` 一步
       - [ ] 補 `secrets.env` 到部署目錄（`/workspace/deploy/active-bots/ShuyuLendingBot/`）。
             目前該檔不存在，`dry_run: true` 下不影響，**實單前必須補上**（使用者端待辦）
-      - [ ] `podman logs shuyu-lending-bot` 取不到任何內容（log driver 為 `journald`，
-            rootless 環境下實際拿不到），deploy job 最後的「取得最近容器日誌」步驟等於
-            空跑。可考慮改用 `--log-driver=k8s-file`，或直接改成讀掛載出來的
-            `logs/bfx_lending_bot.log`（2026-08-02 發現）
-      - [ ] 清理 `logs/` 底下 M3 之前產生的帶時間戳舊檔（`bfx_lending_bot_2026*.log`），
-            已是歷史殘留、不再增加，但會干擾查看
-      - 決定容器崩潰重啟策略（`podman run --restart` 或 `podman generate systemd`）
-      - 確認 `systemd/bfx-lending-bot.service` 的去留（改為本機測試用途）
-      - **`FatalError` 目前是 `return 1` 直接退出，但 `docker-compose.yml` 設
-        `restart: unless-stopped`**，API 金鑰無效這類錯會變成無限重啟迴圈。需搭配
-        `StartLimitBurst` 之類的節流，或改用不會被自動重啟的離開碼
-        （2026-07-27 於 M3 發現）
-      - 加上容器 healthcheck：讀 `bot_state.last_run_at`（心跳）與 `consecutive_failures`
-        判斷存活，M3 已把兩者寫進 DB，只差檢查腳本（2026-07-27）
+      - [x] `podman logs` 取不到內容（log driver 為 `journald`，rootless 下拿不到）：
+            改用 `--log-driver=k8s-file`（含 `max-size=10mb`），CI 的「取得最近容器日誌」
+            改讀掛載出來的 `logs/bfx_lending_bot.log`，`podman logs` 降為備援
+            （2026-08-02，分支 `deploy/m4-podman-hardening`，見 DECISIONS.md D016）
+      - [x] 清理 `logs/` 底下 M3 之前產生的帶時間戳舊檔（部署目錄 7 個、專案目錄 4 個），
+            刪前確認全是 dry-run 常規巡檢、無 ERROR/CRITICAL（2026-08-02）
+      - [x] 容器崩潰重啟策略：採 `--restart=on-failure:3`（次數上限），
+            `docker-compose.yml` 同步由 `unless-stopped` 改為 `on-failure`（2026-08-02）
+      - [x] `FatalError` 與自動重啟的衝突：`main.py` 離開碼語意化為
+            `EXIT_OK=0` / `EXIT_UNEXPECTED=1` / `EXIT_FATAL=2`，三條退出路徑退出前
+            都先把原因寫進 `bot_state.last_action`。restart policy 看不到離開碼，
+            節流靠 `on-failure:3` 的次數上限（2026-08-02）
+      - [x] 容器 healthcheck：新增 `scripts/healthcheck.py`，唯讀讀取
+            `bot_state.last_run_at` 判斷心跳是否過期（門檻 = 巡檢間隔 × 3 + 60 秒）。
+            **刻意不看 `consecutive_failures`**——那是交易所端的問題，重啟容器無益，
+            已由 `FailureTracker` 告警負責（2026-08-02，見 DECISIONS.md D016）
+      - [ ] 觀察期滿後評估加上 `--health-on-failure=restart`：目前 healthcheck 只標記
+            healthy/unhealthy，不會自動處理。先累積一段實際運行資料確認不會誤判，
+            再決定要不要讓卡死的容器自動重啟（2026-08-02 決定延後，見 DECISIONS.md D016）
+      - [ ] 本 PR 合併後確認正式容器已套用新參數：正在跑的容器仍是舊設定
+            （無 restart、journald），要等 CI 重新部署才生效。屆時確認
+            `podman ps` 顯示 healthy、`podman logs` 有內容
+      - 確認 `systemd/bfx-lending-bot.service` 的去留：D016 已決定維持本機測試用途，
+        正式路線不採 `podman generate systemd`；檔案本身的去留仍待確認
 - [ ] 小額真金測試前，再次確認 API Key 權限已禁止「提現（Withdraw）」
 - [ ] **子分支 `feature/m4-line-messaging`**：通知模組改寫為 `notify/line_messaging.py`，走 LINE Messaging API push
       （取代已停用的 LINE Notify）—— 原列在 M1，2026-07-26 使用者指示改排到最後一步；

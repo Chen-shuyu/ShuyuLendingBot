@@ -25,6 +25,13 @@
   `functional`（`run_once()` 巡檢流程、`FailureTracker` 告警去重）、
   `integration`（dry-run 端到端、Bitfinex 公開端點格式守門，連不上時 skip）
 - `pytest.ini`（`pythonpath = .` 與 `live` marker）與 `requirements-dev.txt`
+- `scripts/healthcheck.py`：容器健康檢查，唯讀讀取 `bot_state.last_run_at` 判斷心跳是否過期
+  （門檻 = 巡檢間隔 × 3 + 60 秒，可用 `engine.health_max_silence_seconds` 覆寫），
+  並在 `podman run` 與 `docker-compose.yml` 兩邊都掛上對應的 healthcheck 設定
+- `main.py` 的離開碼常數 `EXIT_OK` / `EXIT_UNEXPECTED` / `EXIT_FATAL`，
+  三條退出路徑退出前都會把原因寫進 `bot_state.last_action`
+- 最外層攔截未預期例外：改為寫進日誌檔與 DB 後才結束，不再只噴 traceback 到取不到的 stderr
+- 測試增加到 236 項：`tests/unit/test_healthcheck.py`、`tests/functional/test_main_exit_codes.py`
 
 ### Fixed
 - CI 部署階段自 M3 起持續以 exit code 125 失敗的問題：podman 的 bind mount 不會自動建立
@@ -45,6 +52,10 @@
   一次網路抖動就整輪跳過
 - `utils/logger.py` 用 `FileHandler` 導致常駐後單檔無限增大的問題
 - `.gitignore` 未排除 SQLite 檔的問題（`data/`、`*.sqlite3` 及 WAL 附屬檔）
+- 容器崩潰後不會自行復原的問題：`podman run` 原本完全沒有 `--restart` 參數
+- `podman logs` 取不到任何內容的問題：log driver 由 rootless 下拿不到的 `journald`
+  改為 `k8s-file`，deploy job 的「取得最近容器日誌」不再空跑
+- `FatalError` 直接退出與容器 `restart: unless-stopped` 打架、金鑰失效時會無限重啟的問題
 
 ### Changed
 - 移除 `strategy.split_threshold_usd`：原「餘額超過 300 才對半拆單」的語意已被 spread 的
@@ -55,6 +66,11 @@
   等於寫了測試也攔不住壞掉的程式碼
 - CI 內嵌的 heredoc smoke test 收斂進 `tests/integration/test_dry_run_cycle.py`，
   workflow 不再需要維護兩份驗證邏輯；測試依賴改由 `requirements-dev.txt` 統一安裝
+- 容器重啟策略統一為 `on-failure`：正式部署用 `--restart=on-failure:3`（次數上限），
+  `docker-compose.yml` 由 `unless-stopped` 改為 `on-failure`。取次數上限是因為
+  能自行恢復的問題三次內大多會過，過不了的重開再多次也沒用（見 DECISIONS.md D016）
+- CI 的「取得最近容器日誌」改讀掛載出來的 `logs/bfx_lending_bot.log`，
+  `podman logs` 降為備援——容器被收掉之後檔案還在，而那正是最需要日誌的時候
 
 ### Known Issues
 - `line_notifier.py` 呼叫已停用的 LINE Notify 端點，通知永遠失敗（待使用者申請 LINE
@@ -64,12 +80,8 @@
   （見 DECISIONS.md D011、TASKS.md M3）
 - `earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，尚無資料來源與呼叫端
   （需另接 Bitfinex ledger 端點，見 DECISIONS.md D013、TASKS.md M3）
-- `FatalError` 會讓程式 `return 1` 退出，但容器設 `restart: unless-stopped`，
-  金鑰失效這類錯誤會導致無限重啟迴圈（見 TASKS.md M4）
-- CI 的 `podman run` 沒有任何 `--restart` 參數，容器崩潰後不會自行復原；與
-  `docker-compose.yml` 的 `restart: unless-stopped` 兩邊策略不一致（見 TASKS.md M4）
-- `podman logs shuyu-lending-bot` 取不到任何內容（log driver 為 `journald`），
-  deploy job 最後的「取得最近容器日誌」步驟等於空跑；除錯需改讀掛載出來的 log 檔
+- 容器 healthcheck 目前只標記 healthy／unhealthy，**不會自動重啟**卡死的容器
+  （`--health-on-failure=restart` 待觀察期滿再評估，見 DECISIONS.md D016、TASKS.md M4）
 - 部署目錄尚無 `secrets.env`，`dry_run: true` 下不影響，實單前必須補上
 
 本專案尚未發版（無 git tag），暫不建立版本號段落；待 M1～M4（見 PLAN.md）完成、

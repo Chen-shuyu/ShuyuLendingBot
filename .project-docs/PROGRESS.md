@@ -273,3 +273,43 @@
   記錄為 DECISIONS.md D014 的補充步驟；同時寫入 `.ai-brain/CORE.md` 作為跨專案慣例
 - 下一步：`deploy/m4-podman` 的剩餘項目（容器重啟策略、healthcheck、`FatalError`
   與自動重啟的衝突、podman logs 取不到內容），以及 `refactor/m4-layering` 分層搬遷
+
+### 本次追加（容器可靠性收尾，分支 `deploy/m4-podman-hardening`）
+- 背景：機器人自 PR #8 起已能常駐運行，但等於沒有安全網。上一段列出的四個剩餘項目
+  彼此牽動（重啟策略 ↔ 致命錯誤的退出方式 ↔ 健康檢查），一次收斂成 DECISIONS.md D016
+- 完成：`podman run` 加上 `--restart=on-failure:3`。原本完全沒有 restart 參數，
+  崩了就永遠躺平；直接用 `unless-stopped` 又會和「致命錯誤直接退出」變成無限重啟迴圈，
+  因此取次數上限這個中間解
+- 完成：`main.py` 離開碼語意化為 `EXIT_OK=0` / `EXIT_UNEXPECTED=1` / `EXIT_FATAL=2`，
+  並在三條退出路徑（啟動檢查失敗、`FatalError`、未預期例外）退出前都先把原因寫進
+  `bot_state.last_action`。未預期的例外原本只會噴 traceback 到 stderr，而這個環境的
+  容器 stderr 拿不到，等於崩潰現場整個消失；現在改成寫進日誌檔與 DB，兩者都掛在主機上
+- 完成：容器日誌驅動由 `journald` 改為 `k8s-file`（`--log-opt max-size=10mb`），
+  CI 的「取得最近容器日誌」改讀掛載出來的 `logs/bfx_lending_bot.log`，
+  `podman logs` 降為備援（檔案 30 秒內仍是空的才退回去用）
+- 完成：新增 `scripts/healthcheck.py` 與容器 `--health-*` 參數。只讀
+  `bot_state.last_run_at` 判斷心跳是否過期（門檻 = 巡檢間隔 × 3 + 60 秒），
+  一律以 SQLite 唯讀模式開啟——健康檢查不能像 `Repository` 那樣順手建目錄建表，
+  否則 DB 掛載掉了反而會被檢查本身補回去，真正的問題就被蓋掉
+- 完成：`docker-compose.yml` 的 `restart` 由 `unless-stopped` 改為 `on-failure`，
+  並補上同一支腳本的 healthcheck，讓本機測試與正式部署行為一致
+- 完成：測試從 227 項增加到 236 項（`tests/unit/test_healthcheck.py` 22 項、
+  `tests/functional/test_main_exit_codes.py` 6 項；`scripts/` 補 `__init__.py`
+  與其他套件目錄一致，並把 `scripts/healthcheck.py` 加進 CI 的語法檢查清單）
+- 完成：清掉兩處 `logs/` 底下 M3 之前產生的帶時間戳舊檔（部署目錄 7 個、專案目錄 4 個），
+  刪前確認內容全是 dry-run 常規巡檢、無任何 ERROR/CRITICAL；固定檔名的
+  `bfx_lending_bot.log` 保留
+- 驗證（實際跑 podman，不是只看設定檔）：
+  - 以測試映像另起 `bot-verify-a`：`podman ps` 顯示 `Up (healthy)`，
+    `podman inspect` 確認 `on-failure`／上限 3 次／`k8s-file`；**`podman logs` 終於有內容**，
+    與掛載出來的日誌檔一致；容器內執行 healthcheck 回 `healthy` 離開碼 0；
+    DB 心跳、`last_frr`、掛單筆數皆正常
+  - 從外部送 `podman kill --signal=STOP` 凍結主行程，模擬「行程活著但不巡檢」：
+    09:03:56 凍結 → 09:06:16 轉 `unhealthy`，輸出為「距離上次心跳已 140 秒，超過上限 120 秒」，
+    與設計的門檻一致（該次測試 interval 設 20 秒，故上限為 120 秒）
+  - 另起 `bot-verify-b` 以 `dry_run: false` 且無金鑰啟動，必定啟動檢查失敗：
+    **離開碼 2、重啟 3 次後停止**，確認不會無限重啟
+  - 驗證完把兩個測試容器與測試映像都刪掉，正式容器 `shuyu-lending-bot` 全程未被動到
+- 注意：正在運行的正式容器仍是舊參數（無 restart、journald），**本 PR 合併後 CI 重新部署
+  才會套用**；屆時要再確認一次 `podman ps` 顯示 healthy、`podman logs` 有內容
+- 下一步：推送分支開 PR；之後是 `refactor/m4-layering` 分層搬遷

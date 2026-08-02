@@ -313,3 +313,46 @@
 - 注意：正在運行的正式容器仍是舊參數（無 restart、journald），**本 PR 合併後 CI 重新部署
   才會套用**；屆時要再確認一次 `podman ps` 顯示 healthy、`podman logs` 有內容
 - 下一步：推送分支開 PR；之後是 `refactor/m4-layering` 分層搬遷
+
+### 本次追加（PR #10 合併後驗收與部署盤查，分支 `docs/m4-deploy-audit`）
+- 確認：`deploy/m4-podman-hardening` 已由 **PR #10 合併進 main**（合併點 `9a12e40`），
+  兩個 commit 依 D012 以 `git merge-base --is-ancestor` 逐一確認都在 `origin/main` 內；
+  CI 三個 job 全部通過
+- 確認（有效的部分）：正式容器已套用新參數——`on-failure`（上限 3 次）、`k8s-file`、
+  健康狀態 `healthy`。**healthcheck 確實在運作**：每 60 秒一次、累積 5 筆全為離開碼 0，
+  訊息「心跳正常，距離上次巡檢 183 秒（上限 1860 秒）」。機器人本身正常：
+  心跳 09:45:35、連續失敗 0、`loan_offers` 累計 234 筆
+- **發現（重大）**：`podman logs shuyu-lending-bot` **仍然完全沒有內容**。往下追查發現
+  **容器的 conmon 行程不存在**——`podman inspect` 記錄的 conmon PID 查無此行程，
+  整台機器上沒有任何 conmon，容器主行程的父行程已變成 `systemd --user`（被認養）。
+  容器建立於 17:35:35、runner 的 deploy job 於 17:35:42 完成，時間吻合
+- 驗證方式（對照實驗，可重現）：起兩個測試容器，指令都是「印一行 → 睡 15 秒 →
+  以離開碼 1 結束」，都帶 `--restart=on-failure:3 --log-driver=k8s-file`，
+  其中一個在啟動後 `kill -9` 掉它的 conmon：
+  - conmon 活著：容器退出後**會**重啟（RestartCount=1），`podman logs` 有內容
+  - conmon 被殺：**完全不重啟**（RestartCount=0），`podman logs` 停在被殺那一刻，
+    而且 `podman ps` 對一個主行程早已不存在的容器仍顯示 `running`
+- 結論：PR #10 的四項修改中，**離開碼語意化與 healthcheck 兩項有效**，
+  **自動重啟與容器日誌兩項在目前的部署方式下不會生效**。程式碼與參數都正確，
+  卡在部署層。這**不是 PR #10 改壞的**——PR #8（M3）那版同樣由 CI 部署、同樣沒有
+  conmon，所以 `podman logs` 自 M3 起就一直是空的、重啟策略也從來沒生效過
+- 一併發現：`loginctl show-user shuyu` 顯示 `Linger=no`，所有登入 session 結束後
+  `systemd --user` 會停止，掛在它底下的容器會一起消失
+- **被推翻的推論（記下來免得下次又繞回去）**：曾懷疑「conmon 不在，沒人讀 stdout pipe，
+  寫滿 64KB 後 Python 會阻塞、機器人會卡死」。實測灌 200KB 輸出後測試容器仍正常跑完
+  並以離開碼 0 結束，**不成立**
+- 另檢查、確認沒問題的：workflow 中等待日誌檔的迴圈在 GitHub Actions 的 `bash -e` 下
+  不會提前退出（實測 `[ -s "$f" ] && break` 在 `&&` list 中不觸發 `set -e`）；
+  healthcheck 的門檻算式與實際輸出相符；healthcheck 唯讀開啟 DB 無副作用；
+  236 項單元／功能測試與 19 項整合測試全數通過
+- 程式碼層另外盤到三項（都不緊急，已列入 TASKS.md A3～A5）：`main.py` 三條退出路徑
+  在落帳失敗時會蓋掉原始錯誤；DB 相對路徑的解析主程式相對 cwd、healthcheck 相對專案根目錄，
+  兩邊不一致；`config.yaml` 沒有列出 `engine.health_max_silence_seconds`
+- 文件更正：D016 的第 3 點根因判斷錯誤（原歸因為「journald 在 rootless 下拿不到」），
+  已在該條後補「⚠️ 2026-08-02 驗收後更正」段；CHANGELOG.md 的 Fixed 移除兩條不成立的
+  宣稱、Known Issues 補回四條；PLAN.md 的 M4 部署狀態由完成改為部分完成
+- 教訓：當時的驗證用的是**自己手動起的容器**，而問題只發生在 **CI 起的容器**上，
+  驗證環境與故障環境根本不同，卻當成修好了。往後部署層的修正要在真正的部署路徑上驗收
+- 下一步（依 TASKS.md 排序）：A2 開 linger → A1 容器生命週期改由 systemd 管理
+  → A3～A5 程式碼層三項 → 之後才回到 `refactor/m4-layering`。
+  **本次只做盤查與文件，沒有動任何程式碼與正式容器**

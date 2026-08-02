@@ -52,10 +52,14 @@
   一次網路抖動就整輪跳過
 - `utils/logger.py` 用 `FileHandler` 導致常駐後單檔無限增大的問題
 - `.gitignore` 未排除 SQLite 檔的問題（`data/`、`*.sqlite3` 及 WAL 附屬檔）
-- 容器崩潰後不會自行復原的問題：`podman run` 原本完全沒有 `--restart` 參數
-- `podman logs` 取不到任何內容的問題：log driver 由 rootless 下拿不到的 `journald`
-  改為 `k8s-file`，deploy job 的「取得最近容器日誌」不再空跑
-- `FatalError` 直接退出與容器 `restart: unless-stopped` 打架、金鑰失效時會無限重啟的問題
+- `FatalError` 直接退出與容器 `restart: unless-stopped` 打架、金鑰失效時會無限重啟的
+  設定衝突：重啟策略改為 `on-failure` 系列並帶次數上限
+- deploy job 的「取得最近容器日誌」空跑的問題：改讀掛載出來的 `logs/bfx_lending_bot.log`
+
+> **2026-08-02 更正**：原本這裡還列了「容器崩潰後不會自行復原」與「`podman logs`
+> 取不到內容」兩條，經 PR #10 合併後驗收，**兩者其實都沒有真正解決**——參數設定正確，
+> 但容器的 conmon 行程被 CI job 收尾時殺掉，沒有人執行重啟、也沒有人寫容器日誌。
+> 兩條已移回下方 Known Issues，詳見 DECISIONS.md D016 的更正段與 TASKS.md A1。
 
 ### Changed
 - 移除 `strategy.split_threshold_usd`：原「餘額超過 300 才對半拆單」的語意已被 spread 的
@@ -68,7 +72,8 @@
   workflow 不再需要維護兩份驗證邏輯；測試依賴改由 `requirements-dev.txt` 統一安裝
 - 容器重啟策略統一為 `on-failure`：正式部署用 `--restart=on-failure:3`（次數上限），
   `docker-compose.yml` 由 `unless-stopped` 改為 `on-failure`。取次數上限是因為
-  能自行恢復的問題三次內大多會過，過不了的重開再多次也沒用（見 DECISIONS.md D016）
+  能自行恢復的問題三次內大多會過，過不了的重開再多次也沒用（見 DECISIONS.md D016）。
+  **注意：參數已正確設定，但在目前的 CI 部署方式下不會被執行**，見 Known Issues 第一條
 - CI 的「取得最近容器日誌」改讀掛載出來的 `logs/bfx_lending_bot.log`，
   `podman logs` 降為備援——容器被收掉之後檔案還在，而那正是最需要日誌的時候
 
@@ -80,8 +85,18 @@
   （見 DECISIONS.md D011、TASKS.md M3）
 - `earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，尚無資料來源與呼叫端
   （需另接 Bitfinex ledger 端點，見 DECISIONS.md D013、TASKS.md M3）
+- **容器的 conmon 行程被 CI job 收尾時殺掉**，導致三件事：`--restart=on-failure:3`
+  設定正確但從不執行（容器崩了不會自己起來）、`podman logs` 永遠是空的（換 log driver
+  無效）、`podman ps` / `podman inspect` 的狀態不可信（主行程已死仍顯示 running）。
+  程式自己寫的日誌檔與容器 healthcheck 不受影響。修法方向見 TASKS.md A1
+- **`Linger=no`**：所有登入 session 結束後 `systemd --user` 會停止，目前掛在它底下的
+  容器會一起消失。修法為 `loginctl enable-linger shuyu`，見 TASKS.md A2
+- `main.py` 三條退出路徑在落帳失敗時會蓋掉原始錯誤（DB 故障或 volume 掉了的情況下，
+  離開碼會從 2 變成 1、通知也不會送出），見 TASKS.md A3
+- 資料庫相對路徑的解析方式主程式與 healthcheck 兩邊不一致（前者相對 cwd、後者相對
+  專案根目錄）。目前三條啟動路徑的 cwd 剛好都對，尚不會出錯，見 TASKS.md A4
 - 容器 healthcheck 目前只標記 healthy／unhealthy，**不會自動重啟**卡死的容器
-  （`--health-on-failure=restart` 待觀察期滿再評估，見 DECISIONS.md D016、TASKS.md M4）
+  （`--health-on-failure=restart` 的評估前提已因 A1 改變，見 TASKS.md A6）
 - 部署目錄尚無 `secrets.env`，`dry_run: true` 下不影響，實單前必須補上
 
 本專案尚未發版（無 git tag），暫不建立版本號段落；待 M1～M4（見 PLAN.md）完成、

@@ -408,3 +408,36 @@
   `main.py` 的離開碼與退出路徑、新增 `scripts/healthcheck.py` 與
   `tests/unit/test_healthcheck.py`、`tests/functional/test_main_exit_codes.py`。
   `config.yaml` 未新增鍵；`engine.health_max_silence_seconds` 是可選的覆寫，不設就用預設。
+
+### ⚠️ 2026-08-02 驗收後更正（PR #10 合併後實測）
+
+**本條決策的第 3 點根因判斷是錯的，第 1 點的效果沒有真正生效。** 更正如下，
+細節與修法排序見 TASKS.md 的「2026-08-02 部署盤查發現的問題」A1～A6。
+
+- **錯在哪**：原文把「`podman logs` 取不到內容」歸因為「預設的 `journald` 在這台
+  rootless 環境實際取不到內容」。實測後確認**真正原因是容器的 conmon 行程不存在**——
+  conmon 才是負責把容器 stdout/stderr 寫成日誌、並在容器退出時執行 restart policy 的角色。
+  它被 CI 的 deploy job 收尾時一併清掉了（容器建立於 17:35:35，job 於 17:35:42 完成）。
+  換成 `k8s-file` 之後 `podman logs` 依然是空的，因為根本沒有人在寫。
+- **連帶影響第 1 點**：`--restart=on-failure:3` 參數確實有正確設定在容器上
+  （`podman inspect` 看得到），但 **conmon 不在就沒有人觸發重啟**，所以自動重啟
+  從頭到尾沒有生效過。以對照實驗證實：同樣參數的兩個測試容器，conmon 活著的
+  退出後重啟（RestartCount=1），conmon 被 `kill -9` 的完全不重啟（RestartCount=0），
+  而且 `podman ps` 還會顯示已死的容器為 `running`。
+- **仍然成立的部分**：
+  - 第 2 點（離開碼語意化 + 退出前落帳）與其理由完全不受影響。
+  - 第 3 點的後半段——**CI 改讀掛載出來的 `logs/bfx_lending_bot.log`**——不但成立，
+    而且事後看正是唯一真的有效的那一半：程式自己寫的日誌檔跟 conmon 無關，一直正常。
+  - 第 4 點（healthcheck 只看心跳、唯讀、不自動重啟）不受影響。實測 healthcheck
+    由獨立的 systemd timer 執行 `podman healthcheck run`，**不依賴 conmon**，
+    每 60 秒正常執行、離開碼 0。
+  - 「放棄 `podman generate systemd`」這個判斷則需要重新考慮：當時的理由是
+    「效果與 `on-failure:3` 相同、卻多一層部署元件」，但現在已知在這個 CI 部署方式下
+    `on-failure:3` 效果是零，前提不成立。修法方向見 TASKS.md A1。
+- **一個被推翻的擔憂**（記下來免得下次又繞回去）：曾懷疑「conmon 不在，沒人讀
+  stdout pipe，寫滿 64KB 後 Python 會阻塞、機器人會卡死」。**實測不成立**——
+  測試容器灌了 200KB 輸出仍正常跑完並以離開碼 0 結束。機器人不會因此卡死。
+- **教訓**：這次犯的錯是「看到症狀就近取一個聽起來合理的解釋（rootless + journald），
+  改了設定、測試容器看起來好了，就當作修好」。當時的驗證用的是**自己手動起的容器**，
+  而問題只在 **CI 起的容器**上發生，等於驗證環境與故障環境根本不同。
+  往後驗證部署層的修正，要在真正的部署路徑上驗收，或至少確認驗證環境與實際環境的差異。

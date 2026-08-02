@@ -32,9 +32,10 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
   - 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils` 分層搬遷
   - [x] 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
         （2026-08-01，分支 `test/m4-test-suite`，227 項；CI 的 `|| true` 一併拿掉）
-  - [x] 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007、D016）：
+  - [~] 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007、D016）：
         部署已恢復、容器可靠性四項（重啟次數上限、離開碼語意化、日誌取得、心跳健康檢查）
-        完成（2026-08-01～02）。仍在 dry-run 驗證階段，小額實單待使用者補 `secrets.env`
+        程式面完成（2026-08-01～02），但驗收發現自動重啟與容器日誌兩項受 conmon 被殺影響
+        而未生效（TASKS.md A1）。仍在 dry-run 驗證階段，小額實單待使用者補 `secrets.env`
   - 通知模組改寫為 LINE Messaging API push（取代已於 2025-03 停用的 LINE Notify）——
     原列在 M1，2026-07-26 使用者指示改排到最後一步，待使用者申請好 LINE Developers
     Channel 憑證後才實作／實測
@@ -70,13 +71,18 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 - [ ] `refactor/m4-layering`：`strategies/`、`core/`、`notify/` 分層搬遷（有測試當回歸保護）
 - [x] `deploy/m4-podman`（PR #8，2026-08-01）：修掉讓部署自 M3 起一直失敗的主機端目錄
       問題——**機器人已恢復常駐運行**，dry-run 下心跳與落帳皆正常
-- [x] `deploy/m4-podman-hardening`（2026-08-02）：容器可靠性四項一次收斂
+- [~] `deploy/m4-podman-hardening`（PR #10，2026-08-02）：容器可靠性四項一次收斂
       （`--restart=on-failure:3` 次數上限、離開碼語意化 0/1/2 並在退出前落帳、
       日誌驅動改 `k8s-file` 且 CI 改讀掛載出來的日誌檔、新增 `scripts/healthcheck.py`
       心跳檢查），見 DECISIONS.md D016。測試 227 → 236 項。
-      剩餘：觀察期滿後評估 `--health-on-failure=restart`；`secrets.env` 屬使用者端待辦
+      **合併後驗收發現其中兩項實際上沒有生效**：容器的 conmon 行程被 CI job 收尾時
+      殺掉，自動重啟從不執行、`podman logs` 依然是空的。離開碼與 healthcheck 兩項確認有效。
+      修法方向與優先順序見 TASKS.md 的「2026-08-02 部署盤查發現的問題」A1～A6
+- [ ] 部署可靠性補完（承上，尚未開分支）：容器生命週期改由 systemd 管理，
+      讓自動重啟真正生效；先開 linger。這是小額實單的前置條件
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 
-M4 目前只剩 `refactor/m4-layering`（分層搬遷）與被憑證卡住的 LINE 通知兩條；
-測試與部署兩條已完成。
+M4 目前的狀態：測試那條已完成；部署那條程式面完成但**可靠性目標尚未真的達成**
+（見上方與 TASKS.md A1～A2，是小額實單的前置條件）；另外還有 `refactor/m4-layering`
+分層搬遷，以及被憑證卡住的 LINE 通知。

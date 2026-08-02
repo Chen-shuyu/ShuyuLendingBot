@@ -28,7 +28,7 @@ jobs:
           fi
 
       - name: 執行語法檢查
-        run: python -m py_compile main.py config/settings.py api/rate_limiter.py db/models.py db/repository.py modules/exchange_client.py modules/lending_strategy.py modules/line_notifier.py utils/logger.py utils/exceptions.py
+        run: python -m py_compile main.py config/settings.py api/rate_limiter.py db/models.py db/repository.py modules/exchange_client.py modules/lending_strategy.py modules/line_notifier.py scripts/healthcheck.py utils/logger.py utils/exceptions.py
 
       - name: 執行單元與功能測試
         # 這裡刻意不加 `|| true`：測試失敗就要擋下合併，否則寫了測試也攔不住壞掉的程式碼
@@ -96,8 +96,27 @@ jobs:
       - name: 啟動 Podman 容器
         run: |
           # data 也要掛出來：SQLite 檔留在容器內的話，每次重新部署掛單與收益紀錄就全沒了
+          #
+          # --restart=on-failure:3
+          #   容器崩潰要能自己爬起來，但不能無限重啟：API 金鑰無效這類問題
+          #   （main.py 以離開碼 2 表示）重開幾次都不會好，只會洗版日誌。
+          #   restart policy 看不到離開碼，因此用「最多 3 次」從次數上節流。
+          # --log-driver=k8s-file
+          #   預設的 journald 在這台 rootless 環境實際取不到內容，`podman logs`
+          #   一直是空的。改用 k8s-file 存成檔案，並加 max-size 免得無限長大。
+          # --health-*
+          #   讀 bot_state 的心跳判斷「還在巡檢嗎」，行程活著但卡死也看得出來。
+          #   刻意不加 --health-on-failure=restart：先累積一段觀察期，確認判斷
+          #   不會誤判再開自動重啟（見 DECISIONS.md D016）。
           podman run -d \
             --name shuyu-lending-bot \
+            --restart=on-failure:3 \
+            --log-driver=k8s-file \
+            --log-opt max-size=10mb \
+            --health-cmd "python /app/scripts/healthcheck.py" \
+            --health-interval=60s \
+            --health-retries=3 \
+            --health-start-period=180s \
             -e BFX_SECRETS_FILE=/run/secrets/secrets.env \
             -v /workspace/deploy/active-bots/ShuyuLendingBot:/run/secrets:ro \
             -v /workspace/deploy/active-bots/ShuyuLendingBot/logs:/app/logs \
@@ -105,7 +124,23 @@ jobs:
             shuyu-lending-bot
 
       - name: 檢查容器狀態
-        run: podman ps --filter "name=shuyu-lending-bot"
+        run: |
+          podman ps --filter "name=shuyu-lending-bot"
+          podman inspect shuyu-lending-bot \
+            --format '重啟策略：{{.HostConfig.RestartPolicy.Name}}（上限 {{.HostConfig.RestartPolicy.MaximumRetryCount}} 次）／日誌驅動：{{.HostConfig.LogConfig.Type}}'
 
       - name: 取得最近容器日誌
-        run: podman logs --tail=100 shuyu-lending-bot
+        # 讀掛載出來的日誌檔，而不是 `podman logs`：即使容器已經被收掉，檔案還在，
+        # 而且這是程式自己寫的完整日誌（含輪替），比容器 stdout 可靠。
+        run: |
+          LOG_FILE=/workspace/deploy/active-bots/ShuyuLendingBot/logs/bfx_lending_bot.log
+          for _ in $(seq 1 15); do
+            [ -s "$LOG_FILE" ] && break
+            sleep 2
+          done
+          if [ -s "$LOG_FILE" ]; then
+            tail -n 100 "$LOG_FILE"
+          else
+            echo "::warning::30 秒內 $LOG_FILE 仍是空的，改用 podman logs 作為備援"
+            podman logs --tail=100 shuyu-lending-bot || true
+          fi

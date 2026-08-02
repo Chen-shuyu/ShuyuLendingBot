@@ -32,6 +32,9 @@
   三條退出路徑退出前都會把原因寫進 `bot_state.last_action`
 - 最外層攔截未預期例外：改為寫進日誌檔與 DB 後才結束，不再只噴 traceback 到取不到的 stderr
 - 測試增加到 236 項：`tests/unit/test_healthcheck.py`、`tests/functional/test_main_exit_codes.py`
+- `systemd/shuyu-lending-bot.container`：正式部署用的 Podman Quadlet 單元（納入版控，
+  CI 每次部署複製到 `~/.config/containers/systemd/`），容器的常駐、開機自動啟動、
+  重啟節流與離開碼判斷都在這一個檔案裡表達
 
 ### Fixed
 - CI 部署階段自 M3 起持續以 exit code 125 失敗的問題：podman 的 bind mount 不會自動建立
@@ -55,11 +58,18 @@
 - `FatalError` 直接退出與容器 `restart: unless-stopped` 打架、金鑰失效時會無限重啟的
   設定衝突：重啟策略改為 `on-failure` 系列並帶次數上限
 - deploy job 的「取得最近容器日誌」空跑的問題：改讀掛載出來的 `logs/bfx_lending_bot.log`
+- **容器崩潰後不會自行復原、`podman logs` 永遠是空的**（自 M3 起就存在）：根因是 CI 的
+  deploy job 用 `podman run` 起容器，job 收尾時把容器的 conmon 一併殺掉——沒有 conmon
+  就沒有人寫容器日誌、也沒有人在容器退出時執行重啟策略。改由 systemd --user 的 Quadlet
+  單元管理容器生命週期，conmon 落在 `user@.service` 的 cgroup 底下與 job 脫鉤
+  （見 DECISIONS.md D017）。修正後 `podman logs` 自 M3 以來第一次取得到內容
+- `Linger=no` 導致所有登入 session 結束後 `systemd --user` 連同其下容器一起消失的問題：
+  已執行 `loginctl enable-linger shuyu`
 
-> **2026-08-02 更正**：原本這裡還列了「容器崩潰後不會自行復原」與「`podman logs`
-> 取不到內容」兩條，經 PR #10 合併後驗收，**兩者其實都沒有真正解決**——參數設定正確，
-> 但容器的 conmon 行程被 CI job 收尾時殺掉，沒有人執行重啟、也沒有人寫容器日誌。
-> 兩條已移回下方 Known Issues，詳見 DECISIONS.md D016 的更正段與 TASKS.md A1。
+> **2026-08-02 更正**：上面「容器崩潰後不會自行復原」與「`podman logs` 取不到內容」
+> 兩條，PR #10 曾宣稱修好、驗收後發現並沒有（參數正確但 conmon 不在，等於沒人執行），
+> 一度移回 Known Issues。本次改由 systemd 接管容器生命週期後才真正成立，
+> 並已用對照實驗與正式容器實測驗證，詳見 DECISIONS.md D017。
 
 ### Changed
 - 移除 `strategy.split_threshold_usd`：原「餘額超過 300 才對半拆單」的語意已被 spread 的
@@ -70,12 +80,26 @@
   等於寫了測試也攔不住壞掉的程式碼
 - CI 內嵌的 heredoc smoke test 收斂進 `tests/integration/test_dry_run_cycle.py`，
   workflow 不再需要維護兩份驗證邏輯；測試依賴改由 `requirements-dev.txt` 統一安裝
-- 容器重啟策略統一為 `on-failure`：正式部署用 `--restart=on-failure:3`（次數上限），
-  `docker-compose.yml` 由 `unless-stopped` 改為 `on-failure`。取次數上限是因為
-  能自行恢復的問題三次內大多會過，過不了的重開再多次也沒用（見 DECISIONS.md D016）。
-  **注意：參數已正確設定，但在目前的 CI 部署方式下不會被執行**，見 Known Issues 第一條
+- 容器重啟策略統一為 `on-failure`：`docker-compose.yml` 由 `unless-stopped` 改為
+  `on-failure`。取次數上限是因為能自行恢復的問題三次內大多會過，過不了的重開再多次
+  也沒用（見 DECISIONS.md D016）。正式部署那側原本用 `--restart=on-failure:3`，
+  已於本次改由 systemd 表達（見下一條）
+- **正式部署的容器改由 systemd --user 的 Quadlet 單元啟動**（DECISIONS.md D017）：
+  - 新增版控的單元檔 `systemd/shuyu-lending-bot.container`，CI 每次部署複製到
+    `~/.config/containers/systemd/` 並 `daemon-reload`
+  - deploy job 不再 `podman run`，改為 `podman build` + `systemctl --user restart`；
+    移除 podman 端的 `--restart=on-failure:3`（與 systemd 的重啟策略會打架）
+  - 重啟節流改用 `Restart=on-failure` + `StartLimitIntervalSec=1800` /
+    `StartLimitBurst=4`（30 分鐘內最多 4 次啟動），語意比 podman 的 `on-failure:N` 明確
+  - 新增 `RestartPreventExitStatus=2`：systemd 看得到離開碼，`EXIT_FATAL` 直接不重啟。
+    podman 的 restart policy 做不到這件事，這是換過來額外拿到的好處
+  - 掛載目錄的 `mkdir -p` 從 CI 移進單元的 `ExecStartPre`，開機自動啟動時也才會成立
 - CI 的「取得最近容器日誌」改讀掛載出來的 `logs/bfx_lending_bot.log`，
   `podman logs` 降為備援——容器被收掉之後檔案還在，而那正是最需要日誌的時候
+- CI deploy job 新增「驗證容器生命週期真的由 systemd 接管」步驟，斷言服務為 active、
+  conmon 行程存在、`podman logs` 取得到內容，三者任一不成立就紅燈。加這一步是因為
+  先前「重啟與日誌沒生效」拖了兩個 milestone 才發現——部署完只看 `podman ps` 顯示
+  running 是不夠的
 
 ### Known Issues
 - `line_notifier.py` 呼叫已停用的 LINE Notify 端點，通知永遠失敗（待使用者申請 LINE
@@ -85,12 +109,6 @@
   （見 DECISIONS.md D011、TASKS.md M3）
 - `earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，尚無資料來源與呼叫端
   （需另接 Bitfinex ledger 端點，見 DECISIONS.md D013、TASKS.md M3）
-- **容器的 conmon 行程被 CI job 收尾時殺掉**，導致三件事：`--restart=on-failure:3`
-  設定正確但從不執行（容器崩了不會自己起來）、`podman logs` 永遠是空的（換 log driver
-  無效）、`podman ps` / `podman inspect` 的狀態不可信（主行程已死仍顯示 running）。
-  程式自己寫的日誌檔與容器 healthcheck 不受影響。修法方向見 TASKS.md A1
-- **`Linger=no`**：所有登入 session 結束後 `systemd --user` 會停止，目前掛在它底下的
-  容器會一起消失。修法為 `loginctl enable-linger shuyu`，見 TASKS.md A2
 - `main.py` 三條退出路徑在落帳失敗時會蓋掉原始錯誤（DB 故障或 volume 掉了的情況下，
   離開碼會從 2 變成 1、通知也不會送出），見 TASKS.md A3
 - 資料庫相對路徑的解析方式主程式與 healthcheck 兩邊不一致（前者相對 cwd、後者相對

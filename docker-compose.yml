@@ -1,4 +1,5 @@
-# 本機測試用途。正式部署走 CI 的 `podman run`（見 DECISIONS.md D007），
+# 本機測試用途。正式部署走 systemd --user 管理的 Quadlet 單元
+# `systemd/shuyu-lending-bot.container`（見 DECISIONS.md D007、D017）。
 # 兩邊的重啟策略與健康檢查要保持一致，否則本機測不出正式環境的行為。
 version: "3.9"
 services:
@@ -16,8 +17,9 @@ services:
       - /home/shuyu/.config/bfx-lending-bot/data:/app/data
     # 原本是 unless-stopped，會與 main.py 的「致命錯誤直接退出」打架：
     # 金鑰無效時變成啟動→退出→啟動的無限迴圈。改用 on-failure，正常結束
-    # （離開碼 0）不重啟。compose 的 restart 沒有次數上限可設，次數節流只在
-    # 正式部署那側以 `--restart=on-failure:3` 表達。
+    # （離開碼 0）不重啟。compose 的 restart 既沒有次數上限、也認不得離開碼，
+    # 節流與「EXIT_FATAL=2 不重啟」只在正式部署那側由 systemd 表達
+    # （StartLimitBurst 與 RestartPreventExitStatus，見 D017）。
     restart: on-failure
     healthcheck:
       # 與 podman run 的 --health-cmd 同一支腳本，讀 bot_state 心跳判斷是否還在巡檢

@@ -32,10 +32,11 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
   - 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils` 分層搬遷
   - [x] 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
         （2026-08-01，分支 `test/m4-test-suite`，227 項；CI 的 `|| true` 一併拿掉）
-  - [~] 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007、D016）：
-        部署已恢復、容器可靠性四項（重啟次數上限、離開碼語意化、日誌取得、心跳健康檢查）
-        程式面完成（2026-08-01～02），但驗收發現自動重啟與容器日誌兩項受 conmon 被殺影響
-        而未生效（TASKS.md A1）。仍在 dry-run 驗證階段，小額實單待使用者補 `secrets.env`
+  - [x] 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007、D016、D017）：
+        部署已恢復、容器可靠性四項（重啟節流、離開碼語意化、日誌取得、心跳健康檢查）
+        全部完成並實測生效（2026-08-01～02）。其中自動重啟與容器日誌兩項一度因 conmon
+        被 CI job 殺掉而未生效，已於 2026-08-02 把容器生命週期改由 systemd --user 的
+        Quadlet 單元管理後解決。仍在 dry-run 驗證階段，小額實單待使用者補 `secrets.env`
   - 通知模組改寫為 LINE Messaging API push（取代已於 2025-03 停用的 LINE Notify）——
     原列在 M1，2026-07-26 使用者指示改排到最後一步，待使用者申請好 LINE Developers
     Channel 憑證後才實作／實測
@@ -77,12 +78,21 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       心跳檢查），見 DECISIONS.md D016。測試 227 → 236 項。
       **合併後驗收發現其中兩項實際上沒有生效**：容器的 conmon 行程被 CI job 收尾時
       殺掉，自動重啟從不執行、`podman logs` 依然是空的。離開碼與 healthcheck 兩項確認有效。
-      修法方向與優先順序見 TASKS.md 的「2026-08-02 部署盤查發現的問題」A1～A6
-- [ ] 部署可靠性補完（承上，尚未開分支）：容器生命週期改由 systemd 管理，
-      讓自動重啟真正生效；先開 linger。這是小額實單的前置條件
+      這兩項已由下一條分支補完
+- [x] `deploy/m4-systemd-lifecycle`（2026-08-02）：部署可靠性補完，見 DECISIONS.md D017。
+      開啟 linger（A2）；容器生命週期改由 systemd --user 的 Quadlet 單元管理（A1），
+      CI deploy job 不再自己 `podman run`，conmon 因而與 job 脫鉤。重啟節流改用
+      `StartLimitBurst`、並用 `RestartPreventExitStatus=2` 表達「EXIT_FATAL 不重啟」
+      （podman 的 restart policy 做不到）。以對照實驗＋正式容器實測驗收：
+      **自動重啟與 `podman logs` 都確認生效**，後者是自 M3 以來第一次
+- [ ] `refactor/m4-layering`：分層搬遷（承上方，仍未開始）
+- [ ] `fix/m4-audit-findings`（暫名，2026-08-02 使用者指示延後）：PR #10 盤查在程式碼層
+      發現的三項——退出路徑落帳失敗會蓋掉原始錯誤、DB 相對路徑解析兩邊不一致、
+      `config.yaml` 缺 `engine.health_max_silence_seconds`。細節見 TASKS.md A3～A5
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 
-M4 目前的狀態：測試那條已完成；部署那條程式面完成但**可靠性目標尚未真的達成**
-（見上方與 TASKS.md A1～A2，是小額實單的前置條件）；另外還有 `refactor/m4-layering`
-分層搬遷，以及被憑證卡住的 LINE 通知。
+M4 目前的狀態：測試與部署兩條都已完成，**可靠性目標這次是真的達成了**（有對照實驗與
+正式容器實測佐證）。小額實單剩下的前置條件是使用者補上 `secrets.env`。
+未完的是 `refactor/m4-layering` 分層搬遷、延後的程式碼層三項（A3～A5），
+以及被憑證卡住的 LINE 通知。

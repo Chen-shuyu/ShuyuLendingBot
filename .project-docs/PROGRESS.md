@@ -356,3 +356,46 @@
 - 下一步（依 TASKS.md 排序）：A2 開 linger → A1 容器生命週期改由 systemd 管理
   → A3～A5 程式碼層三項 → 之後才回到 `refactor/m4-layering`。
   **本次只做盤查與文件，沒有動任何程式碼與正式容器**
+
+### 本次追加（A1／A2：容器生命週期改由 systemd 管理，分支 `deploy/m4-systemd-lifecycle`）
+- 起點：確認 `docs/m4-deploy-audit` 已由 **PR #11 合併進 main**（合併點 `2189715`），
+  以 `git merge-base --is-ancestor dddc4a3 origin/main` 驗證後切回 main 並 fast-forward，
+  再從最新的 main 開本分支
+- 動手前先查現況，確認上一輪盤查的結論仍成立：`Linger=no`、整台機器沒有任何 conmon、
+  `~/.config/containers/systemd/` 不存在。正式容器是 PR #11 合併觸發 CI 重新部署後
+  於 18:05 起的，一樣沒有 conmon——問題與部署次數無關，是部署**方式**的問題
+- 完成 **A2**：`loginctl enable-linger shuyu`，確認 `Linger=yes`
+- 完成 **A1**：容器生命週期改由 systemd --user 的 Quadlet 單元管理（見 DECISIONS.md D017）
+  - 新增 `systemd/shuyu-lending-bot.container` 並納入版控。CI 每次部署複製到
+    `~/.config/containers/systemd/`，主機上那份視為產物
+  - CI deploy job 改寫：移除「停止並移除舊容器」「準備主機端掛載目錄」「啟動 Podman 容器」
+    三步，改為「安裝／更新 Quadlet 單元」「重新啟動服務」。掛載目錄的 `mkdir -p`
+    移進單元的 `ExecStartPre`，開機自動啟動與非 CI 觸發的重啟才會成立
+  - 移除 podman 端的 `--restart=on-failure:3`，節流改用 `Restart=on-failure` +
+    `StartLimitIntervalSec=1800` / `StartLimitBurst=4`
+  - 新增 `RestartPreventExitStatus=2`：systemd 看得到離開碼，`EXIT_FATAL` 直接不重啟。
+    D016 當時寫「restart policy 看不到離開碼」，換到 systemd 後這個限制就消失了
+  - CI 新增「驗證容器生命週期真的由 systemd 接管」步驟：斷言服務 active、conmon 存在、
+    `podman logs` 有內容，任一不成立就紅燈
+- 驗證（記取 D016 的教訓，這次先做對照實驗，再在正式容器上驗收）：
+  - 測試用 Quadlet 單元「印一行 → 睡 N 秒 → 以指定離開碼結束」：
+    離開碼 1 → `ExecMainStatus=1`，重啟 4 次後觸及 StartLimitBurst 停在 failed；
+    離開碼 2 → `ExecMainStatus=2`、`NRestarts=0`，完全不重啟。
+    順帶證實離開碼確實會透過 `--sdnotify=conmon` 傳回 systemd
+  - **直接針對根因的對照實驗**：用 `systemd-run --user --scope` 建一個模擬 CI job 的
+    scope，在裡面 `systemctl --user start` 服務，再把整個 scope 的行程樹 SIGKILL。
+    結果 conmon 存活、容器續跑，cgroup 是
+    `user@1000.service/app.slice/shuyu-lending-bot.service/runtime`——與 job 完全脫鉤
+  - 正式容器實際接管後：服務 active、conmon PID 存在、**`podman logs` 終於有內容**
+    （自 M3 以來第一次）、podman 端重啟策略為 `no`（已交給 systemd）、
+    `Up (healthy)`、`podman healthcheck run` 離開碼 0、DB 心跳與 `loan_offers`
+    累計 274 筆都正常
+  - 測試 236 項單元／功能 + 19 項整合全數通過；workflow YAML 另以 `yaml.safe_load` 驗過
+- 過程中修掉自己寫錯的一處：CI 驗證步驟原本用 `{{.ConmonPid}}` 取 conmon PID，
+  podman 5.8 的正確欄位是 `{{.State.ConmonPid}}`，前者會直接讓該步驟報錯。
+  是在正式容器上實跑指令時發現的——只寫不跑就會帶著壞掉的斷言合併進去
+- 依使用者指示，**A3～A5（程式碼層三項）本次不做**，已在 TASKS.md 移到
+  「🟡 延後處理」段落並註明之後另開 `fix/m4-audit-findings` 一次處理。
+  A6 的前提隨 A1 完成而改變（改走 systemd 表達「不健康就重啟」），維持觀察期規劃
+- 下一步：推送分支開 PR；合併後確認 CI 的新驗證步驟在真正的部署路徑上是綠的。
+  之後回到 `refactor/m4-layering`，或先清掉延後的 A3～A5

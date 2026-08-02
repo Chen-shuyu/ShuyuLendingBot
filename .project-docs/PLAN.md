@@ -86,9 +86,14 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       （podman 的 restart policy 做不到）。以對照實驗＋正式容器實測驗收：
       **自動重啟與 `podman logs` 都確認生效**，後者是自 M3 以來第一次
 - [ ] `refactor/m4-layering`：分層搬遷（承上方，仍未開始）
-- [ ] `fix/m4-audit-findings`（暫名，2026-08-02 使用者指示延後）：PR #10 盤查在程式碼層
-      發現的三項——退出路徑落帳失敗會蓋掉原始錯誤、DB 相對路徑解析兩邊不一致、
-      `config.yaml` 缺 `engine.health_max_silence_seconds`。細節見 TASKS.md A3～A5
+- [ ] **`fix/m4-audit-findings`（2026-08-02 已開分支，尚未動工）**：把兩輪盤查延後的
+      五項小缺陷一次做完，細節見 TASKS.md 的「🟡 延後處理」段落——
+      - A3～A5（PR #10 盤查，程式碼層）：退出路徑落帳失敗會蓋掉原始錯誤、
+        DB 相對路徑解析主程式與 healthcheck 兩邊不一致、`config.yaml` 缺
+        `engine.health_max_silence_seconds`
+      - B1、B2（PR #12 合併後驗收，維運層）：CI 那道「驗證容器生命週期由 systemd 接管」
+        的檢查抓不到它想抓的迴歸（要改比對 conmon 的 cgroup 歸屬）、
+        systemd 放棄重啟時無人收到通知（實單前必補，與 A6 一起設計）
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 

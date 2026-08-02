@@ -1,11 +1,111 @@
 # TASKS
 
+> 勾選標記：`[ ]` 未開始／`[x]` 完成／`[~]` **部分完成**（做了但目標沒真的達成，
+> 說明會寫在該項目底下）。
+
 ## 進行中
 （無）
 
 ## 🔴 下一步・最高優先
 
-（無，已於 2026-07-26 完成調查並記錄為 DECISIONS.md D010，解除阻塞，見下方「已完成」）
+### 2026-08-02 部署盤查發現的問題（PR #10 合併後驗收，依建議處理順序排列）
+
+> **給下一個 session 的摘要**：PR #10 加上的「容器可靠性四項」在程式碼層面都正確、
+> 測試也都過，但**部署環境讓其中兩項（自動重啟、容器日誌）實際上不會生效**。
+> 根因是容器的 conmon 行程被 CI job 收尾時一併殺掉了（A1）。
+> A1 沒解決之前，機器人等於仍然沒有自動恢復能力——崩了就躺平，跟改之前一樣。
+> **機器人本身運作正常**（心跳、落帳、日誌檔輸出都沒問題），這是維運層而非策略層的問題。
+
+- [ ] **A1（最高）：容器的 conmon 行程被殺，自動重啟與容器日誌實際上都沒有生效**
+  - **現象**：`podman logs shuyu-lending-bot` 仍然完全沒有內容（改成 `k8s-file` 之後也一樣）。
+  - **根因**：容器的 conmon 行程不存在。conmon 是 podman 為每個容器配的看門人行程，
+    負責兩件事——把容器的 stdout/stderr 寫成日誌、在容器退出時依 `--restart` 規則重新拉起。
+    `podman inspect` 記錄的 conmon PID 查無此行程，整台機器上沒有任何 conmon；
+    容器主行程的父行程已變成 `systemd --user`（被認養的典型跡象）。
+    容器建立於 17:35:35，runner 的 deploy job 於 17:35:42 完成，時間吻合。
+  - **驗證方式（已實測，可重現）**：起兩個測試容器，指令都是「印一行 → 睡 15 秒 → 以離開碼 1 結束」，
+    都帶 `--restart=on-failure:3 --log-driver=k8s-file`；其中一個在啟動後 `kill -9` 掉它的 conmon。
+
+    | | conmon 活著 | conmon 被殺 |
+    |---|---|---|
+    | 容器退出後會重啟 | 會（RestartCount=1） | **不會（RestartCount=0）** |
+    | `podman logs` | 有內容 | 停在 conmon 死亡那一刻 |
+    | `podman ps` 狀態 | 準確 | **主行程已死仍顯示 running** |
+
+  - **影響**：`--restart=on-failure:3` 完全不執行；`podman logs` 永遠是空的（換哪種
+    log driver 都一樣）；`podman ps` / `podman inspect` 的狀態不可信。
+    **不受影響的**：程式自己寫的 `logs/bfx_lending_bot.log`（跟 conmon 無關）、
+    容器 healthcheck（由獨立的 systemd timer 執行 `podman healthcheck run`，實測仍每 60 秒正常執行）、
+    機器人本身的巡檢與落帳。另外曾懷疑「沒人讀 stdout pipe 會塞住寫入端導致程式卡死」，
+    **實測不成立**（灌 200KB 後程式仍正常跑完並以離開碼 0 結束）。
+  - **這不是 PR #10 改壞的**：PR #8（M3）那版同樣由 CI 部署、同樣沒有 conmon，
+    所以 `podman logs` 從 M3 起就一直是空的、重啟策略也從來沒生效過。
+    PR #10 只是把問題查清楚了。
+  - **建議修法（方向 A，推薦）**：**容器生命週期改由 systemd 管理，不再依附 CI job**。
+    - 建立 Quadlet 單元 `~/.config/containers/systemd/shuyu-lending-bot.container`，
+      把目前 workflow 裡 `podman run` 的參數（volume、環境變數、health 設定）搬進去。
+    - 重啟策略改用 systemd 的 `Restart=on-failure` 搭配 `StartLimitIntervalSec` /
+      `StartLimitBurst`，並**移除 `--restart=on-failure:3`**（兩者會打架）。
+      順帶解掉一個 podman 版沒查清楚的疑點：`on-failure:N` 的計數在長期運行下
+      會不會重置未經驗證，而 systemd 的「時間窗內幾次」語意明確得多。
+    - CI 的 deploy job 改成只做兩件事：`podman build` 映像、`systemctl --user restart
+      shuyu-lending-bot`。容器不再由 job 直接啟動，conmon 就不會跟著 job 收尾被清掉。
+    - 依賴 A2 的 linger 才會在無登入 session 時持續運作。
+  - **建議修法（方向 B，備案）**：想辦法讓 conmon 在 job 結束後存活（例如在 `podman run`
+    前清掉 runner 用來追蹤子行程的環境變數）。改動只有一行，但屬於繞過 runner 的既定行為，
+    runner 改版就可能再壞一次，且不解決「主機重開機後容器不會自己起來」。
+  - **為什麼排最前面**：A1 沒解決，「自動重啟」就是假的，後面所有可靠性工作都建立在
+    一個不成立的前提上；也直接擋住小額實單（實單期間崩潰無人恢復的風險不能接受）。
+
+- [ ] **A2（最高，且應先於 A1 完成）：`Linger=no`，登出後容器會整個消失**
+  - **現象**：`loginctl show-user shuyu` 顯示 `Linger=no`。
+  - **影響**：`systemd --user` 只在使用者還有登入 session 時存在。所有 session 結束後
+    它會停止，**目前掛在它底下的容器會跟著沒掉**（容器主行程的父行程正是 `systemd --user`）。
+    A1 的方向 A 改用 systemd user 單元後，同樣需要 linger 才能在無人登入時運作。
+  - **建議修法**：`loginctl enable-linger shuyu`（一行指令，零風險）。
+    做完以 `loginctl show-user shuyu | grep Linger` 確認變成 `Linger=yes`。
+  - **為什麼排最前面**：一行指令、沒有副作用，而且是 A1 方向 A 的前提。
+
+- [ ] **A3：`main.py` 的錯誤處理路徑中，落帳失敗會把原始錯誤蓋掉**
+  - **位置**：`main.py` 三處 —— 啟動檢查失敗（約 160 行）、`FatalError`（約 177 行）、
+    未預期例外（約 192 行），都是先 `repository.save_state(...)` 再 `notifier.send(...)`。
+  - **問題**：如果**資料庫本身故障**（磁碟滿、DB 損毀、volume 掛載掉了），`save_state()`
+    會拋出新的例外，後果是三層的：原始錯誤訊息遺失、`notifier.send()` 不會執行、
+    離開碼從刻意設計的 2（`EXIT_FATAL`）變成 1。`FatalError` 那條路徑更糟——
+    新例外會被下方的 `except Exception` 接住，直接被誤判成「未預期的例外」。
+  - **為什麼值得修**：「volume 掛載掉了」正是這個部署真實會發生的情況之一
+    （M3 起部署失敗的根因就是主機端目錄不存在），而那時候最需要的就是看到原始錯誤。
+  - **建議修法**：把三處落帳各自包一層 `try/except Exception`，寫不進去就只記日誌
+    （例如 `logger.error(f"退出前落帳失敗，原始錯誤為：{exc}")`），不讓它影響離開碼與通知。
+    可抽成一個小的 `_record_exit_reason(logger, repository, reason)` 私有函式，三處共用。
+    測試補一條：`save_state` 被設定成一定拋例外時，離開碼仍為 `EXIT_FATAL` 且通知照送。
+
+- [ ] **A4：資料庫路徑的解析方式，主程式與健康檢查兩邊不一致**
+  - **位置**：`db/repository.py` 的 `Repository.from_config()` 對相對路徑是相對
+    **當下工作目錄（cwd）**；`scripts/healthcheck.py` 的 `resolve_db_path()` 是相對
+    **程式所在目錄（`scripts/` 的上一層）**。
+  - **現況不會出錯**：容器 `WORKDIR=/app`、`start.sh` 有 `cd "$ROOT_DIR"`、
+    `systemd/bfx-lending-bot.service` 有 `WorkingDirectory=`，三條路徑的 cwd 剛好都對。
+  - **風險**：任何一天有人從別的目錄啟動主程式，主程式會在別處建立 DB，
+    健康檢查則仍去專案目錄找 —— 結果是**健康檢查永遠回報「尚未寫入任何心跳」**，
+    而機器人其實跑得好好的。這種錯誤很難聯想到路徑上。
+  - **建議修法**：讓 `Repository` 也以專案根目錄解析相對路徑（與 healthcheck 一致），
+    或反過來讓兩邊共用同一個解析函式。前者較好，因為「設定檔寫的相對路徑相對於專案」
+    比「相對於誰啟動它」更符合直覺。改完補一條測試釘住行為。
+
+- [ ] **A5：`config.yaml` 沒有列出 `engine.health_max_silence_seconds`**
+  - **問題**：這個可以覆寫健康檢查門檻的設定只有程式碼與 DECISIONS.md D016 知道，
+    設定檔裡完全看不到，等於藏起來的選項。
+  - **建議修法**：在 `config.yaml` 的 `engine:` 區段補上一行（註解掉或給預設值皆可），
+    說明「不設就是 `interval_seconds × 3 + 60`」。
+
+- [ ] **A6：重新評估 `--health-on-failure=restart`（原本就列著的觀察期待辦，但前提變了）**
+  - D016 原本的規劃是「先觀察一段時間，確認 healthcheck 不會誤判再開自動重啟」。
+  - **新增的前提**：A1 未解決時，conmon 不在，`--health-on-failure=restart` 是否還執行得了
+    **尚未驗證**（healthcheck 本身是 systemd timer 跑的，重啟動作由 `podman healthcheck run`
+    觸發，理論上可能仍有效，但沒實測過）。等 A1 改成 systemd 管理後這題會自然消失——
+    屆時「不健康就重啟」可直接由 systemd 單元表達。
+  - **建議**：等 A1 完成後再一併決定，不要在現況下單獨開啟。
 
 ## 待處理（依優先級，對應 PLAN.md 的 M1～M4）
 
@@ -78,14 +178,18 @@
             加上該 volume 起每次都以 exit code 125 失敗。workflow 補 `mkdir -p` 一步
       - [ ] 補 `secrets.env` 到部署目錄（`/workspace/deploy/active-bots/ShuyuLendingBot/`）。
             目前該檔不存在，`dry_run: true` 下不影響，**實單前必須補上**（使用者端待辦）
-      - [x] `podman logs` 取不到內容（log driver 為 `journald`，rootless 下拿不到）：
-            改用 `--log-driver=k8s-file`（含 `max-size=10mb`），CI 的「取得最近容器日誌」
-            改讀掛載出來的 `logs/bfx_lending_bot.log`，`podman logs` 降為備援
-            （2026-08-02，分支 `deploy/m4-podman-hardening`，見 DECISIONS.md D016）
+      - [~] `podman logs` 取不到內容：改用 `--log-driver=k8s-file`（含 `max-size=10mb`），
+            CI 的「取得最近容器日誌」改讀掛載出來的 `logs/bfx_lending_bot.log`
+            （2026-08-02，分支 `deploy/m4-podman-hardening`）。
+            **但當時判定的根因（journald 在 rootless 下拿不到）是錯的**，
+            真正原因是 conmon 被殺（見上方 A1），換 log driver 並未解決；
+            改讀掛載日誌檔這半邊有效，`podman logs` 至今仍為空
       - [x] 清理 `logs/` 底下 M3 之前產生的帶時間戳舊檔（部署目錄 7 個、專案目錄 4 個），
             刪前確認全是 dry-run 常規巡檢、無 ERROR/CRITICAL（2026-08-02）
-      - [x] 容器崩潰重啟策略：採 `--restart=on-failure:3`（次數上限），
-            `docker-compose.yml` 同步由 `unless-stopped` 改為 `on-failure`（2026-08-02）
+      - [~] 容器崩潰重啟策略：採 `--restart=on-failure:3`（次數上限），
+            `docker-compose.yml` 同步由 `unless-stopped` 改為 `on-failure`（2026-08-02）。
+            **參數已正確設定但實際不會執行**——conmon 不在就沒人觸發重啟（見上方 A1）。
+            要真正生效需改由 systemd 管理容器生命週期
       - [x] `FatalError` 與自動重啟的衝突：`main.py` 離開碼語意化為
             `EXIT_OK=0` / `EXIT_UNEXPECTED=1` / `EXIT_FATAL=2`，三條退出路徑退出前
             都先把原因寫進 `bot_state.last_action`。restart policy 看不到離開碼，
@@ -94,12 +198,12 @@
             `bot_state.last_run_at` 判斷心跳是否過期（門檻 = 巡檢間隔 × 3 + 60 秒）。
             **刻意不看 `consecutive_failures`**——那是交易所端的問題，重啟容器無益，
             已由 `FailureTracker` 告警負責（2026-08-02，見 DECISIONS.md D016）
-      - [ ] 觀察期滿後評估加上 `--health-on-failure=restart`：目前 healthcheck 只標記
-            healthy/unhealthy，不會自動處理。先累積一段實際運行資料確認不會誤判，
-            再決定要不要讓卡死的容器自動重啟（2026-08-02 決定延後，見 DECISIONS.md D016）
-      - [ ] 本 PR 合併後確認正式容器已套用新參數：正在跑的容器仍是舊設定
-            （無 restart、journald），要等 CI 重新部署才生效。屆時確認
-            `podman ps` 顯示 healthy、`podman logs` 有內容
+      - [ ] 觀察期滿後評估加上 `--health-on-failure=restart` —— **改列為上方 A6**，
+            前提已因 A1 改變，等 A1 完成後再一併決定
+      - [x] PR #10 合併後確認正式容器已套用新參數（2026-08-02 驗收）：
+            `on-failure`（上限 3 次）／`k8s-file`／健康狀態 `healthy` 都已套用，
+            healthcheck 每 60 秒實際執行且離開碼 0。**但 `podman logs` 仍為空**，
+            由此查出 A1
       - 確認 `systemd/bfx-lending-bot.service` 的去留：D016 已決定維持本機測試用途，
         正式路線不採 `podman generate systemd`；檔案本身的去留仍待確認
 - [ ] 小額真金測試前，再次確認 API Key 權限已禁止「提現（Withdraw）」

@@ -301,7 +301,9 @@ M4 只剩 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE �
       `modules/exchange_client.py` → `api/bitfinex_client.py`（+ 新增 `api/base.py`）、
       `modules/lending_strategy.py` → `strategies/frr_plus.py`（+ 新增 `strategies/base.py`）、
       新增 `core/bot_engine.py`、`modules/line_notifier.py` → `notify/line_messaging.py`。
-      搬遷時 `tests/` 的 import 路徑要同步改，改完重跑 227 項即可確認沒搬壞
+      搬遷時 `tests/` 的 import 路徑要同步改，改完重跑全部測試（目前 283 項）即可確認沒搬壞。
+      注意 `scripts/healthcheck.py` 與 `scripts/notify_failure.py` **不要搬**——
+      它們刻意維持零專案相依（見 ARCHITECTURE.md「維運元件與主程式刻意分離」）
 - [x] 建立 `tests/unit`、`tests/functional`、`tests/integration` 目錄與測試，共 227 項
       （2026-08-01，分支 `test/m4-test-suite`）。一併補掉三個 CI 缺口：拿掉
       `pytest ... || true`（測試失敗必須擋下合併）、新增 `requirements-dev.txt`

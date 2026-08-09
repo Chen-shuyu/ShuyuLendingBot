@@ -551,3 +551,10 @@
 - 測試 265 → 283 項（新增 `tests/unit/test_notify_failure.py` 18 項）
 - 下一步：兩輪盤查的六項缺陷全部清完，M4 只剩 `refactor/m4-layering` 分層搬遷，
   以及被憑證卡住的 LINE 通知
+- 補上 **ARCHITECTURE.md** 的同步（前一個 commit 漏掉的）：新增「維運元件與主程式刻意分離」
+  段落（healthcheck 在容器內、notify_failure 在容器外，兩者都零專案相依，理由是它們執行的
+  時機正是東西壞掉的時候）、`scripts/` 與 `systemd/` 目錄結構、`notify_failure.py` 的模組說明、
+  `resolve_db_path()` 與 healthcheck 必須一致的約束（D019）、失效處理權威唯一為 systemd
+  與兩條告警管道的分工（D020）。測試數字 236 → 283。
+  另修正 TASKS.md 裡 `refactor/m4-layering` 的指示：重跑的項數已過時，
+  並註明兩支維運腳本刻意不參與分層搬遷

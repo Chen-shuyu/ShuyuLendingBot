@@ -431,3 +431,58 @@
 - 依使用者指示開了分支 `fix/m4-audit-findings`（從 main `4c83f73`），把 A3～A5 與
   B1、B2 五項集中在這條分支處理。**本次只寫文件，沒有動任何程式碼**，
   五項的修法都已寫進 TASKS.md 的「🟡 延後處理」段落，下次可直接照做
+
+## 2026-08-09 —— 修好 CI 的容器生命週期斷言（分支 `fix/m4-ci-lifecycle-assertion`）
+
+### 起點：PR #13 合併後 deploy job 紅燈
+- 開工前先做分支盤查（`git fetch` 後逐一比對）：13 條本地分支中 11 條都已推遠端且
+  以 `git merge-base --is-ancestor` 驗證確實在 main 內。兩個例外都不擋事——
+  `fix/m4-audit-findings` 是當時的工作分支（1 個純文件 commit 未推）；
+  `fix/m1-frr-and-loop` 是殘留舊分支，實查後確認它「有而 main 沒有」的只剩 M2 之前的
+  舊策略程式（已被階梯利率取代），三個 raw API 實作與 D010 全都在 main 內，沒有漏掉的工作
+- 依使用者選擇：文件 commit 先走自己的 PR（#13）合併進 main，再從最新 main 開新分支，
+  與 PR #9、#11 的做法一致。合併後以 `git merge-base --is-ancestor 8814cd0 origin/main`
+  實際驗證（不只看 PR 顯示已合併）
+- PR #13 合併觸發部署，deploy job 在「驗證容器生命週期真的由 systemd 接管」失敗
+
+### 根因：斷言讀錯了管道（B3）
+- **不是 systemd 接管失敗**。實查：conmon PID 4185319 存在、cgroup 為
+  `user@1000.service/app.slice/shuyu-lending-bot.service/runtime`、`NRestarts=0`、
+  `podman logs` 有 11 行內容、容器 `Up (healthy)`——三個前提全部成立
+- 真正的原因是檢查本身：機器人日誌走 **stderr**（`logging.StreamHandler()` 不帶參數，
+  Python 預設 stderr），程式無任何 `print()` 所以 stdout 恆空，而檢查用
+  `$(podman logs ... 2>/dev/null)` 只捕捉 stdout 又丟掉 stderr。**親手扔掉自己要找的東西**
+- 現場驗證：同一個容器，`2>/dev/null` 捕捉到 0 個字元，`2>&1` 得到 11 行
+- 推論並確認影響範圍：這道檢查**從加進來就不可能通過**，deploy job 自 PR #12 合併
+  （8/2）以來一路是紅的。當時手動驗收看得到日誌，是因為終端機下 stderr 直接顯示在螢幕上。
+  機器人本身不受影響——重啟服務在這一步之前就已完成，容器連續運行 7 天、心跳正常
+
+### 修改內容
+- **B3**：改用 `CONTAINER_LOGS=$(podman logs --tail=20 ... 2>&1)`，並同時要求 podman
+  指令本身成功——否則「no such container」這類錯誤訊息會被當成「有日誌」而誤放行
+- **B1**（同一個步驟，順手一起改）：conmon 的判斷從「行程存不存在」改為
+  「**cgroup 是否屬於 `shuyu-lending-bot.service`**」。原本已經把 cgroup 印出來了，
+  只是印給人看、沒拿去比對，補一個 `case` 判斷即可
+- 刻意**不改 `utils/logger.py`**：日誌走 stderr 是 Python 的預設行為，本身沒錯，
+  兩邊（`podman logs` 與掛載出來的日誌檔）都收得到。為了讓寫錯的斷言通過而改動
+  機器人的輸出行為，是把因果關係倒過來
+
+### 驗證
+- 把 workflow 裡那段斷言抽出來做成可帶參數的腳本，兩個情境各跑一次：
+
+  | 情境 | 期望 | 實測 |
+  |---|---|---|
+  | 正式容器（systemd 啟動） | 通過 | 離開碼 0，11 行日誌正常印出 |
+  | 假容器（直接 `podman run`，模擬舊做法） | 紅燈 | 離開碼 1，被 cgroup 判斷擋下 |
+
+- 第二個情境的關鍵：**那個假容器的 `podman logs` 是有內容的**，所以它是被「啟動方式不對」
+  擋下來的，不是碰巧因為沒日誌而失敗——這正是 B1 要的鑑別力。測完已移除假容器
+- workflow YAML 以 `yaml.safe_load` 驗過；完整測試套件 255 項全數通過
+
+### 教訓與下一步
+- 這是同一系列的第三條：D016 是「驗證**環境**與故障環境不同」、B1 是「驗證**時機**與
+  故障時機不同」、B3 是「驗證**管道**與資料實際流經的管道不同」。三次都是同一個病——
+  檢查沒有在檢查它以為在檢查的東西。往後寫自動化斷言，**一定要在故障情境下實際跑一次
+  看它會不會失敗**，不能只在正常情境下看到綠燈就收工。記為 DECISIONS.md D018
+- 下一步：合併後回到剩下的 A3、A4、A5、B2（B2 仍與 A6 一起設計），之後才是
+  `refactor/m4-layering`

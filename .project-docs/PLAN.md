@@ -86,18 +86,24 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       （podman 的 restart policy 做不到）。以對照實驗＋正式容器實測驗收：
       **自動重啟與 `podman logs` 都確認生效**，後者是自 M3 以來第一次
 - [ ] `refactor/m4-layering`：分層搬遷（承上方，仍未開始）
-- [ ] **`fix/m4-audit-findings`（2026-08-02 已開分支，尚未動工）**：把兩輪盤查延後的
-      五項小缺陷一次做完，細節見 TASKS.md 的「🟡 延後處理」段落——
-      - A3～A5（PR #10 盤查，程式碼層）：退出路徑落帳失敗會蓋掉原始錯誤、
-        DB 相對路徑解析主程式與 healthcheck 兩邊不一致、`config.yaml` 缺
-        `engine.health_max_silence_seconds`
-      - B1、B2（PR #12 合併後驗收，維運層）：CI 那道「驗證容器生命週期由 systemd 接管」
-        的檢查抓不到它想抓的迴歸（要改比對 conmon 的 cgroup 歸屬）、
-        systemd 放棄重啟時無人收到通知（實單前必補，與 A6 一起設計）
+- [x] `fix/m4-audit-findings`（PR #13，2026-08-09）：純文件同步，記錄 PR #12 的驗收結果
+      與 B1／B2 兩項新發現
+- [x] **`fix/m4-ci-lifecycle-assertion`（2026-08-09）**：修好 CI 紅燈，見 DECISIONS.md D018。
+      PR #13 合併後 deploy job 在「驗證容器生命週期真的由 systemd 接管」失敗，查出
+      **systemd 接管一切正常，壞的是斷言本身**——機器人日誌走 stderr，而檢查用
+      `$(podman logs ... 2>/dev/null)` 只捕捉 stdout，等於扔掉自己要找的東西（B3）。
+      這道檢查自 2026-08-02 加入起就不可能通過，deploy job 一路是紅的。
+      同一步驟順帶完成 **B1**（conmon 判斷改為比對 cgroup 歸屬）。
+      以對照實驗驗收：正式容器通過、直接 `podman run` 的假容器紅燈
+- [ ] **剩下的 A3～A5 與 B2**（下一條分支）：退出路徑落帳失敗會蓋掉原始錯誤、
+      DB 相對路徑解析主程式與 healthcheck 兩邊不一致、`config.yaml` 缺
+      `engine.health_max_silence_seconds`、systemd 放棄重啟時無人收到通知
+      （實單前必補，與 A6 一起設計）。細節見 TASKS.md 的「🟡 延後處理」段落
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 
 M4 目前的狀態：測試與部署兩條都已完成，**可靠性目標這次是真的達成了**（有對照實驗與
-正式容器實測佐證）。小額實單剩下的前置條件是使用者補上 `secrets.env`。
-未完的是 `refactor/m4-layering` 分層搬遷、延後的程式碼層三項（A3～A5），
+正式容器實測佐證），CI 的迴歸防線也已從「看起來有」變成「真的擋得住」（D018）。
+小額實單剩下的前置條件是使用者補上 `secrets.env`。
+未完的是 `refactor/m4-layering` 分層搬遷、延後的程式碼層三項（A3～A5）與維運層的 B2，
 以及被憑證卡住的 LINE 通知。

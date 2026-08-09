@@ -618,3 +618,55 @@ PR #12 合併後由 CI 重新部署（容器建立於 21:25:27，非手動啟動
 - **順帶更正**：`main.py` 的模組 docstring 原本寫「重啟次數的節流交給
   `--restart=on-failure:N`」，這是 D017 之前的說法，該參數已移除。改為說明
   離開碼現在由 systemd 直接解讀，以及為什麼退出路徑不能改變它。
+
+## D020 — systemd 失效告警（B2）與「不健康就處理」（A6）：以 `OnFailure=` + `HealthOnFailure=kill` 組合
+- 日期：2026-08-09
+- 背景：兩輪盤查剩下的最後一項。`Restart=on-failure` + `StartLimitBurst=4` 讓 systemd
+  在「30 分鐘內 4 次啟動」後停手（刻意的——金鑰無效這類問題重開幾次都不會好），
+  但停手之後單元停在 `failed` 而**不會有任何人知道**。A6 則是 D016 留下的觀察期決定。
+- 觀察期結論（A6）：容器 healthcheck 自 2026-08-02 起每 60 秒執行一次、連續 7 天
+  **沒有任何一次誤判**（`FailingStreak=0`，容器狀態一路 `healthy`）。據此決定開啟。
+- 決策一（A6）：Quadlet 加 **`HealthOnFailure=kill`**，不是 `restart`。
+  - `restart` 由 podman 自己把容器拉起來，會變成 podman 與 systemd 兩套重啟機制並存，
+    各自計數、互相打架（TASKS.md A6 早就點出這個風險）。
+  - `kill` 只負責「把不健康的容器殺掉」，殺完容器以非 0 離開碼結束，
+    接手的是 systemd 的 `Restart=on-failure`——**重啟權威仍然只有 systemd 一個**，
+    `StartLimitBurst` 的節流與 `OnFailure=` 的告警自動涵蓋這條路徑。
+    podman 官方文件對 `kill` 的說明正是「與 systemd 整合最好」。
+  - **實測確認離開碼是 137（SIGKILL）而不是 2**，所以 `RestartPreventExitStatus=2`
+    不會誤擋這條路徑。這點很重要：若健康檢查觸發的退出剛好是 2，A6 會被 D017 的設定
+    直接廢掉，而且不會有任何徵兆。
+- 決策二（B2）：主單元 `[Unit]` 加 `OnFailure=shuyu-lending-bot-alert.service`，
+  新增一般 systemd 單元（非 Quadlet）與主機端腳本 `scripts/notify_failure.py`。
+  - **腳本在容器外執行**：容器可能正是壞掉的那一個，不能靠它來報告自己死了。
+    因此只用標準函式庫、不 import 專案任何模組（與 `scripts/healthcheck.py` 同一原則）。
+  - **絕不寫 `bot_state.last_run_at`**：那是心跳，機器人已經死了還更新它，
+    等於偽造它還活著、騙過健康檢查。只更新 `last_action`。
+  - **DB 以 `mode=rw` 開啟，檔案不存在就失敗、不建立**：DB 掛載掉正是可能觸發告警的
+    原因之一，順手把它補回來只會蓋掉真正的問題。
+  - **每個管道各自 try/except**，一個失敗不影響其他；一個都沒送成才回非 0
+    （「以為有人會被通知、其實沒有」正是 B2 本身的問題，不能在告警機制裡再犯一次）。
+  - LINE 推播位置已留好（`send_line_push`），憑證到位後填上即可。
+- **⚠️ 實驗推翻的假設**：原本設計時認為「`OnFailure=` 只在單元真正進入 `failed` 時觸發，
+  重試中途屬於 `auto-restart` 狀態不會誤觸發」，並據此把訊息寫死成「不會再自動重啟」。
+  **實測證明是錯的**：`StartLimitBurst=3` 的單元一路失敗，告警被觸發 **4 次**
+  （已重啟 0／1／2 次時各一次，最後放棄時一次）。中途那三次的訊息完全是錯的。
+  - 修法：腳本自己查單元狀態分辨兩種情況——`SubState=auto-restart` 是重試中（ERROR），
+    `ActiveState=failed` 是已放棄（CRITICAL）；查不到狀態時**一律當成已放棄**。
+  - 查詢前先等 `BFX_ALERT_SETTLE_SECONDS`（預設 2 秒）讓狀態轉換走完，
+    否則可能問到轉換前的舊狀態，把「正在重試」誤判成「已經放棄」。
+    正式部署 `RestartSec=30`，這幾秒完全來得及。
+  - **刻意不做靜音**：兩種代價不對稱——多送一則「正在重試」只是稍微吵，
+    漏掉那則「已經放棄」等於整個 B2 白做。
+- 驗證（兩個實機對照實驗，做完已清除所有殘留，正式服務全程未受影響）：
+  | 實驗 | 驗的是什麼 | 結果 |
+  |---|---|---|
+  | 1. 一定失敗的測試單元 + `OnFailure=` | 告警鏈通不通、訊息誠不誠實 | 觸發 4 次：3 次 ERROR「重試中」+ 1 次 CRITICAL「已放棄」，日誌與 DB 都寫入，`last_run_at` 未被更動 |
+  | 2. 健康檢查一定失敗的測試容器 + `HealthOnFailure=kill` | A6 與 systemd 的串接 | 容器被殺（離開碼 137）→ systemd 重啟 2 次 → 用盡次數停在 failed → 告警照常觸發 |
+
+  第二個實驗等於把 A6 與 B2 串成一條完整的鏈驗過一次：**不健康 → 殺掉 → 重啟 →
+  放棄 → 告警**，中間沒有斷點。
+- CI 另加「驗證失效告警已接上」步驟：斷言主單元的 `OnFailure=` 真的指到告警單元、
+  告警單元 systemd 讀得到、腳本檔存在。三個都問「systemd 眼中的實際狀態」而不是
+  「repo 裡寫了什麼」——少複製一個檔或 `OnFailure=` 被刪掉都會當場紅燈。
+  理由與 B1／B3 一樣：告警最糟的失敗方式是「以為接上了、其實沒有」。

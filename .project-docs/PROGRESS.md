@@ -520,3 +520,34 @@
   該參數已於 D017 移除
 - 下一步：只剩 **B2**（systemd 放棄重啟時無人收到通知，與 A6 一起設計），
   之後就是 `refactor/m4-layering`
+
+## 2026-08-09（續）—— 失效告警 B2 與「不健康就處理」A6（分支 `deploy/m4-failure-alert`）
+
+- 先確認 PR #15 已合併（`ac4e5a3` 在 main 內），main 前進到 `60b80bf`
+- **A6 的觀察期資料**：healthcheck 自 8/2 起每 60 秒執行、連續 7 天零誤判
+  （`FailingStreak=0`，容器一路 `healthy`），據此決定開啟
+- **A6**：Quadlet 加 `HealthOnFailure=kill`（不是 `restart`）。`restart` 會讓 podman
+  與 systemd 兩套重啟機制並存互相打架；`kill` 只負責殺掉不健康的容器，
+  重啟仍然只由 systemd 負責，節流與告警自動涵蓋這條路徑
+- **B2**：主單元 `[Unit]` 加 `OnFailure=`，新增 `systemd/shuyu-lending-bot-alert.service`
+  與主機端腳本 `scripts/notify_failure.py`（純標準函式庫、不 import 專案模組——
+  容器可能正是壞掉的那個，不能靠它報告自己死了）。CI deploy job 一併安裝這兩個檔案
+- **實驗推翻了一個寫進設計裡的假設**：原本以為 `OnFailure=` 只在單元真正放棄時觸發，
+  重試中途不會誤觸發，訊息因此寫死成「不會再自動重啟」。
+  實測 `StartLimitBurst=3` 的單元，**告警被觸發 4 次**（重啟 0／1／2 次時各一次、
+  最後放棄時一次），中途三次的訊息完全是錯的。
+  改成由腳本自己查單元狀態分辨：`SubState=auto-restart` → ERROR「重試中」、
+  `ActiveState=failed` → CRITICAL「已放棄」，查不到狀態時一律當成已放棄。
+  查詢前等 2 秒讓狀態轉換走完，避免問到轉換前的舊狀態
+- **刻意不做靜音**：多送一則「正在重試」只是稍微吵，漏掉「已經放棄」等於整個 B2 白做
+- 兩個實機對照實驗（做完已清乾淨，正式服務全程 `active`、容器 `Up (healthy)`）：
+  - 實驗 1（告警鏈）：觸發 4 次，3 次 ERROR + 1 次 CRITICAL，日誌與 DB 都寫入，
+    **`last_run_at` 確認未被更動**（告警絕不能偽造心跳）
+  - 實驗 2（A6 串接）：健康檢查失敗 → 容器被殺（**離開碼 137，不是 2**）→
+    systemd 重啟 2 次 → 用盡次數停在 failed → 告警照常觸發。
+    137 這點很重要：若剛好是 2，`RestartPreventExitStatus=2` 會把 A6 整個廢掉而毫無徵兆
+- CI 新增「驗證失效告警已接上」步驟，三個斷言都問「systemd 眼中的實際狀態」而非
+  repo 內容；`quadlet -dryrun` 另外驗過修改後的單元檔會產生正確參數
+- 測試 265 → 283 項（新增 `tests/unit/test_notify_failure.py` 18 項）
+- 下一步：兩輪盤查的六項缺陷全部清完，M4 只剩 `refactor/m4-layering` 分層搬遷，
+  以及被憑證卡住的 LINE 通知

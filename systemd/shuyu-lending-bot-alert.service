@@ -1,0 +1,32 @@
+# systemd 放棄重啟機器人時的告警單元（見 DECISIONS.md D020、TASKS.md B2）。
+#
+# 由主單元 shuyu-lending-bot.service 的 `OnFailure=` 觸發。OnFailure= 是**每一次
+# 失敗**都觸發，不是只在最後放棄時觸發（實測確認，見 DECISIONS.md D020），
+# 所以 notify_failure.py 會自己查單元狀態，分辨「systemd 正在重試」與
+# 「已經放棄、需要人工介入」，兩種都送、但訊息與嚴重度不同。
+#
+# 這是一般的 systemd 單元，不是 Quadlet 產物：安裝位置是
+# ~/.config/systemd/user/shuyu-lending-bot-alert.service，由 CI 的 deploy job
+# 從 repo 複製過去。repo 這份才是唯一的真實來源，不要直接改主機上那份。
+#
+# 刻意不放 [Install]：它只由 OnFailure= 觸發，不需要 enable、也不該開機自動跑。
+
+[Unit]
+Description=Shuyu Bitfinex Lending Bot 失效告警
+# 告警本身不要再掛 OnFailure=，否則告警失敗會觸發另一輪告警。
+
+[Service]
+Type=oneshot
+
+# 部署相關的路徑集中寫在這裡，腳本本身保持與部署環境無關（跟容器的分工一致）。
+# 這兩個路徑必須與 shuyu-lending-bot.container 掛載出來的主機端目錄相同，
+# 否則告警會寫到沒有人看的地方——改任何一邊都要一起改。
+Environment=BFX_UNIT=shuyu-lending-bot.service
+Environment=BFX_LOG_FILE=/workspace/deploy/active-bots/ShuyuLendingBot/logs/bfx_lending_bot.log
+Environment=BFX_DB_PATH=/workspace/deploy/active-bots/ShuyuLendingBot/data/lending.sqlite3
+
+ExecStart=/usr/bin/python3 %h/.local/share/shuyu-lending-bot/notify_failure.py
+
+# 告警卡住不能拖著 systemd：這支腳本只做寫檔與一次 systemctl 查詢，
+# 正常情況遠低於一秒。
+TimeoutStartSec=60

@@ -99,13 +99,16 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       見 DECISIONS.md D019。退出路徑的落帳不再蓋掉原始錯誤與離開碼、DB 相對路徑
       改以專案根目錄解析（與 healthcheck 一致）、`config.yaml` 補上健康檢查門檻設定。
       測試 255 → 265 項，三項都在故障情境下實跑驗證過
-- [ ] **B2**（下一條分支）：systemd 放棄重啟時無人收到通知，實單前必補，
-      與 A6「不健康就自動重啟」一起設計。細節見 TASKS.md 的「🟡 延後處理」段落
+- [x] **`deploy/m4-failure-alert`（2026-08-09）**：B2 與 A6 完成，見 DECISIONS.md D020。
+      systemd 放棄重啟時會透過 `OnFailure=` 送出告警（寫進日誌檔與 `bot_state.last_action`，
+      不碰心跳）；容器 healthcheck 觀察期滿，以 `HealthOnFailure=kill` 接上 systemd 重啟。
+      兩個實機對照實驗把「不健康 → 殺掉 → 重啟 → 放棄 → 告警」整條鏈驗過一次。
+      測試 265 → 283 項。**兩輪盤查的六項缺陷至此全部清完**
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 
 M4 目前的狀態：測試與部署兩條都已完成，**可靠性目標這次是真的達成了**（有對照實驗與
 正式容器實測佐證），CI 的迴歸防線也已從「看起來有」變成「真的擋得住」（D018）。
 小額實單剩下的前置條件是使用者補上 `secrets.env`。
-未完的是 `refactor/m4-layering` 分層搬遷、維運層的 B2（與 A6 一起設計），
-以及被憑證卡住的 LINE 通知。兩輪盤查累積的六項缺陷已清掉五項。
+未完的是 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE 通知。
+兩輪盤查累積的六項缺陷（A1～A6、B1～B3）已全部清完。

@@ -15,6 +15,15 @@ Description=Shuyu Bitfinex Lending Bot
 After=network-online.target
 Wants=network-online.target
 
+# systemd 放棄重啟（用盡 StartLimitBurst，或以離開碼 2 退出而被
+# RestartPreventExitStatus 擋下）之後，單元會停在 failed 而不會有任何人知道
+# ——實單時「資金掛在交易所上、機器人卻已經死了好幾小時」不能接受（TASKS.md B2）。
+#
+# 注意 OnFailure= 是**每一次失敗**都觸發，不是只在最後放棄時觸發
+# （實測確認，見 DECISIONS.md D020）。分辨「重試中」與「已放棄」是
+# notify_failure.py 的職責，不是這裡；這裡只負責把兩者都送出去。
+OnFailure=shuyu-lending-bot-alert.service
+
 # 重啟節流。原本 podman 端用 `--restart=on-failure:3` 表達「最多重啟 3 次」，
 # 但 podman 對這個計數何時重置沒有明確定義；systemd 的「時間窗內最多幾次啟動」
 # 語意清楚得多：30 分鐘內最多 4 次啟動（首次 + 3 次重啟），超過就停住不再嘗試。
@@ -39,11 +48,18 @@ Volume=/workspace/deploy/active-bots/ShuyuLendingBot/data:/app/data
 
 # 讀 bot_state 的心跳判斷「還在巡檢嗎」，行程活著但卡死也看得出來。
 # 門檻由 scripts/healthcheck.py 自行計算（巡檢間隔 × 3 + 60 秒）。
-# 刻意不加 --health-on-failure=restart：見 TASKS.md A6，等觀察期滿再決定。
 HealthCmd=python /app/scripts/healthcheck.py
 HealthInterval=60s
 HealthRetries=3
 HealthStartPeriod=180s
+
+# 觀察期滿，開啟「不健康就處理」（TASKS.md A6、DECISIONS.md D020）。
+# 取 kill 而不是 restart 是關鍵：restart 由 podman 自己把容器拉起來，會變成
+# podman 與 systemd 兩套重啟機制並存，各自計數、互相打架；kill 只負責「把不健康的
+# 容器殺掉」，殺掉後容器以非 0 離開碼結束，接手的是 systemd 的 Restart=on-failure
+# ——重啟權威仍然只有 systemd 一個，StartLimitBurst 的節流與 OnFailure= 的告警
+# 也就自動涵蓋這條路徑。podman 官方文件對 kill 的說明正是「與 systemd 整合最好」。
+HealthOnFailure=kill
 
 # 容器 stdout/stderr 存成檔案。程式自己的 logs/bfx_lending_bot.log 是主要日誌，
 # 這邊接的是它寫不到的部分（直接噴到 stderr 的 traceback、直譯器層級的錯誤）。

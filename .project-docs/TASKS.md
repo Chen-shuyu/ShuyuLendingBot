@@ -5,12 +5,11 @@
 
 ## 進行中
 
-**分支 `fix/m4-code-audit-findings`（2026-08-09 開，從 main `27e0e69`）**：
-程式碼層三項 **A3、A4、A5 全部完成**，見 DECISIONS.md D019。測試 255 → 265 項。
+**分支 `deploy/m4-failure-alert`（2026-08-09 開，從 main `60b80bf`）**：
+**B2 與 A6 都已完成**，見 DECISIONS.md D020。測試 265 → 283 項。
 
-兩輪盤查累積的六項缺陷，到這裡只剩 **B2**（systemd 放棄重啟時無人收到通知）——
-它與 A6 互相牽動、且完整做法要等 LINE 憑證，刻意留到下一條分支處理。
-已完成的：B1、B3（PR #14，CI 斷言）、A3、A4、A5（本分支）。
+**兩輪盤查累積的六項缺陷至此全部清完**（A1～A6、B1～B3）。
+M4 只剩 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE 通知。
 
 ## 🔴 下一步・最高優先
 
@@ -82,7 +81,13 @@
     做完以 `loginctl show-user shuyu | grep Linger` 確認變成 `Linger=yes`。
   - **為什麼排最前面**：一行指令、沒有副作用，而且是 A1 方向 A 的前提。
 
-- [ ] **A6：重新評估 `--health-on-failure=restart`**
+- [x] **A6：重新評估 `--health-on-failure=restart`**
+      —— **已於 2026-08-09 完成**（分支 `deploy/m4-failure-alert`，見 DECISIONS.md D020）。
+      觀察期結論：healthcheck 自 8/2 起每 60 秒執行、連續 7 天零誤判，據此決定開啟。
+      採 **`HealthOnFailure=kill`** 而非 `restart`——kill 只負責殺掉不健康的容器，
+      重啟仍然只由 systemd 負責，不會變成兩套機制並存。實測容器以離開碼 **137** 退出
+      （不是 2），所以 `RestartPreventExitStatus=2` 不會誤擋這條路徑。
+      以下為原始規劃紀錄，保留備查。
   - D016 原本的規劃是「先觀察一段時間，確認 healthcheck 不會誤判再開自動重啟」。
   - **A1 完成後的變化**：先前擔心的「conmon 不在，這個參數是否還執行得了」已不存在。
     而且「不健康就重啟」現在可以直接由 systemd 單元表達，不必用 podman 的參數
@@ -92,7 +97,7 @@
     之後再開。開的時候走 systemd 那條路，不要回頭加 `--health-on-failure=restart`
     （會變成兩套重啟機制並存）。
 
-### 🟡 延後處理：只剩 B2（A3～A5、B1、B3 已於 2026-08-09 完成）
+### ✅ 已全部完成：A3～A5、B1～B3（2026-08-09）
 
 > **這五項都不緊急、也不擋小額實單**，所以刻意集中到一條分支一次處理。
 > 動手前不需要重新盤查——下面記的位置、成因與修法可直接照做。
@@ -210,7 +215,13 @@
   - **驗收方式**：改完之後，可以另起一個用 `podman run` 直接啟動的同名測試容器，
     確認新的判斷會失敗（模擬「有人改回舊做法」）；正式容器則應通過。
 
-- [ ] **B2：systemd 放棄重啟時，沒有任何人會被通知**
+- [x] **B2：systemd 放棄重啟時，沒有任何人會被通知**
+      —— **已於 2026-08-09 完成**（分支 `deploy/m4-failure-alert`，見 DECISIONS.md D020）。
+      採方向 A：主單元掛 `OnFailure=`，新增告警單元與主機端 `scripts/notify_failure.py`。
+      **實驗推翻了規劃時的假設**：`OnFailure=` 是每次失敗都觸發，不是只在最後放棄時
+      觸發（實測 `StartLimitBurst=3` 觸發 4 次），所以腳本自己查單元狀態分辨
+      「重試中」（ERROR）與「已放棄」（CRITICAL）。LINE 位置已留好，待憑證。
+      以下為原始診斷紀錄，保留備查。
   - **現況**：Quadlet 單元設的是 `Restart=on-failure` +
     `StartLimitIntervalSec=1800` / `StartLimitBurst=4`，也就是「30 分鐘內最多 4 次啟動，
     超過就停手」。這個上限是**刻意的**——金鑰無效這類問題重開幾次都不會好，

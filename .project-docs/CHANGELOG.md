@@ -134,3 +134,15 @@
   容器 stdout 恆空，導致這道檢查自 2026-08-02 加入起就不可能通過（見 DECISIONS.md D018）
 - 同一步驟的 conmon 判斷由「行程是否存在」改為「cgroup 是否屬於 `shuyu-lending-bot.service`」，
   讓它真的擋得住「部署改回 CI job 直接 `podman run`」的迴歸（TASKS.md B1）
+
+### Fixed（2026-08-09，分支 `fix/m4-code-audit-findings`）
+- `main.py` 三條退出路徑的落帳改由 `_record_exit_reason()` 包住，DB 故障時不再蓋掉
+  原始錯誤、不再吃掉通知、也不再讓離開碼從 `EXIT_FATAL` 變成 `EXIT_UNEXPECTED`
+  （systemd 的 `RestartPreventExitStatus=2` 依賴它）；`finally` 的 `close()` 一併保護
+- `db/repository.py` 新增 `resolve_db_path()`：`database.path` 的相對路徑一律相對於
+  專案根目錄（與 `scripts/healthcheck.py` 一致），`BFX_DB_PATH` 在兩邊都有最高優先權。
+  修正前若從專案目錄以外啟動，健康檢查會永遠回報「尚未寫入任何心跳」
+
+### Added（2026-08-09）
+- `config.yaml` 的 `engine:` 補上 `health_max_silence_seconds` 說明（註解狀態，
+  不設就是 `interval_seconds × 3 + 60`）

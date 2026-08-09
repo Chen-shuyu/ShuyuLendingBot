@@ -6,6 +6,7 @@
 一條連線即可。
 """
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,28 @@ from typing import Any, Dict, Optional
 from db import models
 
 DEFAULT_DB_PATH = "data/lending.sqlite3"
+
+# 專案根目錄（本檔在 `db/` 底下，往上一層）。相對路徑一律以它為基準，
+# 與 `scripts/healthcheck.py` 的 `project_root()` 算法保持一致。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_db_path(configured_path: Optional[str] = None) -> Path:
+    """決定 SQLite 檔位置：環境變數優先，其次設定值，最後預設值。
+
+    相對路徑一律相對於**專案根目錄**，而不是當下的工作目錄。這一點必須跟
+    `scripts/healthcheck.py` 的 `resolve_db_path()` 完全一致，否則兩邊會算出
+    不同的檔案位置：主程式在啟動它的地方建 DB、健康檢查仍去專案目錄找，
+    結果是健康檢查永遠回報「尚未寫入任何心跳」，但機器人其實跑得好好的
+    （見 TASKS.md A4）。這種錯誤很難聯想到是路徑問題，所以兩邊的規則
+    ——包含 `BFX_DB_PATH` 的優先權——都要對齊。
+
+    config.yaml 對 `database.path` 的註解本來就寫「相對於專案根目錄」，
+    這裡是讓程式的行為追上文件的說法。
+    """
+    raw = os.getenv("BFX_DB_PATH") or configured_path or DEFAULT_DB_PATH
+    path = Path(raw)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 # loan_offers.status 的可能值
 STATUS_SUBMITTED = "submitted"
@@ -30,7 +53,7 @@ class Repository:
     """掛單流水、每日收益、機器人狀態的持久化封裝。"""
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
-        self.db_path = Path(db_path)
+        self.db_path = resolve_db_path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(str(self.db_path))
         self.connection.row_factory = sqlite3.Row
@@ -43,7 +66,7 @@ class Repository:
 
     @classmethod
     def from_config(cls, config) -> "Repository":
-        """依 config.yaml 的 `database.path` 建立。"""
+        """依 config.yaml 的 `database.path` 建立（相對路徑相對於專案根目錄）。"""
         database_config = (config or {}).get("database", {}) or {}
         return cls(database_config.get("path") or DEFAULT_DB_PATH)
 

@@ -115,6 +115,13 @@
   專案根目錄）。目前三條啟動路徑的 cwd 剛好都對，尚不會出錯，見 TASKS.md A4
 - 容器 healthcheck 目前只標記 healthy／unhealthy，**不會自動重啟**卡死的容器
   （`--health-on-failure=restart` 的評估前提已因 A1 改變，見 TASKS.md A6）
+- CI deploy job 的「驗證容器生命週期真的由 systemd 接管」步驟**擋不住它想擋的迴歸**：
+  它斷言 conmon 存在與 `podman logs` 有內容，但這兩件事在舊的 `podman run` 做法下、
+  於 job 執行期間同樣成立（舊做法的 conmon 是 job 收尾才被清掉）。修法是改為比對
+  conmon 的 cgroup 歸屬，見 TASKS.md B1。**在那之前不要把這道檢查當成迴歸保險**
+- systemd 用盡 `StartLimitBurst` 放棄重啟後，單元停在 `failed` 而**不會通知任何人**，
+  機器人等於無聲躺平。舊的 `--restart=on-failure:3` 同樣沒有通知（只是從未真的執行），
+  因此不是新的迴歸，但實單前必須補上，見 TASKS.md B2
 - 部署目錄尚無 `secrets.env`，`dry_run: true` 下不影響，實單前必須補上
 
 本專案尚未發版（無 git tag），暫不建立版本號段落；待 M1～M4（見 PLAN.md）完成、

@@ -399,3 +399,35 @@
   A6 的前提隨 A1 完成而改變（改走 systemd 表達「不健康就重啟」），維持觀察期規劃
 - 下一步：推送分支開 PR；合併後確認 CI 的新驗證步驟在真正的部署路徑上是綠的。
   之後回到 `refactor/m4-layering`，或先清掉延後的 A3～A5
+
+### 本次追加（PR #12 合併後驗收與兩項新發現，分支 `fix/m4-audit-findings`）
+- 確認 `deploy/m4-systemd-lifecycle` 已由 **PR #12 合併進 main**（合併點 `4c83f73`），
+  以 `git merge-base --is-ancestor 9c193ee origin/main` 驗證後切回 main 並 fast-forward
+- **在真正的部署路徑上驗收（這次有做對）**：容器由 CI 於 21:25:27 重建（非手動啟動），
+  **等 deploy job 完全結束之後**再檢查——conmon 仍存活，cgroup 為
+  `user@1000.service/app.slice/shuyu-lending-bot.service/runtime`。舊做法下 conmon 正是
+  在 job 收尾這一刻被清掉的，所以這是根因解除的直接證據。一併確認：`podman logs` 有內容、
+  服務 `active`／`Result=success`／`NRestarts=0`、容器 `Up (healthy)`、podman 端重啟策略
+  為 `no`、主機單元檔與 repo `diff` 一致、`loan_offers` 由 274 累積到 280（DB 跨部署保留）、
+  開機自動啟動連結存在
+- 驗收過程踩到的一個小坑（記下來免得重蹈）：用 `pgrep -f "Runner.Worker"` 判斷 CI job
+  是否還在跑會**誤判成「還在跑」**——`-f` 比對完整命令列，而執行這個判斷的 shell 自己的
+  命令列裡就含有 `Runner.Worker` 這串字，等於自我匹配。改用
+  `ps -eo pid,etimes,cmd | grep -i "[R]unner\."` 才問得到正確答案。
+  據此寫的 `until ! pgrep -f ...` 等待迴圈會永遠不結束
+- **新發現 B1（自我修正）**：PR #12 加的那道 CI 檢查「驗證容器生命週期真的由 systemd 接管」，
+  **抓不到它想抓的迴歸**。它斷言 conmon 存在與 `podman logs` 有內容，但這兩件事在舊的
+  `podman run` 做法下、於 job 執行期間同樣成立——舊做法的 conmon 是 **job 收尾那一刻**
+  才被清掉，而檢查跑在 job 執行期間。修法是改為比對 conmon 的 cgroup 是否屬於
+  `shuyu-lending-bot.service`（這個差異在 job 執行期間就看得出來）。
+  D017 已補上更正段，細節與可照抄的程式碼片段見 TASKS.md B1
+- **新發現 B2**：systemd 用盡 `StartLimitBurst` 放棄重啟後，單元停在 `failed` 而
+  **不會通知任何人**。不是這次改壞的（舊的 `--restart=on-failure:3` 同樣沒通知，
+  只是從未真的執行過），但 D017 讓重啟第一次真的會運作，這個缺口也第一次變得有意義。
+  實單前必補，見 TASKS.md B2
+- **教訓**：D016 的錯是「驗證環境與故障環境不同」，B1 的錯是「**驗證時機與故障時機不同**」
+  ——檢查跑在故障發生之前的時間點，所以永遠看不到故障。設計自動化檢查時，
+  除了問「這個檢查會不會通過」，還要問「**如果故障真的發生了，它會不會失敗**」
+- 依使用者指示開了分支 `fix/m4-audit-findings`（從 main `4c83f73`），把 A3～A5 與
+  B1、B2 五項集中在這條分支處理。**本次只寫文件，沒有動任何程式碼**，
+  五項的修法都已寫進 TASKS.md 的「🟡 延後處理」段落，下次可直接照做

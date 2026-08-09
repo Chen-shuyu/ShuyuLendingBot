@@ -4,7 +4,11 @@
 > 說明會寫在該項目底下）。
 
 ## 進行中
-（無）
+
+**分支 `fix/m4-audit-findings`（2026-08-02 開，從 main `4c83f73`）**：一次處理五項，
+都是盤查發現、但當時刻意延後的小缺陷——A3、A4、A5（PR #10 盤查，程式碼層）
+與 B1、B2（PR #12 合併後驗收，維運層）。五項的完整說明都在下方
+「🟡 延後處理」段落，動手前不需要重新盤查。目前尚未開始寫任何程式碼。
 
 ## 🔴 下一步・最高優先
 
@@ -86,12 +90,16 @@
     之後再開。開的時候走 systemd 那條路，不要回頭加 `--health-on-failure=restart`
     （會變成兩套重啟機制並存）。
 
-### 🟡 延後處理：程式碼層三項（2026-08-02 使用者指示，A1／A2 完成後暫不接著做）
+### 🟡 延後處理：分支 `fix/m4-audit-findings` 的五項（A3～A5 + B1、B2）
 
-> 這三項都是 PR #10 盤查時在**程式碼層**發現的，共同點是**都不緊急、也不擋小額實單**：
-> A3 只在 DB 本身故障時才會顯現、A4 目前三條啟動路徑的 cwd 剛好都對、A5 純粹是設定檔
-> 少寫一行。使用者已指示先不做，之後另開一條分支（暫名 `fix/m4-audit-findings`）
-> 一次處理三項。動手前不需要重新盤查——下面記的位置、成因與修法可直接照做。
+> **這五項都不緊急、也不擋小額實單**，所以刻意集中到一條分支一次處理。
+> 動手前不需要重新盤查——下面記的位置、成因與修法可直接照做。
+>
+> - **A3～A5**：PR #10 盤查時在**程式碼層**發現的。A3 只在 DB 本身故障時才會顯現、
+>   A4 目前三條啟動路徑的 cwd 剛好都對、A5 純粹是設定檔少寫一行。
+> - **B1、B2**：PR #12（systemd 接管容器）合併後驗收時發現的**維運層**問題。
+>   B1 是這次自己加的 CI 檢查抓不到它想抓的東西；B2 是既有行為的缺口，
+>   實單前值得補。兩項的完整背景見下方，也可參照 DECISIONS.md D017 的補充段。
 
 - [ ] **A3：`main.py` 的錯誤處理路徑中，落帳失敗會把原始錯誤蓋掉**
   - **位置**：`main.py` 三處 —— 啟動檢查失敗（約 160 行）、`FatalError`（約 177 行）、
@@ -125,6 +133,69 @@
     設定檔裡完全看不到，等於藏起來的選項。
   - **建議修法**：在 `config.yaml` 的 `engine:` 區段補上一行（註解掉或給預設值皆可），
     說明「不設就是 `interval_seconds × 3 + 60`」。
+
+- [ ] **B1：CI 那道「驗證容器生命週期真的由 systemd 接管」的檢查，抓不到它想抓的迴歸**
+  - **先看懂背景**（不熟 podman 的人請先讀這段）：
+    - **conmon** 是 podman 為每個容器配的「看護」行程，只做兩件事——把容器的
+      stdout/stderr 抄成日誌（`podman logs` 讀的就是這份），以及在容器退出時
+      依重啟規則把它拉起來。**conmon 不在，這兩件事就都沒人做**，
+      但容器本身還會繼續跑，所以外觀上看不出異狀。
+    - **cgroup** 是 Linux 幫每個行程登記的「群組歸屬」。重點在於：系統清理行程時
+      是**整個 cgroup 一起清掉**，不是一個一個殺。
+    - **原本壞掉的原因**（A1，已修）：舊做法是 CI 的 deploy job 自己 `podman run`，
+      於是 conmon 的 cgroup 登記在 **CI job 那一群**底下。job 收尾時整群被清掉，
+      conmon 跟著死。所以日誌永遠是空的、容器崩了也沒人重啟。
+      改由 systemd 啟動之後，conmon 的 cgroup 變成
+      `user@1000.service/app.slice/shuyu-lending-bot.service/runtime`，與 job 無關。
+  - **問題**：PR #12 在 deploy job 加了一步「驗證容器生命週期真的由 systemd 接管」，
+    用意是「**萬一以後有人改回 `podman run`，要當場紅燈**」。但它斷言的兩件事是
+    「conmon 行程存在」與「`podman logs` 有內容」，而**這兩件事在舊的壞掉做法下也會通過**：
+    舊做法的 conmon 是在 **job 收尾那一刻**才被清掉的，而這道檢查跑在 **job 執行期間**，
+    那時 conmon 還活著、`podman logs`（k8s-file 驅動）也讀得到東西。
+  - **所以現況是**：這道檢查擋得住「服務起不來、映像不存在、log driver 壞掉」，
+    但**擋不住它最想擋的那件事**。不是會造成故障的 bug，是一道給錯安全感的防線。
+  - **建議修法**（很小）：不要只問「conmon 在不在」，要問「**conmon 的 cgroup 屬於誰**」。
+    那段程式已經用 `cat /proc/$CONMON_PID/cgroup` 把 cgroup 印出來了，只是印出來給人看、
+    沒有拿去比對。補一個判斷即可：
+    ```bash
+    CONMON_CGROUP=$(cat "/proc/$CONMON_PID/cgroup")
+    case "$CONMON_CGROUP" in
+      *shuyu-lending-bot.service*) ;;   # 由 systemd 啟動，正確
+      *) echo "::error::conmon 不在 shuyu-lending-bot.service 的 cgroup 底下"
+         echo "::error::容器可能又變回由 CI job 直接 podman run 啟動：$CONMON_CGROUP"
+         exit 1 ;;
+    esac
+    ```
+    這個差異**在 job 執行期間就看得出來**，不必等收尾，所以才抓得到。
+  - **位置**：`.github/workflows/python-app.yml`，deploy job 的
+    「驗證容器生命週期真的由 systemd 接管」步驟（`cat "/proc/$CONMON_PID/cgroup"` 那行後面）。
+  - **驗收方式**：改完之後，可以另起一個用 `podman run` 直接啟動的同名測試容器，
+    確認新的判斷會失敗（模擬「有人改回舊做法」）；正式容器則應通過。
+
+- [ ] **B2：systemd 放棄重啟時，沒有任何人會被通知**
+  - **現況**：Quadlet 單元設的是 `Restart=on-failure` +
+    `StartLimitIntervalSec=1800` / `StartLimitBurst=4`，也就是「30 分鐘內最多 4 次啟動，
+    超過就停手」。這個上限是**刻意的**——金鑰無效這類問題重開幾次都不會好，
+    無限重啟只會洗版（見 D016、D017）。
+  - **問題**：systemd 放棄之後單元停在 `failed`，機器人整個不在了，
+    但**不會有任何通知**。要自己下 `systemctl --user status` 才會發現。
+    容器 healthcheck 也幫不上忙——容器都沒了，沒有東西可以檢查。
+  - **這不是這次改壞的**：舊的 `--restart=on-failure:3` 同樣沒有通知，
+    只是當時它根本沒在執行（A1），所以問題沒浮現。
+  - **為什麼實單前要補**：dry-run 下機器人躺平沒有代價，實單時「資金掛在交易所上、
+    機器人卻已經死了好幾小時而沒人知道」是不能接受的。
+  - **建議修法（方向 A，推薦）**：在 Quadlet 單元的 `[Unit]` 加
+    `OnFailure=shuyu-lending-bot-alert.service`，另寫一個 oneshot 單元負責送通知。
+    systemd 的 `OnFailure=` 正是為這種情境設計的，單元進入 failed 就會觸發一次。
+    **注意這條會被 LINE 通知的進度卡住**——`modules/line_notifier.py` 目前打的是
+    已停用的 LINE Notify 端點，通知一定失敗（見下方 M4 的 `feature/m4-line-messaging`）。
+    在憑證到位之前，退而求其次可以先讓 alert 單元把事件寫進
+    `logs/bfx_lending_bot.log` 或 DB 的 `bot_state.last_action`，至少留下痕跡。
+  - **建議修法（方向 B，備案）**：不靠 systemd，改讓外部定時檢查
+    （例如既有的 healthcheck timer 之外再加一個）發現服務不在就告警。
+    比較繞，且多一個要維護的元件，除非方向 A 遇到阻礙否則不建議。
+  - **一併決定**：修這條的時候順便把 A6（不健康就自動重啟）想清楚——兩者都是
+    「systemd 層的失效處理」，設計上會互相牽動，分開做容易做出打架的規則。
 
 ## 待處理（依優先級，對應 PLAN.md 的 M1～M4）
 

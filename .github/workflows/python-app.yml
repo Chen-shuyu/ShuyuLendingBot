@@ -91,6 +91,17 @@ jobs:
           export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
           mkdir -p ~/.config/containers/systemd
           cp systemd/shuyu-lending-bot.container ~/.config/containers/systemd/
+
+          # 失效告警（TASKS.md B2）：主單元的 OnFailure= 指到這個單元，
+          # 所以它必須跟主單元一起安裝，否則 systemd 放棄重啟時會找不到單元，
+          # 告警靜悄悄地不會發生——正是 B2 想解掉的那種「以為有人會知道」。
+          # 這是一般單元不是 Quadlet 產物，放 systemd/user 而不是 containers/systemd。
+          mkdir -p ~/.config/systemd/user
+          cp systemd/shuyu-lending-bot-alert.service ~/.config/systemd/user/
+          # 告警腳本在容器外執行：容器可能正是壞掉的那一個，不能靠它來報告自己死了。
+          mkdir -p ~/.local/share/shuyu-lending-bot
+          cp scripts/notify_failure.py ~/.local/share/shuyu-lending-bot/
+
           systemctl --user daemon-reload
 
       - name: 重新啟動服務
@@ -162,6 +173,39 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$CONTAINER_LOGS"
+
+      - name: 驗證失效告警已接上
+        # 這道檢查的存在理由與 B2 本身一樣：告警最糟的失敗方式不是「送錯」，
+        # 而是「以為接上了、其實沒有」，而且那件事要等機器人真的死掉才會發現。
+        # 三個斷言都問「systemd 眼中的實際狀態」而不是「repo 裡寫了什麼」——
+        # 少複製一個檔、或 OnFailure= 被刪掉，都會在這裡當場紅燈。
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+          echo "--- 主單元有沒有掛上 OnFailure= ---"
+          ON_FAILURE=$(systemctl --user show shuyu-lending-bot.service --property=OnFailure --value)
+          echo "OnFailure=$ON_FAILURE"
+          case "$ON_FAILURE" in
+            *shuyu-lending-bot-alert.service*) ;;
+            *)
+              echo "::error::主單元沒有掛上 shuyu-lending-bot-alert.service"
+              echo "::error::systemd 放棄重啟時不會有任何人被通知（TASKS.md B2）"
+              exit 1
+              ;;
+          esac
+
+          echo "--- 告警單元本身裝好了嗎（systemd 讀得到、解析得動）---"
+          if ! systemctl --user cat shuyu-lending-bot-alert.service >/dev/null 2>&1; then
+            echo "::error::找不到 shuyu-lending-bot-alert.service，OnFailure= 會指向不存在的單元"
+            exit 1
+          fi
+
+          echo "--- 告警腳本在不在 ---"
+          test -f "$HOME/.local/share/shuyu-lending-bot/notify_failure.py" || {
+            echo "::error::告警腳本不存在，告警單元會啟動失敗"
+            exit 1
+          }
 
       - name: 檢查容器狀態
         run: |

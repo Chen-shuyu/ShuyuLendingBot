@@ -8,7 +8,15 @@
 核心迴圈（`while True` + `time.sleep`）
 每輪巡檢：取消未成交舊單 → 查詢可用餘額 → 抓 FRR → 產生掛單計畫 → 送出掛單 → 寫入 DB →
 LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007），容器由 systemd --user
-管理生命週期，崩潰後由 systemd 的 restart 策略頂起（見 D017）。
+管理生命週期，崩潰後由 systemd 的 restart 策略頂起（見 D017）；健康檢查判定不健康時
+由 podman 殺掉容器、同樣交還給 systemd 重啟，重啟次數用盡後停在 `failed` 並送出告警
+（見 D020）。
+
+**維運元件與主程式刻意分離**：`scripts/healthcheck.py` 在容器內執行、
+`scripts/notify_failure.py` 在容器外（主機端）執行，兩者都只用標準函式庫、
+不 import 專案任何模組。理由相同——它們執行的時機正是「東西壞掉」的時候，
+不能因為專案程式碼或相依套件有問題而跟著失效，尤其 `notify_failure.py`
+要報告的往往就是「容器本身已經不在了」。
 
 ```
 [main.py bootstrap]
@@ -40,14 +48,21 @@ ShuyuLendingBot/
 │   ├── lending_strategy.py     # LendingStrategy.build_offer_plan()：門檻/拆單/天期判斷骨架
 │   └── line_notifier.py        # LineNotifier：呼叫已停用的 LINE Notify（永遠失敗）
 ├── utils/logger.py             # BotLogger：RotatingFileHandler（M3 改）
-├── scripts/healthcheck.py      # 容器 healthcheck：唯讀讀 bot_state 心跳（M4 新增，見 D016）
-├── tests/                      # 三層測試 236 項（M4 新增，見 DECISIONS.md D015、D016）
+├── scripts/
+│   ├── healthcheck.py          # 容器內：唯讀讀 bot_state 心跳（M4 新增，見 D016）
+│   └── notify_failure.py       # 主機端：systemd 失效告警（M4 新增，見 D020）
+├── systemd/
+│   ├── shuyu-lending-bot.container        # 正式部署的 Quadlet 單元（D017、D020）
+│   ├── shuyu-lending-bot-alert.service    # OnFailure= 觸發的告警單元（D020）
+│   └── bfx-lending-bot.service            # 本機測試用，非正式部署路線
+├── tests/                      # 三層測試 283 項（M4 新增，見 DECISIONS.md D015、D016）
 │   ├── conftest.py             # 共用 fixture 與測試替身（FakeLogger／FakeNotifier／repository）
-│   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端
-│   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重
+│   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端、告警腳本
+│   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重、離開碼與退出路徑
 │   └── integration/            # dry-run 端到端、Bitfinex 公開端點格式守門（live marker）
 └── main.py                     # 常駐主迴圈 + run_once + FailureTracker（尚未搬進 core/）
-                                # 離開碼 0/1/2 語意化，退出前落帳（M4 改，見 D016）
+                                # 離開碼 0/1/2 語意化（D016）；退出路徑的落帳與 close()
+                                # 都不得改變離開碼與通知（D019）
 ```
 
 測試層與待搬遷的目錄結構是耦合的：`refactor/m4-layering` 做搬遷時，`tests/` 的 import
@@ -75,10 +90,13 @@ ShuyuLendingBot/
 ├── notify/
 │   └── line_messaging.py        # 由 modules/line_notifier.py 改寫，走 LINE Messaging API
 ├── utils/logger.py              # 改用 RotatingFileHandler
-├── scripts/healthcheck.py        # 容器 healthcheck（維運腳本，不在主程式執行路徑上）
+├── scripts/                      # 維運腳本，皆不在主程式執行路徑上、皆只用標準函式庫
+│   ├── healthcheck.py            # 容器內執行的 healthcheck
+│   └── notify_failure.py         # 主機端執行的失效告警
 ├── tests/{unit,functional,integration}/
 ├── systemd/                      # shuyu-lending-bot.container 是正式部署的 Quadlet
-│                                 # 單元（D017）；bfx-lending-bot.service 為本機測試用
+│                                 # 單元（D017、D020）、shuyu-lending-bot-alert.service
+│                                 # 是失效告警單元（D020）；bfx-lending-bot.service 為本機測試用
 ├── main.py                       # 精簡為 bootstrap，主迴圈移入 core/
 └── .project-docs/                # 本文件所在
 ```
@@ -107,6 +125,9 @@ ShuyuLendingBot/
 - `db/repository.py`：SQLite WAL 模式（搭配 `synchronous=NORMAL`），記錄掛單流水、
   每日收益彙總、`bot_state`。掛單成功走 `record_offer()`、失敗走 `record_offer_failure()`——
   掛單 API 無法 rollback，同一輪前幾筆成功時錢已經出去了，只有逐筆落帳才對得出真實狀態。
+  檔案位置由 `resolve_db_path()` 決定：`BFX_DB_PATH` 優先，相對路徑一律相對於專案根目錄
+  ——**必須與 `scripts/healthcheck.py` 的同名函式算出相同結果**，兩邊分家的症狀是健康檢查
+  永遠回報「尚未寫入任何心跳」而機器人其實是好的（D019）。
   尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
 - `notify/line_messaging.py`（現 `modules/line_notifier.py`）：目前呼叫已停用的 LINE Notify
   端點（`notify-api.line.me`），需改寫為 LINE Messaging API push
@@ -114,9 +135,18 @@ ShuyuLendingBot/
   只會留在日誌裡。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
 - `scripts/healthcheck.py`：容器 healthcheck 的執行檔，唯讀開啟 SQLite 讀 `bot_state.last_run_at`，
-  心跳超過「巡檢間隔 × 3 + 60 秒」就以離開碼 1 回報 unhealthy。刻意不看
-  `consecutive_failures`（那是交易所端問題，重啟無益），也刻意不建立任何檔案或資料表——
-  健康檢查有副作用會把「DB 掛載掉了」這個真正的問題蓋掉（D016）。
+  心跳超過「巡檢間隔 × 3 + 60 秒」（可由 `engine.health_max_silence_seconds` 覆寫）就以
+  離開碼 1 回報 unhealthy。刻意不看 `consecutive_failures`（那是交易所端問題，重啟無益），
+  也刻意不建立任何檔案或資料表——健康檢查有副作用會把「DB 掛載掉了」這個真正的問題蓋掉
+  （D016）。判定 unhealthy 之後由 `HealthOnFailure=kill` 殺掉容器，重啟交還 systemd（D020）。
+- `scripts/notify_failure.py`：**在容器外（主機端）執行**的失效告警，由
+  `shuyu-lending-bot-alert.service` 執行，而該單元由主單元的 `OnFailure=` 觸發。
+  `OnFailure=` 是每次失敗都觸發（不是只在最後放棄時），所以腳本自己查單元狀態分辨
+  「systemd 正在重試」（ERROR）與「已放棄、需人工介入」（CRITICAL），查不到狀態時
+  一律當成已放棄。寫入機器人日誌檔與 `bot_state.last_action`，**絕不寫 `last_run_at`**
+  ——那是心跳，機器人已經死了還更新它等於偽造它還活著。DB 以 `mode=rw` 開啟，
+  檔案不存在就失敗、不建立（與 healthcheck 同一原則）。LINE 推播位置已留好，
+  待 Channel 憑證到位（D020）。
 
 ## 刻意排除的部分
 
@@ -139,4 +169,11 @@ ShuyuLendingBot/
   `Restart=on-failure` + `StartLimitBurst` 表達、`RestartPreventExitStatus=2` 讓
   `EXIT_FATAL` 不重啟；`--log-driver=k8s-file` 讓日誌取得回來、`--health-cmd` 掛上
   心跳檢查 —— 見 DECISIONS D016。
+- 失效處理只有一個權威：**systemd**。健康檢查不健康時用 `HealthOnFailure=kill`
+  （不是 `restart`）——podman 只負責殺掉容器、產生一個非 0 離開碼，重啟一律由
+  `Restart=on-failure` 接手，因此節流與告警自動涵蓋這條路徑，不會出現 podman 與
+  systemd 兩套機制各自計數互相打架 —— 見 DECISIONS D020。
+- 告警管道：機器人自己的連續失敗告警走 `FailureTracker`（D013，容器內）；
+  「機器人整個不在了」則走 systemd 的 `OnFailure=` + `scripts/notify_failure.py`
+  （D020，容器外）。兩者分工的界線是「還有沒有東西活著可以報告」。
 - 可觀測：固定檔名日誌輪替、指數退避重試、`bot_state` 心跳與連續失敗告警 —— 見 DECISIONS D013。

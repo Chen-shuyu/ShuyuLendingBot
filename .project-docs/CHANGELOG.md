@@ -146,3 +146,16 @@
 ### Added（2026-08-09）
 - `config.yaml` 的 `engine:` 補上 `health_max_silence_seconds` 說明（註解狀態，
   不設就是 `interval_seconds × 3 + 60`）
+
+### Added（2026-08-09，分支 `deploy/m4-failure-alert`）
+- 失效告警（TASKS.md B2）：主單元掛上 `OnFailure=shuyu-lending-bot-alert.service`，
+  新增 `systemd/shuyu-lending-bot-alert.service` 與主機端 `scripts/notify_failure.py`。
+  告警會分辨「systemd 正在重試」（ERROR）與「已放棄、需人工介入」（CRITICAL），
+  寫進機器人日誌檔與 `bot_state.last_action`，**不碰心跳 `last_run_at`**。
+  LINE 推播位置已留好，待憑證到位
+- CI deploy job 新增「驗證失效告警已接上」步驟與告警單元／腳本的安裝步驟
+
+### Changed（2026-08-09）
+- 容器 healthcheck 觀察期滿，Quadlet 加上 `HealthOnFailure=kill`（TASKS.md A6）：
+  不健康的容器由 podman 殺掉（離開碼 137），重啟仍然只由 systemd 負責，
+  避免 podman 與 systemd 兩套重啟機制並存

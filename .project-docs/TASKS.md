@@ -5,10 +5,15 @@
 
 ## 進行中
 
-**分支 `fix/m4-audit-findings`（2026-08-02 開，從 main `4c83f73`）**：一次處理五項，
-都是盤查發現、但當時刻意延後的小缺陷——A3、A4、A5（PR #10 盤查，程式碼層）
-與 B1、B2（PR #12 合併後驗收，維運層）。五項的完整說明都在下方
-「🟡 延後處理」段落，動手前不需要重新盤查。目前尚未開始寫任何程式碼。
+**分支 `fix/m4-ci-lifecycle-assertion`（2026-08-09 開，從 main `ada4fb4`）**：
+先處理 CI 紅燈。PR #13 合併後 deploy job 在「驗證容器生命週期真的由 systemd 接管」
+這一步失敗，查出的根因是**斷言本身寫錯**（B3，見下方），順帶把同一個步驟的
+**B1** 一起改完。兩項都已完成並以對照實驗驗收，見 DECISIONS.md D018。
+
+原本規劃在 `fix/m4-audit-findings` 一次處理的五項（A3～A5＋B1、B2），
+B1 已隨這條分支完成；**剩下 A3、A4、A5、B2 移到下一條分支**，
+完整說明仍在下方「🟡 延後處理」段落，動手前不需要重新盤查。
+（`fix/m4-audit-findings` 只含文件同步，已由 PR #13 合併進 main。）
 
 ## 🔴 下一步・最高優先
 
@@ -90,7 +95,7 @@
     之後再開。開的時候走 systemd 那條路，不要回頭加 `--health-on-failure=restart`
     （會變成兩套重啟機制並存）。
 
-### 🟡 延後處理：分支 `fix/m4-audit-findings` 的五項（A3～A5 + B1、B2）
+### 🟡 延後處理：A3～A5 + B2（B1、B3 已於 2026-08-09 完成）
 
 > **這五項都不緊急、也不擋小額實單**，所以刻意集中到一條分支一次處理。
 > 動手前不需要重新盤查——下面記的位置、成因與修法可直接照做。
@@ -134,7 +139,28 @@
   - **建議修法**：在 `config.yaml` 的 `engine:` 區段補上一行（註解掉或給預設值皆可），
     說明「不設就是 `interval_seconds × 3 + 60`」。
 
-- [ ] **B1：CI 那道「驗證容器生命週期真的由 systemd 接管」的檢查，抓不到它想抓的迴歸**
+- [x] **B3：那道檢查的 `podman logs` 斷言寫錯，從加進來就不可能通過**
+      —— **已於 2026-08-09 完成**（分支 `fix/m4-ci-lifecycle-assertion`，見 DECISIONS.md D018）
+  - **現象**：PR #13 合併後 deploy job 紅燈，訊息是「30 秒內 podman logs 仍然沒有內容，
+    conmon 或 log driver 有問題」。但實查之下 conmon 在、cgroup 正確、`podman logs`
+    有 11 行內容——**三件事全都是好的，壞的是檢查**。
+  - **根因**：機器人的日誌走 **stderr**（`utils/logger.py` 的 `logging.StreamHandler()`
+    不帶參數，Python 預設就是 stderr），而程式沒有任何 `print()`，所以容器 stdout 永遠是空的。
+    檢查寫的是 `$(podman logs ... 2>/dev/null)`——`$( )` 只捕捉 stdout、`2>/dev/null`
+    又把 stderr 丟掉，等於親手扔掉自己要找的東西。
+  - **影響**：deploy job 自 PR #12 合併（2026-08-02）以來一路是紅的，只是沒人注意到。
+    當時手動驗收看得到日誌，是因為終端機下 stderr 會直接顯示在螢幕上。
+    **機器人本身不受影響**，重啟服務在這一步之前就已完成。
+  - **修法**：改用 `CONTAINER_LOGS=$(podman logs --tail=20 ... 2>&1)`，並同時要求
+    podman 指令本身成功（否則「no such container」的錯誤訊息會被當成日誌而誤放行）。
+    刻意**不改 `utils/logger.py`**——為了讓寫錯的斷言通過而改動機器人輸出行為，因果顛倒。
+
+- [x] **B1：CI 那道「驗證容器生命週期真的由 systemd 接管」的檢查，抓不到它想抓的迴歸**
+      —— **已於 2026-08-09 完成**，與 B3 同一個步驟一起改（分支
+      `fix/m4-ci-lifecycle-assertion`，見 DECISIONS.md D018）。實測：正式容器通過（離開碼 0）、
+      直接 `podman run` 起的假容器紅燈（離開碼 1，被 cgroup 判斷擋下）。
+      關鍵在於那個假容器的 `podman logs` **是有內容的**，所以它是被「啟動方式不對」擋下，
+      不是碰巧因為沒日誌而失敗。以下為原始診斷紀錄，保留備查。
   - **先看懂背景**（不熟 podman 的人請先讀這段）：
     - **conmon** 是 podman 為每個容器配的「看護」行程，只做兩件事——把容器的
       stdout/stderr 抄成日誌（`podman logs` 讀的就是這份），以及在容器退出時

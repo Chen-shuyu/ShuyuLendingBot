@@ -126,3 +126,11 @@
 
 本專案尚未發版（無 git tag），暫不建立版本號段落；待 M1～M4（見 PLAN.md）完成、
 可穩定 dry-run 常駐後，再開始標記版本。
+
+### Fixed（2026-08-09，分支 `fix/m4-ci-lifecycle-assertion`）
+- CI deploy job 的「驗證容器生命週期真的由 systemd 接管」步驟：`podman logs` 斷言改為
+  合併 stderr（`2>&1`）並同時檢查 podman 指令本身的離開碼。舊寫法
+  `$(podman logs ... 2>/dev/null)` 只捕捉 stdout，而機器人的日誌全走 stderr、
+  容器 stdout 恆空，導致這道檢查自 2026-08-02 加入起就不可能通過（見 DECISIONS.md D018）
+- 同一步驟的 conmon 判斷由「行程是否存在」改為「cgroup 是否屬於 `shuyu-lending-bot.service`」，
+  讓它真的擋得住「部署改回 CI job 直接 `podman run`」的迴歸（TASKS.md B1）

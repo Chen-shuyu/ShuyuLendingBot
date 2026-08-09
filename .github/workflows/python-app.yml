@@ -122,19 +122,46 @@ jobs:
             echo "::error::conmon 行程不存在（PID=$CONMON_PID），容器日誌與自動重啟都不會生效"
             exit 1
           fi
-          echo "conmon PID=$CONMON_PID，cgroup："
-          cat "/proc/$CONMON_PID/cgroup"
+
+          # 光問「conmon 在不在」擋不住這一步想擋的迴歸（TASKS.md B1）：舊的
+          # 「CI job 自己 podman run」做法下，conmon 是在 **job 收尾那一刻** 才被清掉的，
+          # 而這個檢查跑在 job 執行期間，那時它還活得好好的。所以要問的不是存不存在，
+          # 是 **它登記在誰的 cgroup 底下**——由 systemd 啟動會落在
+          # shuyu-lending-bot.service 底下，由 job 啟動則落在 runner 那一群，
+          # 這個差異當下就看得出來，不必等到收尾。
+          CONMON_CGROUP=$(cat "/proc/$CONMON_PID/cgroup")
+          echo "conmon PID=$CONMON_PID，cgroup：$CONMON_CGROUP"
+          case "$CONMON_CGROUP" in
+            *shuyu-lending-bot.service*) ;;
+            *)
+              echo "::error::conmon 不在 shuyu-lending-bot.service 的 cgroup 底下"
+              echo "::error::容器可能又變回由 CI job 直接 podman run 啟動：$CONMON_CGROUP"
+              exit 1
+              ;;
+          esac
 
           echo "--- podman logs 是否取得到內容 ---"
+          # 這裡一定要合併 stderr（TASKS.md B3）：機器人的日誌走的是 stderr
+          # （utils/logger.py 的 logging.StreamHandler() 不帶參數，Python 預設就是 stderr），
+          # 而程式沒有任何 print()，所以容器的 stdout 永遠是空的。
+          # 舊寫法是 `$(podman logs ... 2>/dev/null)`——`$( )` 只捕捉 stdout、
+          # `2>/dev/null` 又把 stderr 丟掉，等於親手扔掉自己要找的東西，永遠不可能通過。
+          # 合併之後要另外確認 podman 本身有沒有失敗，否則「no such container」這類
+          # 錯誤訊息會被當成「有日誌」而誤放行。
+          LOGS_OK=0
           for _ in $(seq 1 15); do
-            [ -n "$(podman logs --tail=5 shuyu-lending-bot 2>/dev/null)" ] && break
+            if CONTAINER_LOGS=$(podman logs --tail=20 shuyu-lending-bot 2>&1) \
+               && [ -n "$CONTAINER_LOGS" ]; then
+              LOGS_OK=1
+              break
+            fi
             sleep 2
           done
-          if [ -z "$(podman logs --tail=5 shuyu-lending-bot 2>/dev/null)" ]; then
+          if [ "$LOGS_OK" -ne 1 ]; then
             echo "::error::30 秒內 podman logs 仍然沒有內容，conmon 或 log driver 有問題"
             exit 1
           fi
-          podman logs --tail=20 shuyu-lending-bot
+          printf '%s\n' "$CONTAINER_LOGS"
 
       - name: 檢查容器狀態
         run: |

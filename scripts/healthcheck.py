@@ -107,6 +107,13 @@ def resolve_db_path(root: Path) -> Path:
 
     設定檔讀不到時不讓整支腳本壞掉——健康檢查的職責是回報機器人狀態，
     自己因為 PyYAML 沒裝而爆掉只會產生假警報。
+
+    **這裡的規則必須與 `db/repository.py` 的 `resolve_db_path()` 完全一致**
+    （環境變數優先、相對路徑相對於專案根目錄）。兩邊算出不同的位置時，
+    症狀是健康檢查永遠回報「尚未寫入任何心跳」而機器人其實是好的——
+    很難聯想到路徑問題，所以改任何一邊都要一起改（見 TASKS.md A4）。
+    刻意不 import `db.repository` 共用：這支腳本要維持零專案相依、零副作用，
+    而 `Repository` 一建立就會建目錄與資料表。
     """
     env_path = os.getenv("BFX_DB_PATH")
     if env_path:

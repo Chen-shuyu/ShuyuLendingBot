@@ -486,3 +486,37 @@
   看它會不會失敗**，不能只在正常情境下看到綠燈就收工。記為 DECISIONS.md D018
 - 下一步：合併後回到剩下的 A3、A4、A5、B2（B2 仍與 A6 一起設計），之後才是
   `refactor/m4-layering`
+
+## 2026-08-09（續）—— 程式碼層三項 A3／A4／A5（分支 `fix/m4-code-audit-findings`）
+
+- 先確認 PR #14 已合併：`git merge-base --is-ancestor 705df91 origin/main` 通過，
+  main 前進到 `27e0e69`。部署後容器 `Up (healthy)`、`NRestarts=0`、conmon cgroup 正確，
+  **修好的 CI 斷言在真正的部署路徑上第一次綠燈**
+- **A3**：抽出 `main._record_exit_reason()`，三條退出路徑共用，落帳失敗只記日誌，
+  不影響離開碼與通知。順帶把 `finally` 的 `repository.close()` 也包起來——
+  `finally` 拋出的例外會取代回傳值，離開碼會直接變成 1。
+  這件事在 D017 之後變得更重要：systemd 用 `RestartPreventExitStatus=2` 依離開碼
+  決定要不要重啟，落帳失敗把 `EXIT_FATAL` 變成 `EXIT_UNEXPECTED` 會讓它去重啟
+  一台永遠起不來的機器人
+- **A4**：`db/repository.py` 新增 `PROJECT_ROOT` 與 `resolve_db_path()`，相對路徑一律
+  相對專案根目錄；一併讓 `BFX_DB_PATH` 在主程式端也有最高優先權（原本只有 healthcheck
+  認得，設了就兩邊分家，是同一缺陷的另一面）。
+  **刻意不共用同一個函式**：healthcheck 要維持零專案相依、零副作用，
+  改以測試釘住「兩邊算出的路徑必須相同」，兩支檔案的 docstring 都寫明要一起改。
+  容器內行為不變（`PROJECT_ROOT` 就是 `/app`）
+- **A5**：`config.yaml` 的 `engine:` 補上註解掉的 `health_max_silence_seconds` 與說明
+- 測試 255 → 265 項：新增 `TestExitPathSurvivesBrokenDatabase`（4 條）與
+  `TestPathResolution`（6 條，含兩條「主程式與 healthcheck 必須算出同一路徑」的斷言）
+- **每一項都在故障情境下實跑驗證過**（D018 的教訓）：
+  - A3：`git stash` 掉 `main.py` 的修正後重跑，4 條新測試全部失敗，還原後全過
+  - A4：以 cwd=`/tmp` 實跑，修正前兩邊算出 `/tmp/data/...` 與專案目錄兩個不同位置，
+    修正後一致
+  - A5：確認註解狀態下門檻是預設 1860 秒，取消註解設 1200 後覆寫生效
+- 過程中修掉一個既有測試的問題：`test_from_config_falls_back_to_default_path` 原本
+  `monkeypatch.chdir` 後斷言相對路徑，等於釘住舊行為；改成只驗 `resolve_db_path()`
+  的結果，不再實際建立 `Repository`——否則預設路徑會指向**真正的專案目錄**，
+  測試會在 repo 裡留下一個 `data/lending.sqlite3`（第一次改完跑測試時真的發生了，已清掉）
+- 順帶更正 `main.py` 模組 docstring 裡「節流交給 `--restart=on-failure:N`」的說法，
+  該參數已於 D017 移除
+- 下一步：只剩 **B2**（systemd 放棄重啟時無人收到通知，與 A6 一起設計），
+  之後就是 `refactor/m4-layering`

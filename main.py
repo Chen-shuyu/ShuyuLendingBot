@@ -9,10 +9,11 @@
 `bot_state.last_run_at` 則兼作心跳時間戳，連續失敗次數也一併寫入，
 讓外部健康檢查不必啟動 Python 就能判斷機器人是否還健康。
 
-離開碼分成三種（見 DECISIONS.md D016）。容器的 restart policy 只看「是不是 0」，
-分不出這三種，重啟次數的節流交給 `--restart=on-failure:N`；離開碼的用途是讓人
-（與 `podman inspect` 的 `.State.ExitCode`）一眼看出容器為什麼收掉，
-判斷該去修設定還是查日誌。
+離開碼分成三種（見 DECISIONS.md D016、D017）。容器生命週期改由 systemd 的 Quadlet
+單元管理之後，離開碼不只是給人看的：單元用 `RestartPreventExitStatus=2` 表達
+「`EXIT_FATAL` 就不要重啟」，重啟次數的節流則由 `StartLimitIntervalSec` /
+`StartLimitBurst` 負責。因此**退出路徑上的任何失敗都不能改變離開碼**，
+否則 systemd 會做出相反的重啟決定（見 `_record_exit_reason`）。
 """
 
 import os
@@ -80,6 +81,26 @@ class FailureTracker:
             )
             self.logger.error(message)
             self.notifier.send(message)
+
+
+def _record_exit_reason(logger, repository, reason: str) -> None:
+    """退出前把原因寫進 `bot_state`，寫不進去就只記日誌。
+
+    三條退出路徑都是「先落帳、再通知、最後回傳離開碼」。問題在於**資料庫本身故障**
+    （磁碟滿、DB 損毀、volume 掛載掉了）正是這個部署真實會發生的狀況之一
+    ——M3 起部署一路失敗的根因就是主機端目錄不存在——而那時候 `save_state()`
+    自己就會拋例外，後果是三層的：原始錯誤訊息遺失、後面的 `notifier.send()`
+    不會執行、離開碼從刻意設計的 `EXIT_FATAL` 變成 `EXIT_UNEXPECTED`。
+    `FatalError` 那條路徑更糟：新例外會被外層的 `except Exception` 接住，
+    直接被誤判成「未預期的例外」。
+
+    落帳是輔助手段，不該反過來決定機器人怎麼退出，更不該蓋掉真正的死因
+    ——而那正是最需要看到它的時候（見 TASKS.md A3）。
+    """
+    try:
+        repository.save_state(last_action=reason)
+    except Exception as exc:  # noqa: BLE001 - 落帳失敗不能影響離開碼與通知
+        logger.error(f"退出前落帳失敗，原始原因仍為「{reason}」，落帳錯誤：{exc}")
 
 
 def run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds: int = 3) -> None:
@@ -157,7 +178,7 @@ def main() -> int:
             logger.error("啟動檢查失敗")
             # 落帳再退出：容器收掉之後日誌也可能一起看不到（見 D016），
             # DB 是唯一一定留得下來的地方，健康檢查與事後追查都靠它。
-            repository.save_state(last_action="啟動檢查失敗，機器人未進入主迴圈")
+            _record_exit_reason(logger, repository, "啟動檢查失敗，機器人未進入主迴圈")
             notifier.send("Bitfinex 放貸機器人啟動檢查失敗，已停止運作。")
             return EXIT_FATAL
 
@@ -174,7 +195,7 @@ def main() -> int:
                 failures.record_failure(str(exc))
             except FatalError as exc:
                 logger.error(f"致命錯誤，機器人即將停止：{exc}")
-                repository.save_state(last_action=f"致命錯誤已停止：{exc}")
+                _record_exit_reason(logger, repository, f"致命錯誤已停止：{exc}")
                 notifier.send(f"Bitfinex 放貸機器人發生致命錯誤，已停止運作：{exc}")
                 return EXIT_FATAL
             else:
@@ -189,11 +210,17 @@ def main() -> int:
         # 在這個部署環境裡拿不到（見 D016），等於崩潰現場完全消失。
         # 這裡改寫進日誌檔與 DB，兩者都掛載在主機上。
         logger.exception(f"未預期的例外，機器人即將停止：{exc}")
-        repository.save_state(last_action=f"未預期的例外已停止：{exc}")
+        _record_exit_reason(logger, repository, f"未預期的例外已停止：{exc}")
         notifier.send(f"Bitfinex 放貸機器人發生未預期的例外，已停止運作：{exc}")
         return EXIT_UNEXPECTED
     finally:
-        repository.close()
+        # 同 `_record_exit_reason` 的理由：DB 故障時 close() 也可能拋例外，
+        # 而 finally 拋出的例外會取代原本的回傳值，離開碼直接變成 1 並印出
+        # 一份跟真正死因無關的 traceback。收尾動作不該有這種話語權。
+        try:
+            repository.close()
+        except Exception as exc:  # noqa: BLE001 - 收尾失敗只留痕，不影響離開碼
+            logger.error(f"關閉資料庫連線失敗：{exc}")
 
 
 if __name__ == "__main__":

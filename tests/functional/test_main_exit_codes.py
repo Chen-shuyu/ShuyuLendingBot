@@ -8,6 +8,8 @@
 這裡把 `main()` 的外部依賴全部換成替身，只保留主迴圈本身的控制流程。
 """
 
+import sqlite3
+
 import pytest
 
 import main
@@ -151,3 +153,63 @@ class TestExitCodes:
 
         run()
         assert read_state()["last_run_at"] is not None
+
+
+class TestExitPathSurvivesBrokenDatabase:
+    """資料庫故障時，退出路徑上的落帳不能反過來蓋掉真正的死因（TASKS.md A3）。
+
+    「volume 掛載掉了」正是這個部署真實發生過的狀況（M3 起部署失敗的根因就是
+    主機端目錄不存在），而那時候最需要的就是看到原始錯誤、收到通知、
+    以及讓 systemd 拿到正確的離開碼——`RestartPreventExitStatus=2` 靠的就是它。
+    """
+
+    @pytest.fixture(autouse=True)
+    def break_save_state(self, run_main, monkeypatch):
+        """讓 `save_state()` 一定拋例外，模擬 DB 故障。"""
+        run, _ = run_main
+        self.run = run
+
+        def explode(*args, **kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        # main() 拿到的 repository 就是 fixture 建的那一個
+        monkeypatch.setattr(Repository, "save_state", explode)
+
+    def test_startup_failure_still_returns_fatal(self, fake_notifier, fake_logger):
+        StubClient.connect_result = False
+
+        assert self.run() == main.EXIT_FATAL
+        assert any("啟動檢查失敗" in message for message in fake_notifier.sent)
+        assert any("退出前落帳失敗" in message for message in fake_logger.messages["error"])
+
+    def test_fatal_error_still_returns_fatal_and_keeps_original_reason(
+        self, fake_notifier, fake_logger
+    ):
+        # 最容易出錯的一條：落帳拋出的新例外若沒攔住，會被外層的
+        # `except Exception` 接住，EXIT_FATAL 直接變成 EXIT_UNEXPECTED
+        StubClient.cycle_effect = FatalError("API 金鑰無效")
+
+        assert self.run() == main.EXIT_FATAL
+        assert any("API 金鑰無效" in message for message in fake_notifier.sent)
+        # 原始死因必須留在日誌裡，不能被落帳的錯誤取代
+        assert any(
+            "致命錯誤已停止" in message and "API 金鑰無效" in message
+            for message in fake_logger.messages["error"]
+        )
+
+    def test_unexpected_exception_still_returns_unexpected(self, fake_notifier):
+        StubClient.cycle_effect = ValueError("沒人想過的狀況")
+
+        assert self.run() == main.EXIT_UNEXPECTED
+        assert any("沒人想過的狀況" in message for message in fake_notifier.sent)
+
+    def test_close_failure_does_not_change_exit_code(self, monkeypatch, fake_logger):
+        # finally 裡拋出的例外會取代回傳值，離開碼會變成 1 並印出無關的 traceback
+        def explode(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(Repository, "close", explode)
+        StubClient.connect_result = False
+
+        assert self.run() == main.EXIT_FATAL
+        assert any("關閉資料庫連線失敗" in message for message in fake_logger.messages["error"])

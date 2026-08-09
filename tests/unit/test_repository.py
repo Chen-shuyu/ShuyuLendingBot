@@ -12,10 +12,12 @@ import pytest
 from db import models
 from db.repository import (
     DEFAULT_DB_PATH,
+    PROJECT_ROOT,
     STATUS_DRY_RUN,
     STATUS_FAILED,
     STATUS_SUBMITTED,
     Repository,
+    resolve_db_path,
     utc_now,
 )
 from modules.lending_strategy import OfferPlan
@@ -81,10 +83,63 @@ class TestInitialisation:
 
     @pytest.mark.parametrize("config", [None, {}, {"database": None}, {"database": {}}])
     def test_from_config_falls_back_to_default_path(self, config, tmp_path, monkeypatch):
+        # 只驗路徑怎麼算，不真的建立 Repository——建立會 mkdir + 開檔，
+        # 而預設路徑指向真正的專案目錄，測試不該在那裡留下 DB 檔。
+        monkeypatch.delenv("BFX_DB_PATH", raising=False)
         monkeypatch.chdir(tmp_path)
-        repo = Repository.from_config(config)
-        assert str(repo.db_path) == DEFAULT_DB_PATH
-        repo.close()
+        database_config = (config or {}).get("database") or {}
+        assert resolve_db_path(database_config.get("path")) == PROJECT_ROOT / DEFAULT_DB_PATH
+
+
+class TestPathResolution:
+    """相對路徑一律相對於專案根目錄，而不是誰在哪裡下的指令（TASKS.md A4）。
+
+    這組測試釘的是「主程式與 `scripts/healthcheck.py` 算出同一個檔案位置」。
+    兩邊不一致時的症狀非常難聯想：健康檢查永遠回報「尚未寫入任何心跳」，
+    但機器人其實跑得好好的，只是把 DB 建在別的地方。
+    """
+
+    def test_relative_path_is_resolved_against_project_root(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("BFX_DB_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert resolve_db_path("data/lending.sqlite3") == PROJECT_ROOT / "data" / "lending.sqlite3"
+
+    def test_cwd_does_not_change_the_result(self, tmp_path, monkeypatch):
+        # 這是修正前的實際行為：從別的目錄啟動，DB 就會建在別的地方
+        monkeypatch.delenv("BFX_DB_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        from_elsewhere = resolve_db_path("data/lending.sqlite3")
+        monkeypatch.chdir(PROJECT_ROOT)
+        from_project = resolve_db_path("data/lending.sqlite3")
+        assert from_elsewhere == from_project
+
+    def test_absolute_path_is_left_alone(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("BFX_DB_PATH", raising=False)
+        absolute = tmp_path / "custom.sqlite3"
+        assert resolve_db_path(str(absolute)) == absolute
+
+    def test_env_var_wins_over_config(self, tmp_path, monkeypatch):
+        # 與 healthcheck 的優先權一致；不一致的話設了環境變數就會兩邊分家
+        override = tmp_path / "override.sqlite3"
+        monkeypatch.setenv("BFX_DB_PATH", str(override))
+        assert resolve_db_path("data/lending.sqlite3") == override
+
+    def test_agrees_with_healthcheck_resolver(self, tmp_path, monkeypatch):
+        """同一份設定，主程式與健康檢查必須算出同一個路徑。"""
+        from scripts import healthcheck
+
+        monkeypatch.delenv("BFX_DB_PATH", raising=False)
+        monkeypatch.delenv("BFX_CONFIG", raising=False)
+        monkeypatch.chdir(tmp_path)  # 從別的目錄啟動也要一致
+
+        assert resolve_db_path("data/lending.sqlite3") == healthcheck.resolve_db_path(PROJECT_ROOT)
+
+    def test_agrees_with_healthcheck_on_env_override(self, tmp_path, monkeypatch):
+        override = tmp_path / "override.sqlite3"
+        monkeypatch.setenv("BFX_DB_PATH", str(override))
+        from scripts import healthcheck
+
+        assert resolve_db_path("data/lending.sqlite3") == healthcheck.resolve_db_path(PROJECT_ROOT)
 
 
 class TestRecordOffer:

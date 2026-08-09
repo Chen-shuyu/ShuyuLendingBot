@@ -5,15 +5,12 @@
 
 ## 進行中
 
-**分支 `fix/m4-ci-lifecycle-assertion`（2026-08-09 開，從 main `ada4fb4`）**：
-先處理 CI 紅燈。PR #13 合併後 deploy job 在「驗證容器生命週期真的由 systemd 接管」
-這一步失敗，查出的根因是**斷言本身寫錯**（B3，見下方），順帶把同一個步驟的
-**B1** 一起改完。兩項都已完成並以對照實驗驗收，見 DECISIONS.md D018。
+**分支 `fix/m4-code-audit-findings`（2026-08-09 開，從 main `27e0e69`）**：
+程式碼層三項 **A3、A4、A5 全部完成**，見 DECISIONS.md D019。測試 255 → 265 項。
 
-原本規劃在 `fix/m4-audit-findings` 一次處理的五項（A3～A5＋B1、B2），
-B1 已隨這條分支完成；**剩下 A3、A4、A5、B2 移到下一條分支**，
-完整說明仍在下方「🟡 延後處理」段落，動手前不需要重新盤查。
-（`fix/m4-audit-findings` 只含文件同步，已由 PR #13 合併進 main。）
+兩輪盤查累積的六項缺陷，到這裡只剩 **B2**（systemd 放棄重啟時無人收到通知）——
+它與 A6 互相牽動、且完整做法要等 LINE 憑證，刻意留到下一條分支處理。
+已完成的：B1、B3（PR #14，CI 斷言）、A3、A4、A5（本分支）。
 
 ## 🔴 下一步・最高優先
 
@@ -95,7 +92,7 @@ B1 已隨這條分支完成；**剩下 A3、A4、A5、B2 移到下一條分支**
     之後再開。開的時候走 systemd 那條路，不要回頭加 `--health-on-failure=restart`
     （會變成兩套重啟機制並存）。
 
-### 🟡 延後處理：A3～A5 + B2（B1、B3 已於 2026-08-09 完成）
+### 🟡 延後處理：只剩 B2（A3～A5、B1、B3 已於 2026-08-09 完成）
 
 > **這五項都不緊急、也不擋小額實單**，所以刻意集中到一條分支一次處理。
 > 動手前不需要重新盤查——下面記的位置、成因與修法可直接照做。
@@ -106,7 +103,12 @@ B1 已隨這條分支完成；**剩下 A3、A4、A5、B2 移到下一條分支**
 >   B1 是這次自己加的 CI 檢查抓不到它想抓的東西；B2 是既有行為的缺口，
 >   實單前值得補。兩項的完整背景見下方，也可參照 DECISIONS.md D017 的補充段。
 
-- [ ] **A3：`main.py` 的錯誤處理路徑中，落帳失敗會把原始錯誤蓋掉**
+- [x] **A3：`main.py` 的錯誤處理路徑中，落帳失敗會把原始錯誤蓋掉**
+      —— **已於 2026-08-09 完成**（分支 `fix/m4-code-audit-findings`）：抽出
+      `_record_exit_reason()` 供三處共用，落帳失敗只記日誌。順帶把 `finally` 的
+      `repository.close()` 也包起來——它拋例外同樣會取代回傳值，離開碼直接變成 1。
+      補 4 條測試（`TestExitPathSurvivesBrokenDatabase`），並實際還原 `main.py`
+      反證過這 4 條在沒有修正時全部失敗。以下為原始診斷紀錄，保留備查。
   - **位置**：`main.py` 三處 —— 啟動檢查失敗（約 160 行）、`FatalError`（約 177 行）、
     未預期例外（約 192 行），都是先 `repository.save_state(...)` 再 `notifier.send(...)`。
   - **問題**：如果**資料庫本身故障**（磁碟滿、DB 損毀、volume 掛載掉了），`save_state()`
@@ -120,7 +122,14 @@ B1 已隨這條分支完成；**剩下 A3、A4、A5、B2 移到下一條分支**
     可抽成一個小的 `_record_exit_reason(logger, repository, reason)` 私有函式，三處共用。
     測試補一條：`save_state` 被設定成一定拋例外時，離開碼仍為 `EXIT_FATAL` 且通知照送。
 
-- [ ] **A4：資料庫路徑的解析方式，主程式與健康檢查兩邊不一致**
+- [x] **A4：資料庫路徑的解析方式，主程式與健康檢查兩邊不一致**
+      —— **已於 2026-08-09 完成**（分支 `fix/m4-code-audit-findings`）：`db/repository.py`
+      新增 `PROJECT_ROOT` 與 `resolve_db_path()`，相對路徑一律相對專案根目錄，
+      並比照 healthcheck 讓 `BFX_DB_PATH` 有最高優先權（原本只有 healthcheck 認得它，
+      設了就會兩邊分家，是同一個缺陷的另一面）。補 6 條測試，其中兩條直接斷言
+      「主程式與 healthcheck 對同一份設定算出同一個路徑」。
+      兩支檔案刻意不互相 import——healthcheck 要維持零專案相依、零副作用，
+      改任一邊都要一起改，兩邊的 docstring 都寫了這件事。以下為原始診斷紀錄，保留備查。
   - **位置**：`db/repository.py` 的 `Repository.from_config()` 對相對路徑是相對
     **當下工作目錄（cwd）**；`scripts/healthcheck.py` 的 `resolve_db_path()` 是相對
     **程式所在目錄（`scripts/` 的上一層）**。
@@ -133,7 +142,10 @@ B1 已隨這條分支完成；**剩下 A3、A4、A5、B2 移到下一條分支**
     或反過來讓兩邊共用同一個解析函式。前者較好，因為「設定檔寫的相對路徑相對於專案」
     比「相對於誰啟動它」更符合直覺。改完補一條測試釘住行為。
 
-- [ ] **A5：`config.yaml` 沒有列出 `engine.health_max_silence_seconds`**
+- [x] **A5：`config.yaml` 沒有列出 `engine.health_max_silence_seconds`**
+      —— **已於 2026-08-09 完成**（分支 `fix/m4-code-audit-findings`）：在 `engine:`
+      區段補上註解掉的設定與說明（不設就是 `interval_seconds × 3 + 60`）。
+      以下為原始診斷紀錄，保留備查。
   - **問題**：這個可以覆寫健康檢查門檻的設定只有程式碼與 DECISIONS.md D016 知道，
     設定檔裡完全看不到，等於藏起來的選項。
   - **建議修法**：在 `config.yaml` 的 `engine:` 區段補上一行（註解掉或給預設值皆可），

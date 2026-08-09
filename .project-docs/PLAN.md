@@ -95,15 +95,17 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       這道檢查自 2026-08-02 加入起就不可能通過，deploy job 一路是紅的。
       同一步驟順帶完成 **B1**（conmon 判斷改為比對 cgroup 歸屬）。
       以對照實驗驗收：正式容器通過、直接 `podman run` 的假容器紅燈
-- [ ] **剩下的 A3～A5 與 B2**（下一條分支）：退出路徑落帳失敗會蓋掉原始錯誤、
-      DB 相對路徑解析主程式與 healthcheck 兩邊不一致、`config.yaml` 缺
-      `engine.health_max_silence_seconds`、systemd 放棄重啟時無人收到通知
-      （實單前必補，與 A6 一起設計）。細節見 TASKS.md 的「🟡 延後處理」段落
+- [x] **`fix/m4-code-audit-findings`（2026-08-09）**：程式碼層三項 A3～A5 全部完成，
+      見 DECISIONS.md D019。退出路徑的落帳不再蓋掉原始錯誤與離開碼、DB 相對路徑
+      改以專案根目錄解析（與 healthcheck 一致）、`config.yaml` 補上健康檢查門檻設定。
+      測試 255 → 265 項，三項都在故障情境下實跑驗證過
+- [ ] **B2**（下一條分支）：systemd 放棄重啟時無人收到通知，實單前必補，
+      與 A6「不健康就自動重啟」一起設計。細節見 TASKS.md 的「🟡 延後處理」段落
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 
 M4 目前的狀態：測試與部署兩條都已完成，**可靠性目標這次是真的達成了**（有對照實驗與
 正式容器實測佐證），CI 的迴歸防線也已從「看起來有」變成「真的擋得住」（D018）。
 小額實單剩下的前置條件是使用者補上 `secrets.env`。
-未完的是 `refactor/m4-layering` 分層搬遷、延後的程式碼層三項（A3～A5）與維運層的 B2，
-以及被憑證卡住的 LINE 通知。
+未完的是 `refactor/m4-layering` 分層搬遷、維運層的 B2（與 A6 一起設計），
+以及被憑證卡住的 LINE 通知。兩輪盤查累積的六項缺陷已清掉五項。

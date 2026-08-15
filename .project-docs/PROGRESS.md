@@ -558,3 +558,36 @@
   與兩條告警管道的分工（D020）。測試數字 236 → 283。
   另修正 TASKS.md 裡 `refactor/m4-layering` 的指示：重跑的項數已過時，
   並註明兩支維運腳本刻意不參與分層搬遷
+
+## 2026-08-15 —— M4 分層搬遷（分支 `refactor/m4-layering`）
+
+- 先確認 PR #16 已合併（`d00cb9d`、`27eb60f` 都在 main 內），main 前進到 `b844d49`，
+  從最新的 main 開分支
+- 搬遷前先跑一次基準測試：283 項全過（277 + 6 項 live），確認起點是綠的
+- 用 `git mv` 搬四個檔案，保留檔案歷史：
+  `modules/exchange_client.py` → `api/bitfinex_client.py`、
+  `modules/lending_strategy.py` → `strategies/frr_plus.py`、
+  `modules/line_notifier.py` → `notify/line_messaging.py`，`modules/` 整個移除
+- 新增三個檔案：`api/base.py`（`ExchangeClient` 介面）、`strategies/base.py`
+  （`Strategy` 介面 + `OfferPlan`）、`core/bot_engine.py`（`BotEngine` 與 `FailureTracker`）
+- `main.py` 從 227 行縮到 60 行，只剩 bootstrap；主迴圈、`run_once()`、
+  `_record_exit_reason()`、離開碼常數全部移進 `BotEngine`。**離開碼常數雖然改在
+  `core/bot_engine.py` 定義，`main.py` 匯入後仍以同名存取**——systemd 的
+  `RestartPreventExitStatus=2` 認的是實際回傳值，這條路徑不能有任何鬆動
+- 類別更名 `LendingStrategy` → `FrrPlusStrategy`（見 DECISIONS.md D021）
+- `notify/line_messaging.py` **只搬位置、不改內容**，仍打已停用的 LINE Notify 端點；
+  模組 docstring 明寫這個落差，免得檔名誤導人以為 Messaging API 已經接上
+- 測試同步：import 路徑全改，兩個測試檔跟著模組更名
+  （`test_exchange_client.py` → `test_bitfinex_client.py`、
+  `test_lending_strategy.py` → `test_frr_plus.py`）。
+  `tests/functional/test_run_once.py` 加一個薄的 `run_once()` 測試輔助函式包住
+  `BotEngine` 的建構，其餘測試本體一行沒動——**這樣測試本身就是「行為沒變」的證據**
+- `monkeypatch` 的目標從 `main.time.sleep` 改成 `bot_engine.time.sleep`（sleep 跟著迴圈走）
+- CI 的 `py_compile` 清單改成新路徑，順便補進原本漏掉的 `scripts/notify_failure.py`
+  與兩個 base 檔
+- 驗證：283 項測試全過（含 6 項實際連 Bitfinex 的 live 測試）、`py_compile` 全過、
+  另外用暫存 DB／log 實跑 `python main.py` 一輪，確認 bootstrap 接線正確
+  （啟動檢查 → 進入主迴圈 → 取消 → 查餘額 FRR → 掛兩筆 dry-run 單 → 進入睡眠）
+- 下一步：M4 只剩 `feature/m4-line-messaging`，仍卡在使用者尚未申請 LINE Channel 憑證；
+  小額實單的前置條件仍是使用者補上 `secrets.env`
+

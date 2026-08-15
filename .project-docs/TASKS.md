@@ -5,11 +5,14 @@
 
 ## 進行中
 
-**分支 `deploy/m4-failure-alert`（2026-08-09 開，從 main `60b80bf`）**：
-**B2 與 A6 都已完成**，見 DECISIONS.md D020。測試 265 → 283 項。
+**分支 `refactor/m4-layering`（2026-08-15 開，從 main `b844d49`）**：
+分層搬遷已完成，見 DECISIONS.md D021。行為零變動，283 項測試維持全過。
 
-**兩輪盤查累積的六項缺陷至此全部清完**（A1～A6、B1～B3）。
-M4 只剩 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE 通知。
+**M4 只剩 `feature/m4-line-messaging`**——被「使用者尚未申請 LINE Channel 憑證」卡住，
+沒有其他技術阻塞。小額實單的前置條件仍是使用者補上 `secrets.env`。
+
+（前一段：`deploy/m4-failure-alert`，2026-08-09，B2 與 A6 完成，見 D020，
+測試 265 → 283 項；兩輪盤查累積的六項缺陷 A1～A6、B1～B3 至此全部清完。）
 
 ## 🔴 下一步・最高優先
 
@@ -297,13 +300,14 @@ M4 只剩 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE �
       建議與小額實單測試一起做（2026-07-27 決定延後，見 DECISIONS.md D013）
 
 ### M4：架構重構、測試與部署（依 DECISIONS.md D015 拆成子分支）
-- [ ] **子分支 `refactor/m4-layering`**：依 ARCHITECTURE.md 完成目錄搬遷：
-      `modules/exchange_client.py` → `api/bitfinex_client.py`（+ 新增 `api/base.py`）、
-      `modules/lending_strategy.py` → `strategies/frr_plus.py`（+ 新增 `strategies/base.py`）、
-      新增 `core/bot_engine.py`、`modules/line_notifier.py` → `notify/line_messaging.py`。
-      搬遷時 `tests/` 的 import 路徑要同步改，改完重跑全部測試（目前 283 項）即可確認沒搬壞。
-      注意 `scripts/healthcheck.py` 與 `scripts/notify_failure.py` **不要搬**——
-      它們刻意維持零專案相依（見 ARCHITECTURE.md「維運元件與主程式刻意分離」）
+- [x] **子分支 `refactor/m4-layering`**（2026-08-15）：依 ARCHITECTURE.md 完成目錄搬遷，
+      `modules/` 已移除。四個檔案以 `git mv` 搬到 `api/`／`strategies/`／`notify/`，
+      新增 `api/base.py`、`strategies/base.py`、`core/bot_engine.py`，
+      `main.py` 縮為純 bootstrap（227 → 60 行）。類別更名 `LendingStrategy` →
+      `FrrPlusStrategy`，見 DECISIONS.md D021。`scripts/` 兩支維運腳本依原訂不搬。
+      283 項測試全過（含 live）、`py_compile` 全過、dry-run 實跑 `main.py` 驗過一輪。
+      **`notify/line_messaging.py` 只搬了位置，內容仍是已停用的 LINE Notify**，
+      改寫仍屬 `feature/m4-line-messaging`
 - [x] 建立 `tests/unit`、`tests/functional`、`tests/integration` 目錄與測試，共 227 項
       （2026-08-01，分支 `test/m4-test-suite`）。一併補掉三個 CI 缺口：拿掉
       `pytest ... || true`（測試失敗必須擋下合併）、新增 `requirements-dev.txt`
@@ -361,7 +365,8 @@ M4 只剩 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE �
         檔案本身的去留仍待確認。注意勿與新增的
         `systemd/shuyu-lending-bot.container` 混淆——後者才是正式部署路線
 - [ ] 小額真金測試前，再次確認 API Key 權限已禁止「提現（Withdraw）」
-- [ ] **子分支 `feature/m4-line-messaging`**：通知模組改寫為 `notify/line_messaging.py`，走 LINE Messaging API push
+- [ ] **子分支 `feature/m4-line-messaging`**：改寫 `notify/line_messaging.py` 的內容，走 LINE Messaging API
+      （檔案位置已於 2026-08-15 的分層搬遷就位，只差內容） push
       （取代已停用的 LINE Notify）—— 原列在 M1，2026-07-26 使用者指示改排到最後一步；
       **被下方使用者端待辦卡住，尚無法實測**。一併注意 `config/settings.py` 讀的環境變數
       名還是舊的 `LINE_NOTIFY_TOKEN`／`LINE_NOTIFY_CHANNEL`，要同步改成

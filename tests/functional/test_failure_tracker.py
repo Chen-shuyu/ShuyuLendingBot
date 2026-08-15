@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`main.FailureTracker` 的功能測試：連續失敗告警的去重與恢復通知。
+"""`core.bot_engine.FailureTracker` 的功能測試：連續失敗告警的去重與恢復通知。
 
 交易所長時間異常時每輪都送告警會把通知管道洗版，反而讓人忽略；因此規則是
 「剛跨過門檻」與「剛恢復」各送一次（DECISIONS.md D013）。失敗次數同時要寫進
@@ -8,7 +8,7 @@ DB，未來的容器 healthcheck 才能不啟動 Python 就判斷健康狀態。
 
 import pytest
 
-from main import FailureTracker
+from core.bot_engine import FailureTracker
 
 
 @pytest.fixture

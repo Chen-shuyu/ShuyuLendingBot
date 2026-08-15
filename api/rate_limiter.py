@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """交易所 API 呼叫的重試機制（指數退避）。
 
-`modules/exchange_client.py` 的每個方法已經把 ccxt 的原始例外分類成
+`api/bitfinex_client.py` 的每個方法已經把 ccxt 的原始例外分類成
 `RetryableError` / `FatalError`，所以這裡只要攔 `RetryableError` 重試即可，
 不需要再認得 ccxt 的例外型別；`FatalError`（金鑰無效、權限不足）重試沒有意義，
 一律直接往外拋。

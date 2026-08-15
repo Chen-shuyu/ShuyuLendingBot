@@ -11,12 +11,13 @@ from pathlib import Path
 
 import pytest
 
-import main
+from api.bitfinex_client import BitfinexClient
 from config.settings import load_config
+from core import bot_engine
+from core.bot_engine import BotEngine
 from db.repository import Repository
-from modules.exchange_client import BitfinexClient
-from modules.lending_strategy import LendingStrategy
-from modules.line_notifier import LineNotifier
+from notify.line_messaging import LineNotifier
+from strategies.frr_plus import FrrPlusStrategy
 from utils.logger import BotLogger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -31,15 +32,20 @@ def config():
 @pytest.fixture
 def bot(config, tmp_path, monkeypatch):
     """用真實元件組出一台 dry-run 機器人，只把 DB 與 log 導到暫存目錄。"""
-    monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(bot_engine.time, "sleep", lambda seconds: None)
 
     logger = BotLogger(config.get("logging", {}), str(tmp_path / "logs" / "bot.log"))
-    notifier = LineNotifier(config.get("line", {}))
-    strategy = LendingStrategy(config)
-    client = BitfinexClient(config, logger, dry_run=True)
     repository = Repository(str(tmp_path / "data" / "lending.sqlite3"))
+    engine = BotEngine(
+        logger,
+        LineNotifier(config.get("line", {})),
+        FrrPlusStrategy(config),
+        BitfinexClient(config, logger, dry_run=True),
+        repository,
+        cancel_settle_seconds=0,
+    )
 
-    yield logger, notifier, strategy, client, repository
+    yield engine
     repository.close()
 
 
@@ -62,12 +68,12 @@ class TestProjectConfig:
 
 class TestDryRunCycle:
     def test_connection_check_passes(self, bot):
-        _, _, _, client, _ = bot
+        client = bot.client
         assert client.test_connection() is True
 
     def test_single_cycle_records_offers_and_heartbeat(self, bot):
-        logger, notifier, strategy, client, repository = bot
-        main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+        repository = bot.repository
+        bot.run_once()
 
         rows = [dict(row) for row in repository.connection.execute("SELECT * FROM loan_offers")]
         assert rows, "dry-run 巡檢後應該要有掛單紀錄"
@@ -79,23 +85,23 @@ class TestDryRunCycle:
 
     def test_offer_amounts_match_configured_balance(self, bot, config):
         """dry-run 餘額由設定檔給定，掛出的總額不得超過它。"""
-        logger, notifier, strategy, client, repository = bot
-        main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+        repository = bot.repository
+        bot.run_once()
 
         total = repository.connection.execute("SELECT SUM(amount) FROM loan_offers").fetchone()[0]
         assert total <= config["bitfinex"]["dry_run_balance_usd"]
 
     def test_multiple_cycles_accumulate(self, bot):
-        logger, notifier, strategy, client, repository = bot
+        repository = bot.repository
         for _ in range(5):
-            main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+            bot.run_once()
 
         count = repository.connection.execute("SELECT COUNT(*) FROM loan_offers").fetchone()[0]
         assert count >= 5
 
     def test_writes_to_the_log_file(self, bot, tmp_path):
-        logger, notifier, strategy, client, repository = bot
-        main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+        repository = bot.repository
+        bot.run_once()
 
         content = (tmp_path / "logs" / "bot.log").read_text(encoding="utf-8")
         assert "目前 FRR" in content
@@ -105,8 +111,8 @@ class TestDryRunCycle:
 
     def test_state_survives_reopen(self, bot, tmp_path):
         """容器重啟後要讀得回上次心跳，這是 healthcheck 的資料來源。"""
-        logger, notifier, strategy, client, repository = bot
-        main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+        repository = bot.repository
+        bot.run_once()
         last_run_at = repository.get_state()["last_run_at"]
 
         reopened = Repository(str(tmp_path / "data" / "lending.sqlite3"))
@@ -118,12 +124,12 @@ class TestDryRunSafety:
     """dry-run 的唯一意義就是「絕對不動到真實資金」，這裡把它釘死。"""
 
     def test_no_exchange_object_is_created(self, bot):
-        _, _, _, client, _ = bot
+        client = bot.client
         assert client.exchange is None
 
     def test_offers_are_marked_dry_run(self, bot):
-        logger, notifier, strategy, client, repository = bot
-        main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+        repository = bot.repository
+        bot.run_once()
 
         statuses = {
             row[0] for row in repository.connection.execute("SELECT DISTINCT status FROM loan_offers")
@@ -131,8 +137,8 @@ class TestDryRunSafety:
         assert statuses == {"dry_run"}
 
     def test_no_exchange_offer_ids_recorded(self, bot):
-        logger, notifier, strategy, client, repository = bot
-        main.run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=0)
+        repository = bot.repository
+        bot.run_once()
 
         ids = [row[0] for row in repository.connection.execute("SELECT offer_id FROM loan_offers")]
         assert all(offer_id is None for offer_id in ids)

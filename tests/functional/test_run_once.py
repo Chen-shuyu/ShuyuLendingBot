@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`main.run_once()` 的功能測試：一整輪巡檢的流程與落帳。
+"""`BotEngine.run_once()` 的功能測試：一整輪巡檢的流程與落帳。
 
 用真的策略層與真的 SQLite，只把交易所換成替身——要驗證的是「各步驟有沒有
 照順序發生、資料有沒有正確落地」，而不是單一函式的計算結果。
@@ -7,9 +7,22 @@
 
 import pytest
 
-import main
-from modules.lending_strategy import LendingStrategy
+from core import bot_engine
+from core.bot_engine import BotEngine
+from strategies.frr_plus import FrrPlusStrategy
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
+
+
+def run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=3):
+    """組一台引擎跑單輪，讓下面的測試專注在流程與落帳本身。"""
+    BotEngine(
+        logger,
+        notifier,
+        strategy,
+        client,
+        repository,
+        cancel_settle_seconds=cancel_settle_seconds,
+    ).run_once()
 
 
 class FakeClient:
@@ -54,7 +67,7 @@ class FakeClient:
 
 @pytest.fixture
 def strategy():
-    return LendingStrategy(
+    return FrrPlusStrategy(
         {
             "strategy": {
                 "min_required_usd": 150,
@@ -75,7 +88,7 @@ def strategy():
 def no_sleep(monkeypatch):
     """攔下等待餘額釋放的 sleep，記錄秒數。"""
     calls = []
-    monkeypatch.setattr(main.time, "sleep", lambda seconds: calls.append(seconds))
+    monkeypatch.setattr(bot_engine.time, "sleep", lambda seconds: calls.append(seconds))
     return calls
 
 
@@ -86,14 +99,14 @@ def offers_in_db(repository):
 class TestHappyPath:
     def test_places_every_planned_offer(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         client = FakeClient(balance=600.0, frr=0.0002)
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert len(client.offers) == 3
         assert [amount for _, amount, _, _ in client.offers] == [200.0, 200.0, 200.0]
 
     def test_records_every_offer_in_db(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         client = FakeClient(balance=600.0, frr=0.0002)
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         rows = offers_in_db(repository)
         assert len(rows) == 3
@@ -102,7 +115,7 @@ class TestHappyPath:
 
     def test_writes_state_with_frr_and_summary(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         client = FakeClient(balance=600.0, frr=0.0002)
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         state = repository.get_state()
         assert state["last_frr"] == pytest.approx(0.0002)
@@ -111,11 +124,11 @@ class TestHappyPath:
         assert "600.0 USD" in state["last_action"]
 
     def test_sends_notification(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
-        main.run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)
+        run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)
         assert len(fake_notifier.sent) == 1
 
     def test_logs_balance_and_frr(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
-        main.run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)
+        run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)
         joined = "\n".join(fake_logger.messages["info"])
         assert "可用 USD 餘額" in joined
         assert "目前 FRR" in joined
@@ -126,21 +139,21 @@ class TestCancelBeforeReoffer:
 
     def test_always_cancels_first(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         client = FakeClient()
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
         assert client.cancel_calls == 1
 
     def test_waits_for_settlement_when_something_was_cancelled(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
     ):
         client = FakeClient(cancelled=[{"id": 1}])
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository, cancel_settle_seconds=5)
+        run_once(fake_logger, fake_notifier, strategy, client, repository, cancel_settle_seconds=5)
         assert no_sleep == [5]
 
     def test_no_wait_when_nothing_was_cancelled(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
     ):
         """沒有舊掛單就不必空等，否則每輪都白白多花幾秒。"""
-        main.run_once(fake_logger, fake_notifier, strategy, FakeClient(cancelled=[]), repository)
+        run_once(fake_logger, fake_notifier, strategy, FakeClient(cancelled=[]), repository)
         assert no_sleep == []
 
 
@@ -153,7 +166,7 @@ class TestSkipPaths:
     ):
         client = FakeClient(frr=frr)
         with pytest.raises(SkipCycleError, match="FRR 無效"):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert client.offers == []
         state = repository.get_state()
@@ -165,7 +178,7 @@ class TestSkipPaths:
     ):
         client = FakeClient(balance=100.0, frr=0.0002)
         with pytest.raises(SkipCycleError, match="低於最低門檻"):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert client.offers == []
         state = repository.get_state()
@@ -176,12 +189,12 @@ class TestSkipPaths:
     def test_skip_writes_no_offers(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         client = FakeClient(balance=100.0)
         with pytest.raises(SkipCycleError):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
         assert offers_in_db(repository) == []
 
     def test_skip_sends_no_notification(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         with pytest.raises(SkipCycleError):
-            main.run_once(fake_logger, fake_notifier, strategy, FakeClient(frr=None), repository)
+            run_once(fake_logger, fake_notifier, strategy, FakeClient(frr=None), repository)
         assert fake_notifier.sent == []
 
 
@@ -194,7 +207,7 @@ class TestOfferFailure:
     ):
         client = FakeClient(balance=600.0, offer_effects=[None, error])
         with pytest.raises(type(error)):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         rows = offers_in_db(repository)
         assert [row["status"] for row in rows] == ["submitted", "failed"]
@@ -206,7 +219,7 @@ class TestOfferFailure:
     ):
         client = FakeClient(balance=600.0, offer_effects=[None, RetryableError("逾時")])
         with pytest.raises(RetryableError):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
         assert len(client.offers) == 2  # 第三筆不再嘗試
 
     def test_failed_round_does_not_write_success_state(
@@ -214,7 +227,7 @@ class TestOfferFailure:
     ):
         client = FakeClient(balance=600.0, offer_effects=[RetryableError("逾時")])
         with pytest.raises(RetryableError):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         state = repository.get_state()
         assert state["last_action"] is None
@@ -225,7 +238,7 @@ class TestOfferFailure:
     ):
         client = FakeClient(offer_effects=[RetryableError("逾時")])
         with pytest.raises(RetryableError):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
         assert fake_notifier.sent == []
 
     def test_first_offer_failure_records_only_one_row(
@@ -233,7 +246,7 @@ class TestOfferFailure:
     ):
         client = FakeClient(offer_effects=[FatalError("拒單")])
         with pytest.raises(FatalError):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
         assert len(offers_in_db(repository)) == 1
 
 
@@ -251,7 +264,7 @@ class TestExchangeReportedValues:
                 None,
             ],
         )
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         first = offers_in_db(repository)[0]
         assert (first["amount"], first["rate"], first["duration"]) == (150.0, 0.00051, 30)
@@ -263,16 +276,16 @@ class TestConsecutiveRounds:
     ):
         client = FakeClient(balance=600.0)
         for _ in range(3):
-            main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
         assert len(offers_in_db(repository)) == 9
 
     def test_state_reflects_the_latest_round(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
     ):
         client = FakeClient(balance=600.0)
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         client.balance = 300.0
-        main.run_once(fake_logger, fake_notifier, strategy, client, repository)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert "掛出 2 筆掛單" in repository.get_state()["last_action"]

@@ -10,7 +10,7 @@ import pytest
 
 from api import rate_limiter
 from api.rate_limiter import RetrySettings, with_retry
-from modules.exchange_client import BitfinexClient
+from api.bitfinex_client import BitfinexClient
 from utils.exceptions import FatalError, RetryableError
 
 

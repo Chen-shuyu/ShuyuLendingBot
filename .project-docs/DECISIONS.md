@@ -670,3 +670,50 @@ PR #12 合併後由 CI 重新部署（容器建立於 21:25:27，非手動啟動
   告警單元 systemd 讀得到、腳本檔存在。三個都問「systemd 眼中的實際狀態」而不是
   「repo 裡寫了什麼」——少複製一個檔或 `OnFailure=` 被刪掉都會當場紅燈。
   理由與 B1／B3 一樣：告警最糟的失敗方式是「以為接上了、其實沒有」。
+
+## D021 — 分層搬遷：介面的價值在例外契約；名實不符的檔案以 docstring 標明
+- 日期：2026-08-15
+- 背景：M4 最後一條技術性分支。`modules/` 三個檔案搬到 `api/`／`strategies/`／`notify/`，
+  並補上兩層抽象介面與 `core/bot_engine.py`。搬遷本身沒有懸念，有懸念的是下面四點。
+- 決策一：**`api/base.py` 的 `ExchangeClient` 真正約束的是例外契約，不是方法簽章**。
+  介面只列五個方法沒什麼價值（本來就只有一個實作），值得寫進介面文件的是：實作必須把
+  底層套件的例外轉換成 `RetryableError` / `FatalError` 再往外拋。
+  - 理由：主迴圈完全靠這個分類決定「下一輪重試」還是「直接停止」。漏一個 ccxt 例外
+    出去，它會被 `run_forever()` 最外層的 `except Exception` 接住，離開碼變成
+    `EXIT_UNEXPECTED`，systemd 的 `RestartPreventExitStatus=2`（D017）就會做出相反的
+    重啟決定——**而且完全沒有徵兆**。這正是換交易所時最容易漏掉的一件事，
+    所以要寫在介面上而不是留在實作裡。
+  - `create_loan_offer()` 的「不得自行重試」（D013）同理，一併寫進介面。
+- 決策二：**`LendingStrategy` 更名為 `FrrPlusStrategy`**。
+  - 理由：`strategies/` 目錄成形、`strategies/base.Strategy` 出現之後，「LendingStrategy」
+    這個名字已經指認不出是哪一種策略——泛稱的位置被 `Strategy` 佔走了。
+    檔名是 `frr_plus.py`，類別名沒跟上只會讓兩邊對不起來。
+  - 代價：所有引用點要改。實際上只有 `main.py` 與兩個測試檔，由測試當場擋住漏改。
+- 決策三：**`notify/line_messaging.py` 只搬位置、不改內容**，接受暫時的名實不符。
+  - 現況是檔名叫 `line_messaging`、內容打的卻是 2025-03 已停用的 LINE Notify 端點。
+  - 為什麼不乾脆先叫 `line_notifier.py`：目標架構（ARCHITECTURE.md、TASKS.md）早就把
+    路徑定為 `notify/line_messaging.py`，改寫分支 `feature/m4-line-messaging` 被使用者
+    尚未申請的 Channel 憑證卡住、無限期待命。先用舊名等於保證之後還要再搬一次，
+    而搬遷的成本剛好落在最不該有意外的那條分支上。
+  - 代價的抵銷方式：模組 docstring 第一段就明寫「目前仍打已停用的 LINE Notify、
+    `send()` 永遠回傳 False」，並列出改寫時要一併更名的環境變數
+    （`LINE_NOTIFY_TOKEN` → `LINE_CHANNEL_ACCESS_TOKEN` 等）。
+    **檔名會誤導人，docstring 不會**——會去讀這個檔的人一定會看到第一行。
+- 決策四：**離開碼常數移到 `core/bot_engine.py` 定義，但 `main.py` 匯入後維持同名存取**，
+  測試也繼續斷言 `main.EXIT_OK` / `main.EXIT_FATAL`。
+  - 理由：常數該跟決定它的程式碼放在一起（現在是 `run_forever()`），但**實際交給
+    作業系統的是 `main.py` 回傳的那一份**，systemd 認的也是它。測試斷言的位置要對齊
+    「真正生效的地方」，而不是「定義的地方」——D018 的教訓就是斷言問錯對象，
+    結果一道檢查從加入起就不可能通過，還一路沒人發現。
+- 方法論（值得記下來）：**這次搬遷的「行為沒變」是由測試本體幾乎沒動來證明的**。
+  283 項測試裡，改的只有 import 路徑、`monkeypatch` 的目標模組，以及
+  `tests/functional/test_run_once.py` 裡一個薄的 `run_once()` 輔助函式（包住 `BotEngine`
+  的建構）。測試邏輯與斷言一行沒碰——如果為了讓測試通過而動到斷言，就等於把
+  迴歸保護網自己拆掉，那才是重構最常見的翻車方式。
+- 驗證：283 項測試全過（含 6 項實際連 Bitfinex 的 live 測試）、`py_compile` 全過、
+  另以暫存 DB／log 實跑 `python main.py` 一輪，確認 bootstrap 接線正確
+  （啟動檢查 → 進入主迴圈 → 取消 → 查餘額與 FRR → 掛兩筆 dry-run 單 → 進入睡眠）。
+- 影響範圍：`main.py`、`api/`（新增 `base.py`、`bitfinex_client.py`）、
+  `strategies/`（新增）、`core/`（新增）、`notify/`（新增）、`modules/`（移除）、
+  `tests/` 全部、`.github/workflows/python-app.yml` 的 `py_compile` 清單。
+

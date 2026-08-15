@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""與 Bitfinex 交易所互動的封裝模組。
+"""與 Bitfinex 交易所互動的封裝模組（`api/base.py` 介面的 Bitfinex 實作）。
 
 這個版本先提供最小可用的功能，包含初始化連線、檢查權限、
 讀取餘額、讀取 FRR，以及建立放貸掛單。後續會再擴充成更完整的流程。
+
+Bitfinex funding 相關操作一律走 ccxt 的 raw/implicit API，統一方法在 ccxt 的
+bitfinex 實作裡從未存在過（見 DECISIONS.md D010）。
 """
 
 from typing import Any, Dict, List, Optional
 
+from api.base import ExchangeClient
 from api.rate_limiter import RetrySettings, with_retry
 from utils.exceptions import FatalError, RetryableError
 
@@ -16,7 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - environment fallback
     ccxt = None
 
 
-class BitfinexClient:
+class BitfinexClient(ExchangeClient):
     """最小可用的交易所封裝，供第一版流程使用。"""
 
     def __init__(self, config, logger, dry_run: bool = False):

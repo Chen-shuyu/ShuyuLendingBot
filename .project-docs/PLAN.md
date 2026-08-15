@@ -29,7 +29,8 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
   - [x] 補 API Rate Limit 重試（`api/rate_limiter.py`，掛單刻意不套）、heartbeat
         （`bot_state.last_run_at`）與連續失敗告警（`FailureTracker`）
 - [ ] M4：架構重構、測試與部署（依 DECISIONS.md D015 拆成 3~4 條子分支，各自開 PR）
-  - 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils` 分層搬遷
+  - [x] 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils`
+        分層搬遷（2026-08-15，分支 `refactor/m4-layering`，見 DECISIONS.md D021）
   - [x] 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
         （2026-08-01，分支 `test/m4-test-suite`，227 項；CI 的 `|| true` 一併拿掉）
   - [x] 收斂部署路線為 Podman 容器化（見 [DECISIONS.md](DECISIONS.md) D007、D016、D017）：
@@ -69,7 +70,6 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       新增 `requirements-dev.txt` 與 `pytest.ini`、把 workflow 內嵌的 heredoc smoke test
       收斂進整合測試。過程中修掉一個測試抓出的實際缺陷：`upsert_daily_earning()` 因
       `principal_avg` 被宣告為 `NOT NULL`，整條「傳 None 保留舊值」的路徑從來無法使用
-- [ ] `refactor/m4-layering`：`strategies/`、`core/`、`notify/` 分層搬遷（有測試當回歸保護）
 - [x] `deploy/m4-podman`（PR #8，2026-08-01）：修掉讓部署自 M3 起一直失敗的主機端目錄
       問題——**機器人已恢復常駐運行**，dry-run 下心跳與落帳皆正常
 - [~] `deploy/m4-podman-hardening`（PR #10，2026-08-02）：容器可靠性四項一次收斂
@@ -85,7 +85,11 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       `StartLimitBurst`、並用 `RestartPreventExitStatus=2` 表達「EXIT_FATAL 不重啟」
       （podman 的 restart policy 做不到）。以對照實驗＋正式容器實測驗收：
       **自動重啟與 `podman logs` 都確認生效**，後者是自 M3 以來第一次
-- [ ] `refactor/m4-layering`：分層搬遷（承上方，仍未開始）
+- [x] **`refactor/m4-layering`（2026-08-15）**：分層搬遷完成，見 DECISIONS.md D021。
+      `modules/` 移除，四個檔案歸位到 `api/`／`strategies/`／`notify/`，新增
+      `api/base.py`、`strategies/base.py`、`core/bot_engine.py`；`main.py` 縮為純
+      bootstrap（227 → 60 行）。**行為零變動**——283 項測試的斷言一行沒改就全過，
+      另以 dry-run 實跑 `main.py` 驗過接線
 - [x] `fix/m4-audit-findings`（PR #13，2026-08-09）：純文件同步，記錄 PR #12 的驗收結果
       與 B1／B2 兩項新發現
 - [x] **`fix/m4-ci-lifecycle-assertion`（2026-08-09）**：修好 CI 紅燈，見 DECISIONS.md D018。
@@ -107,8 +111,10 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 - [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
       LINE Developers Channel 憑證，刻意排在最後一條
 
-M4 目前的狀態：測試與部署兩條都已完成，**可靠性目標這次是真的達成了**（有對照實驗與
-正式容器實測佐證），CI 的迴歸防線也已從「看起來有」變成「真的擋得住」（D018）。
-小額實單剩下的前置條件是使用者補上 `secrets.env`。
-未完的是 `refactor/m4-layering` 分層搬遷，以及被憑證卡住的 LINE 通知。
+M4 目前的狀態：測試、部署、分層重構三條都已完成，**可靠性目標這次是真的達成了**
+（有對照實驗與正式容器實測佐證），CI 的迴歸防線也已從「看起來有」變成「真的擋得住」（D018）。
 兩輪盤查累積的六項缺陷（A1～A6、B1～B3）已全部清完。
+
+**M4 只剩 `feature/m4-line-messaging` 一條，且沒有任何技術阻塞**——純粹等使用者申請
+LINE Developers Channel 憑證。小額實單剩下的前置條件同樣在使用者身上：補上 `secrets.env`，
+並確認 API Key 已禁止提現權限。

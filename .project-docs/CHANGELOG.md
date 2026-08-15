@@ -159,3 +159,16 @@
 - 容器 healthcheck 觀察期滿，Quadlet 加上 `HealthOnFailure=kill`（TASKS.md A6）：
   不健康的容器由 podman 殺掉（離開碼 137），重啟仍然只由 systemd 負責，
   避免 podman 與 systemd 兩套重啟機制並存
+
+### Changed（2026-08-15，分支 `refactor/m4-layering`）
+- 完成分層搬遷，`modules/` 移除：`exchange_client.py` → `api/bitfinex_client.py`、
+  `lending_strategy.py` → `strategies/frr_plus.py`、`line_notifier.py` →
+  `notify/line_messaging.py`（**只搬位置，內容仍是已停用的 LINE Notify**）
+- 新增 `api/base.py`（`ExchangeClient` 介面）、`strategies/base.py`（`Strategy` 介面
+  與 `OfferPlan`）、`core/bot_engine.py`（`BotEngine` 主迴圈與 `FailureTracker`）
+- `main.py` 精簡為 bootstrap（227 → 60 行），巡檢流程與離開碼常數移入 `core/bot_engine.py`
+- 策略類別更名 `LendingStrategy` → `FrrPlusStrategy`
+- 測試 import 路徑同步調整，`test_exchange_client.py` → `test_bitfinex_client.py`、
+  `test_lending_strategy.py` → `test_frr_plus.py`；CI 的 `py_compile` 清單一併更新
+- 行為零變動：283 項測試（含 live）維持全過，另以 dry-run 實跑 `main.py` 驗證接線
+

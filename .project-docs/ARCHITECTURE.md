@@ -30,25 +30,35 @@ LINE 推播摘要 → 休眠。程式以 Podman 容器化常駐部署（見 D007
         └─ notify/line_messaging.py ─┘（LINE Messaging API push）
 ```
 
-## 現況（尚未重構）
+## 目錄結構
 
-M3 已補齊 `api/`（重試）與 `db/`（資料層）兩個目標目錄，其餘仍是 `config/ modules/ utils/`
-三層結構，尚未完成 `strategies/`、`core/`、`notify/` 的搬遷：
+分層搬遷已於 2026-08-15（分支 `refactor/m4-layering`）完成，目錄結構與
+[SHUYU_PROJECT_PLAN.md 附錄 B.9](../archive/SHUYU_PROJECT_PLAN.md) 的目標架構一致：
 
 ```
 ShuyuLendingBot/
-├── config/settings.py          # YAML + 環境變數 + secrets 載入（已可用）
-├── api/rate_limiter.py         # RetrySettings + with_retry 指數退避（M3 新增）
+├── config/settings.py          # YAML + 環境變數 + secrets 載入
+├── api/                        # 交易所適配層
+│   ├── base.py                 # ExchangeClient 抽象介面（M4 新增）
+│   ├── bitfinex_client.py      # BitfinexClient：連線、餘額、FRR、取消掛單、建立掛單
+│   │                            # （皆呼叫 ccxt raw API，見 D009／D010）
+│   └── rate_limiter.py         # RetrySettings + with_retry 指數退避（M3 新增）
+├── strategies/                 # 策略層（純函式，易測試）
+│   ├── base.py                 # Strategy 介面與 OfferPlan 資料結構（M4 新增）
+│   └── frr_plus.py             # FrrPlusStrategy.build_offer_plan()：門檻/拆單/天期判斷
+├── core/
+│   └── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
+│                                # FailureTracker、離開碼常數（M4 由 main.py 移入）
 ├── db/
 │   ├── models.py               # loan_offers / earnings_daily / bot_state 的 DDL（M3 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
-├── modules/
-│   ├── exchange_client.py      # BitfinexClient：連線、餘額、FRR、取消掛單、建立掛單
-│   │                            # （皆已修正為呼叫 ccxt raw API，見 D009／D010）
-│   ├── lending_strategy.py     # LendingStrategy.build_offer_plan()：門檻/拆單/天期判斷骨架
-│   └── line_notifier.py        # LineNotifier：呼叫已停用的 LINE Notify（永遠失敗）
-├── utils/logger.py             # BotLogger：RotatingFileHandler（M3 改）
-├── scripts/
+├── notify/
+│   └── line_messaging.py       # LineNotifier：**內容仍是已停用的 LINE Notify**，
+│                                # 檔名先依目標架構定好，改寫待 LINE 憑證（見 D002、D021）
+├── utils/
+│   ├── logger.py               # BotLogger：RotatingFileHandler（M3 改）
+│   └── exceptions.py           # RetryableError / FatalError / SkipCycleError
+├── scripts/                    # 維運腳本，皆不在主程式執行路徑上、皆只用標準函式庫
 │   ├── healthcheck.py          # 容器內：唯讀讀 bot_state 心跳（M4 新增，見 D016）
 │   └── notify_failure.py       # 主機端：systemd 失效告警（M4 新增，見 D020）
 ├── systemd/
@@ -60,51 +70,22 @@ ShuyuLendingBot/
 │   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端、告警腳本
 │   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重、離開碼與退出路徑
 │   └── integration/            # dry-run 端到端、Bitfinex 公開端點格式守門（live marker）
-└── main.py                     # 常駐主迴圈 + run_once + FailureTracker（尚未搬進 core/）
-                                # 離開碼 0/1/2 語意化（D016）；退出路徑的落帳與 close()
-                                # 都不得改變離開碼與通知（D019）
+├── config.yaml
+├── main.py                     # 只做 bootstrap：組裝各層元件、把離開碼交給作業系統
+└── .project-docs/              # 本文件所在
 ```
 
-測試層與待搬遷的目錄結構是耦合的：`refactor/m4-layering` 做搬遷時，`tests/` 的 import
-路徑要一併調整，改完重跑全部測試即可確認搬遷沒有改變行為。
-
-## 目標架構（依 [SHUYU_PROJECT_PLAN.md 附錄 B.9](../archive/SHUYU_PROJECT_PLAN.md)）
-
-```
-ShuyuLendingBot/
-├── config/            # 設定載入與驗證
-│   ├── settings.py            # 現有，補型別驗證
-│   └── config.yaml
-├── api/               # 交易所適配層
-│   ├── base.py                 # ExchangeClient 抽象介面
-│   ├── bitfinex_client.py      # 由 modules/exchange_client.py 移入並修正 get_frr
-│   └── rate_limiter.py         # with_retry decorator：指數退避
-├── strategies/        # 策略層（純函式，易測試）
-│   ├── base.py                 # Strategy 抽象基底
-│   └── frr_plus.py             # 由 modules/lending_strategy.py 移入並擴充
-├── core/
-│   └── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機
-├── db/
-│   ├── models.py                # loan_offers / earnings_daily / bot_state
-│   └── repository.py            # SQLite WAL 讀寫封裝
-├── notify/
-│   └── line_messaging.py        # 由 modules/line_notifier.py 改寫，走 LINE Messaging API
-├── utils/logger.py              # 改用 RotatingFileHandler
-├── scripts/                      # 維運腳本，皆不在主程式執行路徑上、皆只用標準函式庫
-│   ├── healthcheck.py            # 容器內執行的 healthcheck
-│   └── notify_failure.py         # 主機端執行的失效告警
-├── tests/{unit,functional,integration}/
-├── systemd/                      # shuyu-lending-bot.container 是正式部署的 Quadlet
-│                                 # 單元（D017、D020）、shuyu-lending-bot-alert.service
-│                                 # 是失效告警單元（D020）；bfx-lending-bot.service 為本機測試用
-├── main.py                       # 精簡為 bootstrap，主迴圈移入 core/
-└── .project-docs/                # 本文件所在
-```
+搬遷本身不改行為（見 D021），迴歸保護來自既有的 283 項測試。
+結構上還沒補齊的只剩 `notify/line_messaging.py` 的內容改寫，卡在 LINE Channel 憑證。
 
 ## 主要模組
 
 - `config/settings.py`：讀取 `config.yaml`，以環境變數與 `BFX_SECRETS_FILE` 覆蓋敏感值。已可用。
-- `api/bitfinex_client.py`（現 `modules/exchange_client.py`）：封裝 `ccxt.bitfinex`，提供
+- `api/base.py`：`ExchangeClient` 抽象介面。重點不在方法簽章而在**例外契約**——實作必須
+  把底層套件的例外轉成 `RetryableError` / `FatalError` 再往外拋，主迴圈才分得出「下一輪
+  重試」與「直接停止」；漏一個 ccxt 例外出去就會被最外層當成未預期例外，離開碼與重啟
+  決策全錯（見 D021）。
+- `api/bitfinex_client.py`：封裝 `ccxt.bitfinex`，實作上述介面，提供
   `test_connection`、`get_available_balance`、`get_frr`、`cancel_active_offers`、
   `create_loan_offer`。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
   `private_post_auth_r_funding_offers_symbol`／`private_post_auth_w_funding_offer_cancel`／
@@ -115,13 +96,17 @@ ShuyuLendingBot/
   decorator。攔的是 `exchange_client` 已分類好的 `RetryableError` 而非 ccxt 原始例外——
   例外轉換早在各方法內做完，decorator 只負責重試，因此一行即可套用而不動內部邏輯；
   `FatalError` 直接往外拋（見 D013）。
-- `strategies/frr_plus.py`（現 `modules/lending_strategy.py`）：FRR+ 策略純函式，輸入餘額與
+- `strategies/base.py`：`Strategy` 介面與 `OfferPlan` 資料結構——策略層與迴圈層之間的契約。
+  `OfferPlan` 是**計畫值不是成交值**，落帳一律以交易所回報為準。
+- `strategies/frr_plus.py`：`FrrPlusStrategy`，FRR+ 策略純函式，輸入餘額與
   FRR，輸出 `OfferPlan` 清單。已含 `maxtolend` 縮量、spread 百分比遞增階梯、依單筆最小量
   自動降階、逐筆判斷天期（D011）。尚待：`maxtolend` 只管本輪掛出總額，未計入已放貸部位。
-- `core/bot_engine.py`（尚未建立，現由 `main.py` 承擔）：`run_once` 單輪巡檢，順序為
+- `core/bot_engine.py`：`BotEngine.run_once()` 單輪巡檢，順序為
   取消舊掛單 → 等待餘額釋放 → 查餘額 → 抓 FRR → 產生掛單計畫 → 逐筆掛單並落帳 →
   寫入 `bot_state` → 通知；主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`，
   並以 `FailureTracker` 累計連續失敗、跨過門檻時告警一次、恢復時再通知一次（D013）。
+  `run_forever()` 包住啟動檢查、主迴圈與三條退出路徑，回傳離開碼（`EXIT_OK` / 
+  `EXIT_UNEXPECTED` / `EXIT_FATAL` 也定義在這裡，見 D016、D017、D019）。
 - `db/repository.py`：SQLite WAL 模式（搭配 `synchronous=NORMAL`），記錄掛單流水、
   每日收益彙總、`bot_state`。掛單成功走 `record_offer()`、失敗走 `record_offer_failure()`——
   掛單 API 無法 rollback，同一輪前幾筆成功時錢已經出去了，只有逐筆落帳才對得出真實狀態。
@@ -129,10 +114,13 @@ ShuyuLendingBot/
   ——**必須與 `scripts/healthcheck.py` 的同名函式算出相同結果**，兩邊分家的症狀是健康檢查
   永遠回報「尚未寫入任何心跳」而機器人其實是好的（D019）。
   尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
-- `notify/line_messaging.py`（現 `modules/line_notifier.py`）：目前呼叫已停用的 LINE Notify
+- `notify/line_messaging.py`：**檔名已是目標名稱，內容還沒改寫**——目前呼叫已停用的 LINE Notify
   端點（`notify-api.line.me`），需改寫為 LINE Messaging API push
   （`POST https://api.line.me/v2/bot/message/push`）。在那之前，M3 的連續失敗告警實際上
   只會留在日誌裡。
+- `main.py`：只做 bootstrap——載入 secrets 與 `config.yaml`、建好 logger／notifier／策略／
+  交易所客戶端／`Repository`，組成 `BotEngine` 後把它回傳的離開碼交給作業系統。
+  這裡不該再出現任何巡檢邏輯。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
 - `scripts/healthcheck.py`：容器 healthcheck 的執行檔，唯讀開啟 SQLite 讀 `bot_state.last_run_at`，
   心跳超過「巡檢間隔 × 3 + 60 秒」（可由 `engine.health_max_silence_seconds` 覆寫）就以

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""放貸策略邏輯。
+"""FRR+ 放貸策略。
 
 這個模組負責將市場資訊與餘額轉換為一組掛單計畫：先套用 maxtolend 風控上限縮減
 可放貸金額，再依 spread 設定把金額拆成多筆、利率逐階遞增的掛單，最後對每一筆
@@ -7,19 +7,12 @@
 """
 
 import math
-from dataclasses import dataclass
 from typing import List
 
-
-@dataclass
-class OfferPlan:
-    currency: str
-    amount: float
-    rate: float
-    duration: int
+from strategies.base import OfferPlan, Strategy
 
 
-class LendingStrategy:
+class FrrPlusStrategy(Strategy):
     """FRR+ 策略：動態利率底線 + spread 階梯拆單 + xDays 動態天期 + maxtolend 風控。"""
 
     def __init__(self, config):

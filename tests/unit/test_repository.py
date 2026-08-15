@@ -20,7 +20,7 @@ from db.repository import (
     resolve_db_path,
     utc_now,
 )
-from modules.lending_strategy import OfferPlan
+from strategies.base import OfferPlan
 
 
 def make_plan(amount=200.0, rate=0.0004, duration=2, currency="USD"):

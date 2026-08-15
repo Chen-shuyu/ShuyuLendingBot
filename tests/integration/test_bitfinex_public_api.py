@@ -15,7 +15,7 @@
 import ccxt
 import pytest
 
-from modules.exchange_client import BitfinexClient
+from api.bitfinex_client import BitfinexClient
 from utils.exceptions import RetryableError
 
 pytestmark = pytest.mark.live

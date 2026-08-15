@@ -170,7 +170,7 @@ def record_in_database(db_path: str, message: str) -> bool:
 def send_line_push(message: str) -> bool:
     """LINE 推播（尚未實作）。
 
-    `modules/line_notifier.py` 目前打的是 2025-03 已停用的 LINE Notify 端點，
+    `notify/line_messaging.py` 目前打的是 2025-03 已停用的 LINE Notify 端點，
     接上去也一定失敗。等 `feature/m4-line-messaging` 把 Messaging API 做完、
     且使用者申請到 Channel Access Token 之後，在這裡補上 push 呼叫。
     回傳 False 表示「這個管道還沒接上」，不是失敗——這支腳本的當期職責是留下痕跡。

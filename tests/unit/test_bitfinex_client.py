@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`modules/exchange_client.py` 的單元測試（不連網路）。
+"""`api/bitfinex_client.py` 的單元測試（不連網路）。
 
 用假的 exchange 物件驗證三件事：ccxt 例外有沒有被正確分類成
 `RetryableError` / `FatalError`、Bitfinex V2 的陣列式回應有沒有解析對、
@@ -11,8 +11,8 @@
 import ccxt
 import pytest
 
+from api.bitfinex_client import BitfinexClient
 from api.rate_limiter import RetrySettings
-from modules.exchange_client import BitfinexClient
 from utils.exceptions import FatalError, RetryableError
 
 # Bitfinex V2 funding offer 陣列：0=ID, 1=SYMBOL, 4=AMOUNT, 14=RATE, 15=PERIOD

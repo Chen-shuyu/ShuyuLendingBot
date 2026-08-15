@@ -5,7 +5,9 @@
 （見 DECISIONS.md D016），所以「退出時回什麼碼」與「退出前有沒有把原因寫進 DB」
 是事後唯一能追查的線索，兩者都要釘住。
 
-這裡把 `main()` 的外部依賴全部換成替身，只保留主迴圈本身的控制流程。
+這裡把 `main()` 的外部依賴全部換成替身，只保留 bootstrap 與 `BotEngine`
+主迴圈本身的控制流程；離開碼常數雖然定義在 `core/bot_engine.py`，
+但斷言仍走 `main` 的名稱——那是實際交給作業系統的那一份。
 """
 
 import sqlite3
@@ -13,6 +15,7 @@ import sqlite3
 import pytest
 
 import main
+from core import bot_engine
 from db.repository import Repository
 from utils.exceptions import FatalError
 
@@ -79,11 +82,11 @@ def run_main(tmp_path, monkeypatch, fake_logger, fake_notifier):
     monkeypatch.setattr(main, "load_config", lambda path: config)
     monkeypatch.setattr(main, "BotLogger", lambda *args, **kwargs: fake_logger)
     monkeypatch.setattr(main, "LineNotifier", lambda *args, **kwargs: fake_notifier)
-    monkeypatch.setattr(main, "LendingStrategy", StubStrategy)
+    monkeypatch.setattr(main, "FrrPlusStrategy", StubStrategy)
     monkeypatch.setattr(main, "Repository", RepositoryStub)
     monkeypatch.setattr(main, "BitfinexClient", StubClient)
     # 主迴圈跑完一輪就靠這裡結束，否則測試會永遠轉下去
-    monkeypatch.setattr(main.time, "sleep", _raise_keyboard_interrupt)
+    monkeypatch.setattr(bot_engine.time, "sleep", _raise_keyboard_interrupt)
 
     StubClient.connect_result = True
     StubClient.cycle_effect = None

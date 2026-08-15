@@ -95,6 +95,29 @@ def strategy_config():
 
 
 @pytest.fixture(autouse=True)
+def no_real_line_credentials(monkeypatch, tmp_path_factory):
+    """**測試絕不能送出真實的 LINE 推播。**
+
+    這條是踩過才加的：`scripts/notify_failure.py` 接上 Messaging API 的當下，
+    測試套件跑起來就從 `~/.config/bfx-lending-bot/secrets.env` 讀到真金鑰，
+    **實際推了 6 則訊息到使用者手機**，還吃掉每月 200 則額度裡的 6 則。
+    失敗方式很安靜——測試照樣綠燈，只有手機會響。
+
+    因此所有測試一律：清掉兩個 LINE 環境變數、把 `BFX_SECRETS_FILE` 指到一個
+    不存在的路徑。沒有憑證時 `send_line_push()` 與 `LineNotifier.send()` 都會
+    在發出請求前就回傳 False，網路呼叫根本不會發生。
+    要驗證推播行為的測試，一律用替身（見 `tests/unit/test_line_messaging.py`）。
+
+    注意不要改成「全域封鎖網路」：`tests/integration` 有 6 項刻意連 Bitfinex
+    公開 API 的 live 測試，那是它們的價值所在。
+    """
+    for name in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_TO_USER_ID"):
+        monkeypatch.delenv(name, raising=False)
+    missing = tmp_path_factory.mktemp("no-secrets") / "secrets.env"
+    monkeypatch.setenv("BFX_SECRETS_FILE", str(missing))
+
+
+@pytest.fixture(autouse=True)
 def reset_bot_logger():
     """測試前後都清掉 `BotLogger` 共用的具名 logger。
 

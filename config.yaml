@@ -45,6 +45,11 @@ logging:
   backup_count: 5           # 最多保留幾份輪替後的舊檔（.1 ~ .5）
 
 line:
-  enabled: false
+  enabled: true
+  # 兩個值都放 ~/.config/bfx-lending-bot/secrets.env，**不要寫在這裡**（見 D022）：
+  #   LINE_CHANNEL_ACCESS_TOKEN=…   LINE_TO_USER_ID=U…
+  # 這裡留空字串當佔位，設定檔本身可以安心進版控。
   token: ""
-  channel: ""
+  to_user_id: ""
+  # 提醒：免費方案每月 200 則。這個管道只送事件（連續失敗／恢復／致命錯誤／
+  # systemd 放棄重啟），例行的每輪巡檢結果只寫日誌，見 DECISIONS.md D024。

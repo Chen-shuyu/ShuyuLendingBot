@@ -30,7 +30,7 @@ def main() -> int:
 
     log_file = os.getenv("BFX_LOG_FILE") or config.get("logging", {}).get("file")
     logger = BotLogger(config.get("logging", {}), log_file)
-    notifier = LineNotifier(config.get("line", {}))
+    notifier = LineNotifier(config.get("line", {}), logger)
     strategy = FrrPlusStrategy(config)
     repository = Repository.from_config(config)
 

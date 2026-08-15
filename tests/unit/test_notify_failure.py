@@ -7,6 +7,8 @@
 一個管道壞掉不影響其他管道、以及**絕對不能更新心跳**。
 """
 
+import io
+import json
 import sqlite3
 
 import pytest
@@ -38,6 +40,12 @@ def clean_env(monkeypatch):
     monkeypatch.setenv("BFX_ALERT_SETTLE_SECONDS", "0")
     # 預設當成「已放棄」，各測試要驗細節時再自行覆寫
     monkeypatch.setattr(notify_failure, "collect_unit_state", lambda unit: dict(GAVE_UP))
+    # 最後一道保險：憑證已由 conftest 清掉，這裡再讓任何漏網的網路呼叫當場炸掉，
+    # 而不是安靜地送出一則真實推播（見 conftest.no_real_line_credentials）
+    def _no_network(*args, **kwargs):
+        raise AssertionError("測試不得發出真實網路請求")
+
+    monkeypatch.setattr(notify_failure.urllib.request, "urlopen", _no_network)
 
 
 class TestHasGivenUp:
@@ -247,7 +255,93 @@ class TestMain:
         assert "ERROR" in content
         assert "CRITICAL" not in content
 
-    def test_line_channel_is_not_wired_yet(self):
-        # 憑證到位前刻意回 False（不是失敗，是「還沒接上」）。
-        # 這條測試在 LINE 接上時會失敗，正好提醒要回來更新這裡與 TASKS.md
+
+class TestLinePush:
+    """LINE 管道（2026-08-15 接上 Messaging API）。"""
+
+    def test_no_credentials_means_no_push(self):
+        # conftest 已清掉憑證並把 secrets 指到不存在的路徑，
+        # 所以這裡要在「發出請求之前」就回 False（urlopen 被設成一呼叫就炸）
         assert notify_failure.send_line_push("測試訊息") is False
+
+    def test_info_level_is_never_pushed(self, monkeypatch):
+        # B4 修掉了「部署重啟送假 ERROR」，不能又從 LINE 這個管道推同樣的東西出去
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "token")
+        monkeypatch.setenv("LINE_TO_USER_ID", "U0000")
+        assert notify_failure.send_line_push("部署重啟造成的觸發", level="INFO") is False
+
+    def test_critical_is_pushed(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["auth"] = request.headers.get("Authorization")
+            return FakeResponse()
+
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "token-abc")
+        monkeypatch.setenv("LINE_TO_USER_ID", "U1234")
+        monkeypatch.setattr(notify_failure.urllib.request, "urlopen", fake_urlopen)
+
+        assert notify_failure.send_line_push("機器人已停止", level="CRITICAL") is True
+        assert captured["url"] == "https://api.line.me/v2/bot/message/push"
+        assert captured["body"]["to"] == "U1234"
+        assert captured["body"]["messages"][0]["text"] == "機器人已停止"
+        assert captured["auth"] == "Bearer token-abc"
+
+    def test_http_error_does_not_raise(self, monkeypatch, capsys):
+        def fake_urlopen(request, timeout=None):
+            raise notify_failure.urllib.error.HTTPError(
+                request.full_url, 401, "Unauthorized", {}, io.BytesIO(b'{"message":"bad token"}')
+            )
+
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "token")
+        monkeypatch.setenv("LINE_TO_USER_ID", "U1234")
+        monkeypatch.setattr(notify_failure.urllib.request, "urlopen", fake_urlopen)
+
+        # 告警腳本自己不能因為 LINE 掛掉而爆炸，日誌與 DB 兩個管道還要照走
+        assert notify_failure.send_line_push("機器人已停止") is False
+        assert "HTTP 401" in capsys.readouterr().err
+
+    def test_token_is_never_printed(self, monkeypatch, capsys):
+        def fake_urlopen(request, timeout=None):
+            raise OSError("連線被拒")
+
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "super-secret-token")
+        monkeypatch.setenv("LINE_TO_USER_ID", "U1234")
+        monkeypatch.setattr(notify_failure.urllib.request, "urlopen", fake_urlopen)
+
+        notify_failure.send_line_push("機器人已停止")
+        assert "super-secret-token" not in capsys.readouterr().err
+
+
+class TestLoadSecrets:
+    def test_reads_export_prefixed_lines(self, tmp_path, monkeypatch):
+        """`secrets.env` 每行都有 `export ` 前綴，這正是不能用 systemd
+        `EnvironmentFile=` 的原因（它會把 `export KEY` 整串當鍵名）。"""
+        path = tmp_path / "secrets.env"
+        path.write_text(
+            "# 註解\n"
+            "export LINE_CHANNEL_ACCESS_TOKEN=abc\n"
+            'export LINE_TO_USER_ID="U999"\n'
+            "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BFX_SECRETS_FILE", str(path))
+
+        secrets = notify_failure.load_secrets()
+        assert secrets["LINE_CHANNEL_ACCESS_TOKEN"] == "abc"
+        assert secrets["LINE_TO_USER_ID"] == "U999"
+
+    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BFX_SECRETS_FILE", str(tmp_path / "nope.env"))
+        assert notify_failure.load_secrets() == {}

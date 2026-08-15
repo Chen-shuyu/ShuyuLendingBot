@@ -647,3 +647,39 @@
   ＋「兩條分支字串未動」作為證據直接提交
 - 下一步：M4 仍只剩 `feature/m4-line-messaging`，等使用者申請 LINE Channel 憑證
 
+## 2026-08-15（續）—— LINE Messaging API 接上，M4 完成（分支 `feature/m4-line-messaging`）
+
+- 先確認 PR #18 已合併（`fc63f21`、`fcb0f36` 都在 main 內），main 前進到 `c43d6e7`，
+  從最新的 main 開分支
+- 使用者填好憑證後，先用**三個唯讀端點**驗證，不送任何訊息：`/v2/bot/info`（token 有效，
+  官方帳號「Bitfinex貸款機器人」、`chatMode=bot` 代表自動回應已關）、
+  `/v2/bot/profile/{userId}`（user ID 有效**且已是好友**——不是好友這個查詢會直接失敗）、
+  `/v2/bot/message/quota`（`{"type":"limited","value":200}`）
+- **額度數字改變了設計**：`run_once()` 結尾原本每輪 `notifier.send("已完成一輪巡檢")`，
+  而巡檢間隔 600 秒 = 一天 144 輪，免費方案卻是每月 200 則——照原樣接上去**不到兩天
+  就把整個月的額度用光**，之後真正的故障告警一則都送不出去。改為只寫日誌，
+  通知管道只送事件（見 DECISIONS.md D024）
+- `notify/line_messaging.py` 改寫為 `POST /v2/bot/message/push`：HTTP 錯誤碼一律翻成
+  人看得懂的原因（403 最常見的其實是「對方不是好友」而不是權限設定）、超過 5000 字截斷、
+  **永遠不拋例外也不重試**（它在致命錯誤的退出路徑上，承 D019）
+- `scripts/notify_failure.py` 的 LINE 管道接上，維持**獨立實作**（只用標準函式庫）。
+  自己讀 `secrets.env`——刻意不用 systemd `EnvironmentFile=`，因為每行的 `export ` 前綴
+  會讓 systemd 把 `export LINE_CHANNEL_ACCESS_TOKEN` 整串當鍵名而**安靜地**解析失敗。
+  **INFO 等級不推**：D023 剛修掉部署重啟的假 ERROR，不能換個管道再犯一次
+- 環境變數與設定鍵改名（`LINE_NOTIFY_*` → `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_TO_USER_ID`、
+  `channel` → `to_user_id`），**刻意不做向後相容**並補一條測試釘住：留著舊名只會讓人
+  以為設了就有用，而舊 token 對新端點必定是 401
+- **踩到一個坑並修掉**：接上之後第一次跑 `pytest`，告警腳本的測試從真實 `secrets.env`
+  讀到金鑰，**實際推了 6 則訊息到使用者手機**，也吃掉當月額度 6 則。失敗方式很安靜
+  ——測試照樣綠燈，只有手機會響。已在 `tests/conftest.py` 加 autouse fixture：所有測試
+  一律清掉 LINE 環境變數並把 `BFX_SECRETS_FILE` 指到不存在的路徑；
+  `test_notify_failure.py` 另把 `urlopen` 換成一呼叫就 AssertionError 當第二道保險。
+  **刻意不做全域封鎖網路**——`tests/integration` 有 6 項刻意連 Bitfinex 公開 API 的 live 測試
+- 測試 292 → 312 項（新增 `tests/unit/test_line_messaging.py` 13 項、告警腳本的
+  LINE 與 `load_secrets()` 測試，並改寫兩條釘住舊行為的測試）
+- **實測驗收**：兩條管道各實際送出一則測試訊息並確認送達——主程式路徑走
+  `load_secrets_from_disk` + `config.yaml` 的真實接線（不是臨時 curl），
+  告警腳本路徑走主機端獨立實作；INFO 等級確認略過
+- **M4 四個 milestone 至此全部完成**。下一步是小額真金測試，前置條件全部在使用者身上：
+  Bitfinex API Key（建立當下就關掉提現權限）、起始金額、`dry_run` 切換時機
+

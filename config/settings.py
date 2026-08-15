@@ -31,10 +31,13 @@ def load_config(path: str):
     bitfinex_config["api_key"] = os.getenv("BFX_API_KEY") or bitfinex_config.get("api_key", "")
     bitfinex_config["api_secret"] = os.getenv("BFX_API_SECRET") or bitfinex_config.get("api_secret", "")
 
+    # LINE Messaging API 的兩個值。舊的 `LINE_NOTIFY_TOKEN` / `LINE_NOTIFY_CHANNEL`
+    # 是 LINE Notify 時代的名字，該服務已於 2025-03 停用，**刻意不做向後相容**：
+    # 留著舊名只會讓人以為設了就有用，而舊 token 對新端點一定是 401（見 D024）。
     line_config = config.setdefault("line", {})
     line_config["enabled"] = bool(line_config.get("enabled", False))
-    line_config["token"] = os.getenv("LINE_NOTIFY_TOKEN") or line_config.get("token", "")
-    line_config["channel"] = os.getenv("LINE_NOTIFY_CHANNEL") or line_config.get("channel", "")
+    line_config["token"] = os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or line_config.get("token", "")
+    line_config["to_user_id"] = os.getenv("LINE_TO_USER_ID") or line_config.get("to_user_id", "")
 
     return config
 

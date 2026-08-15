@@ -39,9 +39,21 @@ Image=localhost/shuyu-lending-bot:latest
 # 而不是去 docker.io 拉一個剛好同名的陌生映像下來跑。
 Pull=never
 
+# 金鑰一律以「檔案」傳遞，不要改成 Environment=BFX_API_KEY=...（見 DECISIONS.md D022）。
+# 用環境變數的話，金鑰會同時出現在四個地方：這個單元檔本身（**而它在版控裡**）、
+# `podman inspect`、`systemctl show`、以及 /proc/<pid>/environ。
 Environment=BFX_SECRETS_FILE=/run/secrets/secrets.env
 
-Volume=/workspace/deploy/active-bots/ShuyuLendingBot:/run/secrets:ro
+# 只掛「那一個檔案」，不是整個目錄（見 DECISIONS.md D022）。
+# 原本掛的是整個部署目錄，於是容器的 /run/secrets 底下看得到 data/ 與 logs/——
+# 那兩個目錄本來就另外掛在 /app/data 與 /app/logs，重複掛載沒有意義，而且容器
+# 一旦被入侵，等於順手多送對方一份完整的交易紀錄與日誌。
+#
+# 來源放家目錄而不是 /workspace：後者就在 git repo 的隔壁，與其靠 .gitignore
+# 記得擋，不如讓它在結構上就不可能被版控或 CI 碰到。而且本機直接跑 main.py
+# 讀的也是這一份（config/settings.py 的預設路徑就是它），不會兩邊分家。
+# 路徑寫絕對值而不用 %h：這份單元只會安裝給 shuyu 使用者，寫死比較一目瞭然。
+Volume=/home/shuyu/.config/bfx-lending-bot/secrets.env:/run/secrets/secrets.env:ro
 Volume=/workspace/deploy/active-bots/ShuyuLendingBot/logs:/app/logs
 # SQLite 檔必須掛在容器外，否則每次重建容器，掛單與收益紀錄就歸零
 Volume=/workspace/deploy/active-bots/ShuyuLendingBot/data:/app/data
@@ -80,6 +92,12 @@ RestartPreventExitStatus=2
 # 以及任何非 CI 觸發的重啟也都成立。
 ExecStartPre=/usr/bin/mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/logs
 ExecStartPre=/usr/bin/mkdir -p /workspace/deploy/active-bots/ShuyuLendingBot/data
+
+# 掛單一檔案時，來源檔案必須先存在。少了這道檢查，podman 會**自己在來源路徑
+# 建一個目錄**頂替，容器裡的 secrets.env 就變成一個目錄，程式開檔時噴
+# IsADirectoryError——錯誤訊息離真正的原因（金鑰檔不見了）非常遠。
+# 寧可在這裡當場失敗，理由與 Pull=never 相同（見 DECISIONS.md D022）。
+ExecStartPre=/usr/bin/test -f /home/shuyu/.config/bfx-lending-bot/secrets.env
 
 [Install]
 WantedBy=default.target

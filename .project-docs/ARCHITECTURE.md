@@ -157,6 +157,12 @@ ShuyuLendingBot/
   `Restart=on-failure` + `StartLimitBurst` 表達、`RestartPreventExitStatus=2` 讓
   `EXIT_FATAL` 不重啟；`--log-driver=k8s-file` 讓日誌取得回來、`--health-cmd` 掛上
   心跳檢查 —— 見 DECISIONS D016。
+- 金鑰：唯一真實來源是 `~/.config/bfx-lending-bot/secrets.env`（目錄 700／檔案 600），
+  以**唯讀掛載單一檔案**的方式進容器，並用 `BFX_SECRETS_FILE` 指路 —— 見 DECISIONS D022。
+  兩條約束：**不掛整個目錄**（容器只該看到金鑰檔，不該看到同目錄的其他東西）、
+  **不用 `Environment=` 傳金鑰**（會同時洩漏到版控中的單元檔、`podman inspect`、
+  `systemctl show` 與 `/proc/<pid>/environ`）。放家目錄而非 `/workspace`，
+  是為了讓版控與 CI 在結構上就碰不到它。`docker-compose.yml` 必須與 Quadlet 單元一致。
 - 失效處理只有一個權威：**systemd**。健康檢查不健康時用 `HealthOnFailure=kill`
   （不是 `restart`）——podman 只負責殺掉容器、產生一個非 0 離開碼，重啟一律由
   `Restart=on-failure` 接手，因此節流與告警自動涵蓋這條路徑，不會出現 podman 與

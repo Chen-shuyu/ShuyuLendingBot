@@ -717,3 +717,50 @@ PR #12 合併後由 CI 重新部署（容器建立於 21:25:27，非手動啟動
   `strategies/`（新增）、`core/`（新增）、`notify/`（新增）、`modules/`（移除）、
   `tests/` 全部、`.github/workflows/python-app.yml` 的 `py_compile` 清單。
 
+## D022 — 金鑰檔的位置與掛載方式：家目錄唯一真實來源、只掛單一檔案、一律走檔案不走環境變數
+
+- 日期：2026-08-15
+- 背景：實單前要備妥 `secrets.env`。盤點時發現兩件事——家目錄那份樣板其實
+  早就存在（2026-07-12 建立，四個鍵都是空值），而 Quadlet 掛的是**整個部署目錄**。
+- 前提：先界定這台機器的實際威脅面。`uid >= 1000` 的一般使用者只有 `shuyu` 一個，
+  而 root 本來就讀得到一切——**「同機他人偷讀」實質上不存在**。真正該防的是
+  誤入版控被推上 GitHub、容器被入侵後的橫向取得、備份工具誤打包。
+  檔案權限要收緊（目錄 700、檔案 600），但它不是這則決策的重點。
+- 決策一：**唯一真實來源是 `~/.config/bfx-lending-bot/secrets.env`**，不放
+  `/workspace/deploy/active-bots/ShuyuLendingBot/`。
+  - 位置在 `/workspace` 之外，git、CI、部署腳本在**結構上**就碰不到它。
+    這比「靠 `.gitignore` 記得擋」可靠——後者只要有人 `git add -f` 就破功。
+  - 而且 `config/settings.py` 的預設路徑正是它，本機直接跑 `main.py` 與容器內
+    讀的是同一份，不會兩邊分家維護兩份金鑰。
+  - 舊位置的其他缺點：目錄權限 755、SELinux 標籤是 `unlabeled_t`、
+    且該目錄同時是 `data/` 與 `logs/` 的家。
+- 決策二：**Quadlet 只掛那一個檔案，不掛整個目錄**。
+  - 原本是 `Volume=/workspace/.../ShuyuLendingBot:/run/secrets:ro`。實測容器內
+    `/run/secrets` 底下看得到 `data/`（完整 SQLite 交易紀錄）與 `logs/`——
+    而這兩個目錄本來就另外掛在 `/app/data` 與 `/app/logs`，**重複掛載毫無作用，
+    只是在容器被入侵時多送對方一份完整交易紀錄**。
+  - 附帶加上 `ExecStartPre=/usr/bin/test -f <來源檔>` 守門：掛單一檔案時，
+    來源不存在的話 podman 會**自己建一個同名目錄頂替**，程式開檔噴
+    `IsADirectoryError`，錯誤訊息離真正的原因（金鑰檔不見了）非常遠。
+    寧可在啟動前當場失敗，理由與 `Pull=never`（D017）相同。
+- 決策三：**金鑰一律以檔案傳遞，不得改用 `Environment=BFX_API_KEY=...`**。
+  - 用環境變數會讓金鑰同時出現在四個地方：Quadlet 單元檔本身（**而它在版控裡**）、
+    `podman inspect`、`systemctl show`、`/proc/<pid>/environ`。
+  - 這條寫進單元檔的註解，避免日後被當成「多此一舉的間接層」順手簡化掉。
+- 不採用 `podman secret`：會多出**第二個真實來源**（本機跑 `main.py` 讀不到，
+  得維護兩份）、更新要 `secret rm` + `create` + 重啟，而預設驅動只是把檔案存在
+  `~/.local/share/containers/storage` 底下——**一樣是 uid 1000 讀得到，實質保護
+  並沒有比 600 的檔案更好**。等日後有多台機器或多個服務共用同一組金鑰再回頭評估。
+- 不採用「以 root 建立金鑰檔」：rootless podman 以 `shuyu` 身分執行，容器內的 root
+  對映到主機 uid 1000。檔案若由主機 root 擁有且權限 600，**容器會直接讀不到而啟動失敗**。
+  安全性也沒有提升——`600 + owner shuyu` 已經是「只有你和 root 讀得到」，
+  改成 root 擁有只是把使用者自己也擋在門外，能讀的人並沒有變少。
+- SELinux 備查：目前是 **Permissive**，家目錄的 `config_home_t` 掛進容器不會被擋。
+  若日後改為 `Enforcing`，這個掛載需要加 `,z`（會重新標記該檔）或調整對應布林值。
+  記在這裡是因為屆時的症狀（容器讀不到金鑰）與原因（SELinux）距離很遠。
+- 驗證：`quadlet -dryrun` 確認產生的 `podman run` 帶的是單一檔案的 `-v`；
+  重啟後服務 `active`、容器 `healthy`、容器內 `/run/secrets` 只剩 `secrets.env`
+  （另有 podman 在 RHEL 上**預設注入**的訂閱憑證 `rhsm/`、`redhat.repo`、
+  `etc-pki-entitlement/`，與本專案無關，非本次掛載帶進去的）；
+  日誌全文搜尋金鑰樣式 0 筆；283 項測試維持全過。
+

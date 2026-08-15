@@ -11,7 +11,9 @@ services:
     environment:
       BFX_SECRETS_FILE: /run/secrets/secrets.env
     volumes:
-      - /home/shuyu/.config/bfx-lending-bot:/run/secrets:ro
+      # 只掛金鑰檔本身，不掛整個目錄（見 DECISIONS.md D022）。與正式部署的
+      # Quadlet 單元保持一致；掛目錄會讓容器連帶看到同目錄下的其他東西。
+      - /home/shuyu/.config/bfx-lending-bot/secrets.env:/run/secrets/secrets.env:ro
       - /home/shuyu/.config/bfx-lending-bot/logs:/app/logs
       # SQLite 檔必須掛在容器外，否則每次重建容器紀錄就歸零
       - /home/shuyu/.config/bfx-lending-bot/data:/app/data

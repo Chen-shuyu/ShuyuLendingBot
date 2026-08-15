@@ -52,14 +52,20 @@ LINE 推播的位置已經留好（`send_line_push`），待 LINE Developers Cha
 到位後填上即可，在那之前這支腳本負責的是「至少留下痕跡」。
 """
 
+import json
 import os
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 DEFAULT_UNIT = "shuyu-lending-bot.service"
+# 主機端的金鑰檔（見 DECISIONS.md D022）。容器內是 /run/secrets/secrets.env，
+# 但這支腳本跑在容器外，走的是原始路徑。
+DEFAULT_SECRETS_FILE = "~/.config/bfx-lending-bot/secrets.env"
 # 查詢單元狀態前先等一下，讓 systemd 把狀態轉換走完再問。
 # 觸發告警與轉換到 auto-restart 幾乎同時發生，馬上問可能問到轉換前的舊狀態，
 # 那會把「正在重試」誤判成「已經放棄」。正式部署的 RestartSec=30，
@@ -230,15 +236,77 @@ def record_in_database(db_path: str, message: str) -> bool:
     return True
 
 
-def send_line_push(message: str) -> bool:
-    """LINE 推播（尚未實作）。
+def load_secrets() -> dict:
+    """從 `secrets.env` 讀出憑證，只用標準函式庫。
 
-    `notify/line_messaging.py` 目前打的是 2025-03 已停用的 LINE Notify 端點，
-    接上去也一定失敗。等 `feature/m4-line-messaging` 把 Messaging API 做完、
-    且使用者申請到 Channel Access Token 之後，在這裡補上 push 呼叫。
-    回傳 False 表示「這個管道還沒接上」，不是失敗——這支腳本的當期職責是留下痕跡。
+    這支腳本跑在**容器外**（主機端），systemd 的告警單元不會帶這兩個變數進來，
+    所以要自己讀檔。**刻意不用單元的 `EnvironmentFile=`**：`secrets.env` 每一行
+    都有 `export ` 前綴，systemd 會把 `export LINE_CHANNEL_ACCESS_TOKEN` 整串
+    當成鍵名而解析失敗——那種失敗是安靜的，正好是這支腳本最不能有的性質。
+
+    讀不到就回空字典：憑證沒設定不該讓告警腳本自己爆掉，日誌與 DB 兩個管道
+    仍然要照常留下痕跡。
     """
-    return False
+    path = os.getenv("BFX_SECRETS_FILE") or os.path.expanduser(DEFAULT_SECRETS_FILE)
+    secrets = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                key, _, value = line.partition("=")
+                secrets[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    return secrets
+
+
+def send_line_push(message: str, level: str = "CRITICAL") -> bool:
+    """把告警推到 LINE（Messaging API push）。
+
+    **INFO 一律不推**：那是部署重啟造成的觸發（D023），單元其實好好的。
+    每次部署都推一則「告警」到手機，正是 B4 要消滅的那種假警報——
+    在修掉它的同一支腳本裡又用另一個管道犯一次，沒有道理。
+    日誌與 DB 仍然照常留痕，所以事後查得到。
+
+    與 `notify/line_messaging.py` 是**兩份獨立實作**，不共用程式碼：這支腳本
+    執行的時機正是「機器人壞掉」的時候，不能 import 專案模組、也不能依賴
+    `requests`（見模組 docstring 的設計選擇 1）。兩邊要一起改，都寫了這段說明。
+    """
+    if level == "INFO":
+        return False
+
+    secrets = load_secrets()
+    token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or secrets.get("LINE_CHANNEL_ACCESS_TOKEN")
+    to_user_id = os.getenv("LINE_TO_USER_ID") or secrets.get("LINE_TO_USER_ID")
+    if not token or not to_user_id:
+        return False
+
+    payload = json.dumps(
+        {"to": to_user_id, "messages": [{"type": "text", "text": message[:5000]}]}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/push",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status == 200
+    except urllib.error.HTTPError as exc:
+        # 只印狀態碼與 LINE 的說明，**絕不印出 token**
+        print(f"LINE 推播失敗：HTTP {exc.code} {exc.read()[:200]!r}", file=sys.stderr)
+        return False
+    except Exception as exc:  # noqa: BLE001 - 連線層問題不該讓告警腳本自己失敗
+        print(f"LINE 推播失敗（連線層）：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
 
 
 def main() -> int:
@@ -262,7 +330,7 @@ def main() -> int:
     for name, action in (
         ("日誌檔", lambda: bool(log_file) and append_to_log(log_file, message, level)),
         ("資料庫", lambda: bool(db_path) and record_in_database(db_path, message)),
-        ("LINE", lambda: send_line_push(message)),
+        ("LINE", lambda: send_line_push(message, level)),
     ):
         try:
             if action():

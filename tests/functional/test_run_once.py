@@ -123,9 +123,18 @@ class TestHappyPath:
         assert "掛出 3 筆掛單" in state["last_action"]
         assert "600.0 USD" in state["last_action"]
 
-    def test_sends_notification(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+    def test_routine_cycle_does_not_push_to_line(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """例行巡檢只寫日誌，不推 LINE（見 DECISIONS.md D024）。
+
+        LINE 免費方案每月 200 則，巡檢間隔 600 秒等於一天 144 輪——每輪推一則
+        不到兩天就把額度用光，之後真正的故障告警一則都送不出去。
+        這條測試就是釘住「不要再把例行事件接回通知管道」。
+        """
         run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)
-        assert len(fake_notifier.sent) == 1
+        assert fake_notifier.sent == []
+        assert any("本輪巡檢完成" in text for text in fake_logger.messages["info"])
 
     def test_logs_balance_and_frr(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)

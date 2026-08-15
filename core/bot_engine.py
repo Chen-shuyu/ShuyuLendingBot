@@ -33,9 +33,9 @@ class FailureTracker:
     只在「剛跨過門檻」與「剛恢復」這兩個時間點送出通知，中間持續失敗不再重送，
     避免交易所長時間異常時把通知管道洗版。
 
-    注意：通知目前走的 `LineNotifier` 因 LINE Notify 已停用而永遠回傳 False，
-    告警實際上只會留在日誌裡；待 `feature/m4-line-messaging` 改寫為
-    LINE Messaging API 後即自動生效。
+    「只在跨門檻與恢復時各送一次」這件事，在 LINE 接上之後從「避免洗版」
+    升級成硬性需求：免費方案每月只有 200 則，持續失敗若每輪都推，
+    額度會在故障期間被自己燒光（見 DECISIONS.md D024）。
     """
 
     def __init__(self, logger, notifier, repository, alert_after: int = 3):
@@ -143,7 +143,11 @@ class BotEngine:
             last_frr=frr,
             last_action=f"掛出 {len(plans)} 筆掛單，合計 {total_amount} USD",
         )
-        self.notifier.send("Bitfinex 放貸機器人已完成一輪巡檢。")
+        # 這裡刻意**不送 LINE**：例行巡檢結果只寫日誌。
+        # LINE 免費方案是每月 200 則，而巡檢間隔 600 秒等於一天 144 輪——
+        # 每輪推一則的話不到兩天就把整個月的額度用光，之後真正的故障告警
+        # 一則都送不出去（見 DECISIONS.md D024）。
+        self.logger.info(f"本輪巡檢完成：掛出 {len(plans)} 筆，合計 {total_amount} USD")
 
     def run_forever(self) -> int:
         """啟動檢查後進入常駐主迴圈，回傳離開碼。"""

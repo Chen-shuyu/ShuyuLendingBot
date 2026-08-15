@@ -13,7 +13,7 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
 
 ## Milestone
 
-- [ ] M1：修正致命問題 —— 讓現有雛型「正確」
+- [x] M1：修正致命問題 —— 讓現有雛型「正確」
   - 修正 `get_frr()` 誤用永續合約資金費率的問題，改抓 Bitfinex V2 `/v2/ticker/fUSD` 的真實 FRR
   - `main.py` 加入 `while True` 主迴圈 + `time.sleep(interval)` + 例外分類隔離
 - [x] M2：補策略與風控
@@ -28,7 +28,7 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
   - [x] `logger` 改用 `RotatingFileHandler`（固定檔名 + 大小輪替）
   - [x] 補 API Rate Limit 重試（`api/rate_limiter.py`，掛單刻意不套）、heartbeat
         （`bot_state.last_run_at`）與連續失敗告警（`FailureTracker`）
-- [ ] M4：架構重構、測試與部署（依 DECISIONS.md D015 拆成 3~4 條子分支，各自開 PR）
+- [x] M4：架構重構、測試與部署（依 DECISIONS.md D015 拆成 3~4 條子分支，各自開 PR）
   - [x] 依 [ARCHITECTURE.md](ARCHITECTURE.md) 完成 `config/api/strategies/core/db/notify/utils`
         分層搬遷（2026-08-15，分支 `refactor/m4-layering`，見 DECISIONS.md D021）
   - [x] 補齊 `tests/unit`、`tests/functional`、`tests/integration`，CI 真正跑得動
@@ -38,9 +38,10 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
         全部完成並實測生效（2026-08-01～02）。其中自動重啟與容器日誌兩項一度因 conmon
         被 CI job 殺掉而未生效，已於 2026-08-02 把容器生命週期改由 systemd --user 的
         Quadlet 單元管理後解決。仍在 dry-run 驗證階段，小額實單待使用者補 `secrets.env`
-  - 通知模組改寫為 LINE Messaging API push（取代已於 2025-03 停用的 LINE Notify）——
-    原列在 M1，2026-07-26 使用者指示改排到最後一步，待使用者申請好 LINE Developers
-    Channel 憑證後才實作／實測
+  - [x] 通知模組改寫為 LINE Messaging API push（取代已於 2025-03 停用的 LINE Notify）
+        （2026-08-15，分支 `feature/m4-line-messaging`，見 DECISIONS.md D024）。
+        兩條管道各實際送出一則測試訊息並確認送達；因免費方案每月 200 則，
+        例行巡檢改為只寫日誌、通知管道只送事件
 
 四個 milestone 依 [SHUYU_PROJECT_PLAN.md 附錄 B](../archive/SHUYU_PROJECT_PLAN.md) 的「第一步～第四步」
 一一對應，介面簽章、設定鍵名、邊界情況等實作規格以該附錄為準。
@@ -108,13 +109,25 @@ Python 2 / Bitfinex V1 API 版本，並補上主迴圈狀態機、Rate Limit 重
       不碰心跳）；容器 healthcheck 觀察期滿，以 `HealthOnFailure=kill` 接上 systemd 重啟。
       兩個實機對照實驗把「不健康 → 殺掉 → 重啟 → 放棄 → 告警」整條鏈驗過一次。
       測試 265 → 283 項。**兩輪盤查的六項缺陷至此全部清完**
-- [ ] `feature/m4-line-messaging`：LINE Messaging API —— 仍卡在使用者尚未申請
-      LINE Developers Channel 憑證，刻意排在最後一條
+- [x] **`feature/m4-line-messaging`（2026-08-15）**：LINE Messaging API 接上並實測送達，
+      見 DECISIONS.md D024。環境變數改名、`config.yaml` 的 `line.enabled` 開啟、
+      主機端告警腳本一併接上（INFO 不推）。**M4 至此全部完成**
 
-M4 目前的狀態：測試、部署、分層重構三條都已完成，**可靠性目標這次是真的達成了**
-（有對照實驗與正式容器實測佐證），CI 的迴歸防線也已從「看起來有」變成「真的擋得住」（D018）。
-兩輪盤查累積的六項缺陷（A1～A6、B1～B3）已全部清完。
+**M4 已全部完成（2026-08-15）**：測試、部署、分層重構、LINE 通知四條子分支都收尾。
+可靠性目標有對照實驗與正式容器實測佐證，CI 的迴歸防線已從「看起來有」變成
+「真的擋得住」（D018），兩輪盤查累積的六項缺陷（A1～A6、B1～B3）與後續的 B4 全部清完。
+通知管道兩條（主程式、systemd 失效告警）都已實測送達。
 
-**M4 只剩 `feature/m4-line-messaging` 一條，且沒有任何技術阻塞**——純粹等使用者申請
-LINE Developers Channel 憑證。小額實單剩下的前置條件同樣在使用者身上：補上 `secrets.env`，
-並確認 API Key 已禁止提現權限。
+## 下一步：小額真金測試
+
+四個 milestone 都完成之後，剩下的是從 dry-run 切到實單。**這一步的前置條件全部在使用者身上**：
+
+1. 到 Bitfinex 建立 API Key，**建立當下就把「提現（Withdraw）」權限關掉**
+   —— 金鑰外洩時這是唯一真正救得了資金的一條
+2. 把 `BFX_API_KEY` / `BFX_API_SECRET` 填進 `~/.config/bfx-lending-bot/secrets.env`
+   （LINE 兩個值已於 2026-08-15 填好並驗證）
+3. 決定起始金額與 `config.yaml` 的 `engine.dry_run: false` 切換時機
+
+技術面還沒做、但**不擋實單**的兩項（都在 TASKS.md，建議與實單一起做）：
+`maxtolend` 升級為含已放貸的真實總曝險版、`earnings_daily` 接上 Bitfinex ledger 資料來源
+——後者要有真實利息入帳才驗證得了，本來就該跟實單同期進行。

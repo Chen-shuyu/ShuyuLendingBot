@@ -796,3 +796,51 @@ PR #12 合併後由 CI 重新部署（容器建立於 21:25:27，非手動啟動
   依據是：那兩條分支的判斷順序與訊息字串**一字未改**，且各自有單元測試涵蓋。
   若日後要補這個實驗，做法見 D020 的兩個對照實驗。
 
+## D024 — LINE Messaging API 接上：額度決定了「什麼事件才配得上一則訊息」
+
+- 日期：2026-08-15
+- 背景：使用者申請好 LINE Developers Channel 並填入憑證，M4 最後一條分支
+  `feature/m4-line-messaging` 的阻塞解除。憑證先以三個唯讀端點驗過：token 有效
+  （官方帳號「Bitfinex貸款機器人」）、user ID 有效且已是好友、額度
+  `{"type": "limited", "value": 200}`。
+- 決策一：**這個管道只送事件，不送例行**。`BotEngine.run_once()` 結尾原本每輪
+  `notifier.send("已完成一輪巡檢")`，改為只寫日誌。
+  - 算式很直接：巡檢間隔 600 秒 = 一天 144 輪，而免費方案是**每月 200 則**。
+    照原樣接上去，**不到兩天就把整個月的額度用光**，之後真正的故障告警一則都送不出去。
+  - 這不是「調參數」能解的：任何合理的巡檢間隔都遠超過每月 200 則的預算。
+    要有例行摘要的話，正確做法是每日彙總一則（約 30 則/月），而那要等
+    `earnings_daily` 有資料來源才有意義（TASKS.md 既有項目）。
+  - `FailureTracker` 的「只在跨門檻與恢復時各送一次」因此從「避免洗版」升級為硬性需求：
+    持續失敗若每輪推一則，額度會在故障期間被自己燒光——**恰好在最需要通知的時候**。
+- 決策二：**維持兩份獨立實作，刻意不共用程式碼**。容器內 `notify/line_messaging.py`
+  用 `requests`；主機端 `scripts/notify_failure.py` 用標準函式庫的 `urllib`。
+  - 理由與 D020 相同：`notify_failure.py` 執行的時機正是機器人壞掉的時候，
+    它要報告的往往就是「容器本身已經不在了」，不能 import 專案模組或依賴第三方套件。
+  - 代價是兩邊要一起改，兩份 docstring 都寫了這件事。
+  - 附帶：`notify_failure.py` 自己讀 `secrets.env`（告警單元不會帶憑證進來）。
+    **刻意不用 systemd 的 `EnvironmentFile=`**——`secrets.env` 每行都有 `export ` 前綴，
+    systemd 會把 `export LINE_CHANNEL_ACCESS_TOKEN` 整串當成鍵名而解析失敗，
+    而那種失敗是安靜的。
+- 決策三：**INFO 等級不推 LINE**。D023 剛把「部署重啟送假 ERROR」修掉，
+  若又從 LINE 這個管道把同樣的東西推到手機，等於換個管道再犯一次。日誌與 DB 照常留痕。
+- 決策四：**舊的 `LINE_NOTIFY_TOKEN` / `LINE_NOTIFY_CHANNEL` 不做向後相容**，直接改名為
+  `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_TO_USER_ID`（設定鍵 `channel` → `to_user_id`）。
+  留著舊名只會讓人以為設了就有用，而 LINE Notify 的 token 對新端點必定是 401。
+- `send()` 永遠不拋例外（承 D019）：它出現在致命錯誤的退出路徑上，拋例外會蓋掉原始錯誤
+  與離開碼。所有失敗一律回傳 False 並記日誌，且**刻意不重試**——事件本身早已寫進日誌與 DB，
+  重試只會拖慢機器人結束的時間。HTTP 錯誤碼一律翻成人看得懂的原因（403 最常見的其實是
+  「對方不是好友」而不是權限設定）。
+- **踩到的坑：測試套件真的把訊息送出去了**。接上 Messaging API 後第一次跑 `pytest`，
+  `scripts/notify_failure.py` 的測試從 `~/.config/bfx-lending-bot/secrets.env` 讀到真金鑰，
+  **實際推了 6 則訊息到使用者手機**，也吃掉當月額度的 6 則。
+  - 失敗方式很安靜：測試照樣綠燈，只有手機會響。
+  - 修法寫在 `tests/conftest.py` 的 autouse fixture：所有測試一律清掉兩個 LINE 環境變數、
+    把 `BFX_SECRETS_FILE` 指到不存在的路徑，沒有憑證時兩邊都會在發出請求前回傳 False。
+    `test_notify_failure.py` 另外把 `urlopen` 換成「一呼叫就 AssertionError」當第二道保險。
+  - **刻意不做全域封鎖網路**：`tests/integration` 有 6 項刻意連 Bitfinex 公開 API 的
+    live 測試，那是它們的價值所在。
+- 驗證：312 項測試全過（283 → 312，新增 `tests/unit/test_line_messaging.py` 13 項與
+  告警腳本的 LINE／secrets 測試）；**兩條管道各實際送出一則測試訊息並確認送達**
+  （主程式路徑走 `load_secrets_from_disk` + `config.yaml` 的真實接線，
+  告警腳本路徑走主機端獨立實作），INFO 等級確認略過。
+

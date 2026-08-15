@@ -5,17 +5,16 @@
 
 ## 進行中
 
-**分支 `deploy/m4-secrets-hardening`（2026-08-15 開，從 main `2c3d74c`）**：
-金鑰檔位置與掛載方式定案，見 DECISIONS.md D022。金鑰唯一真實來源改為
-`~/.config/bfx-lending-bot/secrets.env`（目錄收緊為 700），Quadlet 改掛單一檔案。
-驗證重啟時發現 **B4**（部署重啟會觸發假的失效告警），依使用者指示併入本分支一起修掉，
-見 DECISIONS.md D023。測試 283 → 292 項。
+**分支 `feature/m4-line-messaging`（2026-08-15 開，從 main `c43d6e7`）**：
+LINE Messaging API 接上並實測送達，見 DECISIONS.md D024。**M4 四個 milestone 至此全部完成。**
+測試 292 → 312 項。連帶決定：例行巡檢不再推 LINE（免費方案每月 200 則，
+每輪推一則兩天就用光），通知管道只送事件。
 
-**M4 只剩 `feature/m4-line-messaging`**——被「使用者尚未申請 LINE Channel 憑證」卡住，
-沒有其他技術阻塞。小額實單的前置條件仍是使用者**把值填進**
-`~/.config/bfx-lending-bot/secrets.env`（檔案本身早就存在，內容是空殼樣板）。
+**下一步是小額真金測試**，前置條件全部在使用者身上（見下方「基礎建設待辦」）：
+Bitfinex API Key（**建立當下就關掉提現權限**）填進
+`~/.config/bfx-lending-bot/secrets.env`，以及決定起始金額與 `dry_run` 切換時機。
 
-（前一段：`refactor/m4-layering`，2026-08-15，分層搬遷完成，見 D021，行為零變動。）
+（前一段：`deploy/m4-secrets-hardening`，2026-08-15，金鑰掛載強化 D022 + B4 假告警修正 D023。）
 
 ## 🔴 下一步・最高優先
 
@@ -409,19 +408,26 @@
         檔案本身的去留仍待確認。注意勿與新增的
         `systemd/shuyu-lending-bot.container` 混淆——後者才是正式部署路線
 - [ ] 小額真金測試前，再次確認 API Key 權限已禁止「提現（Withdraw）」
-- [ ] **子分支 `feature/m4-line-messaging`**：改寫 `notify/line_messaging.py` 的內容，走 LINE Messaging API
-      （檔案位置已於 2026-08-15 的分層搬遷就位，只差內容） push
-      （取代已停用的 LINE Notify）—— 原列在 M1，2026-07-26 使用者指示改排到最後一步；
-      **被下方使用者端待辦卡住，尚無法實測**。一併注意 `config/settings.py` 讀的環境變數
-      名還是舊的 `LINE_NOTIFY_TOKEN`／`LINE_NOTIFY_CHANNEL`，要同步改成
-      `LINE_CHANNEL_ACCESS_TOKEN`／`LINE_TO_USER_ID`（2026-07-27 於 M3 發現）
+- [x] **子分支 `feature/m4-line-messaging`**（2026-08-15，見 DECISIONS.md D024）：
+      `notify/line_messaging.py` 改寫為 LINE Messaging API push、環境變數改名為
+      `LINE_CHANNEL_ACCESS_TOKEN`／`LINE_TO_USER_ID`（設定鍵 `channel` → `to_user_id`，
+      舊名刻意不做向後相容）、`config.yaml` 的 `line.enabled` 開啟、
+      `scripts/notify_failure.py` 的 LINE 管道接上（INFO 不推，見 D023）。
+      **兩條管道各實際送出一則測試訊息並確認送達。**
+      連帶決定：例行巡檢不再推 LINE（每月 200 則額度，每輪推一則兩天就用光），
+      改為只寫日誌。測試 292 → 312 項
 - [ ] 清理已合併完成的殘留分支：`fix/m1-frr-and-loop`、`feature/m2-strategy-and-risk`、
       `docs/sync-m2-branch-workflow`、`feature/roadmap-and-tests`（本地與遠端）
       （2026-07-27 使用者選擇先不處理）
 
 ## 基礎建設待辦（使用者端）
-- [ ] 申請 LINE Developers Channel，取得 `Channel Access Token` 與 `User ID`
-      （目前尚未申請，是 LINE 通知模組串接測試的前置阻塞項目）
+- [x] 申請 LINE Developers Channel，取得 `Channel Access Token` 與 `User ID`
+      （2026-08-15 完成並填入 `~/.config/bfx-lending-bot/secrets.env`；
+      已用三個唯讀端點驗過：token 有效、user ID 有效且已加好友、額度 200 則/月）
+- [ ] **小額實單前置**：到 Bitfinex 建立 API Key，**建立當下就關閉「提現（Withdraw）」權限**，
+      並把 `BFX_API_KEY`／`BFX_API_SECRET` 填進 `~/.config/bfx-lending-bot/secrets.env`
+      （目前兩個鍵都是空值，`dry_run: true` 下不影響運作）
+- [ ] 決定小額實單的起始金額，以及 `config.yaml` 的 `engine.dry_run` 何時切成 `false`
 
 ## 已完成
 - [x] 設定 git `user.name` / `user.email` 為 `Chen-shuyu` / `suyuchen322@gmail.com`

@@ -26,7 +26,7 @@ strategy:
 line:
   enabled: true
   token: "file-token"
-  channel: "file-channel"
+  to_user_id: "file-user-id"
 """
 
 
@@ -45,8 +45,8 @@ def clear_env(monkeypatch):
         "BFX_API_SECRET",
         "BFX_CONFIG",
         "BFX_SECRETS_FILE",
-        "LINE_NOTIFY_TOKEN",
-        "LINE_NOTIFY_CHANNEL",
+        "LINE_CHANNEL_ACCESS_TOKEN",
+        "LINE_TO_USER_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -92,10 +92,20 @@ class TestLoadConfig:
         assert load_config(str(config_file))["line"]["enabled"] is True
 
     def test_line_env_overrides_file(self, config_file, monkeypatch):
-        # 註：這兩個變數名還是 LINE Notify 時代的，M4 改走 Messaging API 時要一起換掉
-        monkeypatch.setenv("LINE_NOTIFY_TOKEN", "env-token")
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "env-token")
+        monkeypatch.setenv("LINE_TO_USER_ID", "U-env")
         config = load_config(str(config_file))
         assert config["line"]["token"] == "env-token"
+        assert config["line"]["to_user_id"] == "U-env"
+
+    def test_old_line_notify_names_are_not_honoured(self, config_file, monkeypatch):
+        """LINE Notify 已於 2025-03 停用，舊變數名刻意不做向後相容。
+
+        留著舊名只會讓人以為設了就有用，而舊 token 對新端點必定是 401。
+        """
+        monkeypatch.setenv("LINE_NOTIFY_TOKEN", "old-token")
+        config = load_config(str(config_file))
+        assert config["line"]["token"] == "file-token"
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):

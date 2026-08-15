@@ -6,7 +6,7 @@
 單獨判斷天期（高利率鎖長天期、低利率保持靈活）。
 """
 
-import math
+from decimal import Decimal
 from typing import List
 
 from strategies.base import OfferPlan, Strategy
@@ -74,13 +74,23 @@ class FrrPlusStrategy(Strategy):
         return count
 
     def _split_amount(self, lendable_usd: float, count: int) -> List[float]:
-        """把總金額均分成 count 筆；除不盡的餘數併入利率最低、最容易成交的第一筆。"""
-        # 向下取到分位，確保各筆加總不會因四捨五入超過可用餘額而被交易所拒絕。
-        per_offer = math.floor(lendable_usd / count * 100) / 100
-        amounts = [per_offer] * count
-        remainder = round(lendable_usd - per_offer * count, 2)
-        if remainder > 0:
-            amounts[0] = round(amounts[0] + remainder, 2)
+        """把總金額均分成 count 筆；除不盡的餘數併入利率最低、最容易成交的第一筆。
+
+        **全程向下取到分位**：各筆加總必須 `<=` 可用餘額，多一分錢，交易所就會以
+        `Invalid offer: not enough USD balance available in deposit wallet`
+        拒絕**整筆**掛單。這在 dry-run 下永遠看不出來——沒有人驗證金額。
+        """
+        # 全程以「整數分」計算，理由有兩個：
+        # 1. 截斷成分位就保證加總 <= 餘額。原本的寫法先 floor 每筆、再用 `round()`
+        #    處理餘數，等於把 floor 抵銷掉——0.0086 被進位成 0.01，總額就超出了。
+        #    2026-08-15 首次實單即因此被拒：餘額 160.00861413，卻掛出 160.01。
+        # 2. 純浮點運算會少掉一分錢：`500.0 - 166.66 * 3` 實際算出的是
+        #    0.019999999999953，向下取分位就變成 0.01。`Decimal(str(x))` 沒有這個問題。
+        total_cents = int(Decimal(str(lendable_usd)) * 100)  # int() 截斷 = 向下取分位
+        per_cents, remainder_cents = divmod(total_cents, count)
+        amounts = [per_cents / 100] * count
+        if remainder_cents:
+            amounts[0] = (per_cents + remainder_cents) / 100
         return amounts
 
     def _resolve_duration(self, rate: float) -> int:

@@ -683,3 +683,26 @@
 - **M4 四個 milestone 至此全部完成**。下一步是小額真金測試，前置條件全部在使用者身上：
   Bitfinex API Key（建立當下就關掉提現權限）、起始金額、`dry_run` 切換時機
 
+
+## 2026-08-15（續）—— 首次實單：被拒單、找到金額四捨五入的 bug（分支 `fix/offer-amount-exceeds-balance`）
+
+- PR #19（LINE）、#20（go-live）依指定順序合併，main 前進到 `b9abf94`，CI 部署完成
+- **第一輪實單巡檢**：連線 ✅ → 取消 0 筆 ✅ → 餘額 160.00861413 ✅ →
+  FRR 0.00032288767 ✅ → 掛單 **被拒**：
+  `Invalid offer: not enough USD balance available in deposit wallet`
+- **可靠性鏈按設計運作**：判為 `FatalError` → 離開碼 2 → `RestartPreventExitStatus=2`
+  不重啟（避免無限迴圈燒錢）→ 停在 `failed` → `OnFailure=` 送出 CRITICAL 告警。
+  事後查證 **0 筆掛單、0 筆已借出、餘額分毫未動**，資金零損失
+- 根因見 DECISIONS.md D025：`_split_amount()` 先 floor 每筆、卻用 `round()` 處理餘數，
+  `round(0.00861413, 2)` 進位成 0.01，總額 160.01 超出餘額 160.00861413
+- 修法改用**整數分**運算（`Decimal(str(x))` 轉分、`divmod` 分配）。
+  第一版只把 `round` 換成 `floor`，結果 `500.0 - 166.66*3 = 0.019999999999953`
+  少算一分錢、弄壞三條既有測試——金額運算不該碰浮點誤差
+- **測試設計的教訓**：`test_total_never_exceeds_balance` 斷言的正是這個性質、而且一直綠燈，
+  但輸入全是小數點後兩位的「漂亮數字」，**那種輸入不可能違反該性質**。
+  真實餘額有 8 位小數。已把真實值加進輸入集並補一條指名事故的迴歸測試，
+  且先還原舊實作反證過兩條新測試確實會失敗
+- 測試 312 → 313 項
+- 新增 TASKS.md **B5**：ccxt 把餘額不足歸類成 `AuthenticationError`，日誌寫「認證失敗」，
+  會把人引去查金鑰而不是查金額
+- 下一步：合併後 CI 部署會自動 `reset-failed` 並重啟，屆時確認第一筆真單掛出

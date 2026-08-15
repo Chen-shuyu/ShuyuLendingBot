@@ -54,9 +54,19 @@ class TestProjectConfig:
         for section in ("bitfinex", "strategy", "engine", "database", "retry", "logging", "line"):
             assert section in config, f"config.yaml 缺少 {section} 區段"
 
-    def test_ships_with_dry_run_enabled(self, config):
-        """版控裡的設定檔必須是 dry-run，避免有人 clone 下來直接跑成實單。"""
-        assert config["engine"]["dry_run"] is True
+    def test_dry_run_flag_matches_the_deliberate_choice(self, config):
+        """`dry_run` 的當下預期值是 `False`（2026-08-15 起小額實單）。
+
+        這條原本釘的是「必須是 True」，理由是「避免有人 clone 下來直接跑成實單」。
+        但這個專案的 `config.yaml` **就是正式部署的設定**（打包進映像、不是掛載進去），
+        上線本來就要改它——那條規則等於永遠擋著上線，遲早會被當成雜訊直接改掉。
+
+        改成釘住「當下刻意選定的值」：要防的不是實單本身，而是**沒有人注意到它被改了**。
+        不論哪個方向的變動，都會在這裡當場失敗，逼人一起改測試、順便留下紀錄。
+
+        真正不能進版控的是金鑰，那由下面的 `test_ships_without_credentials` 守住。
+        """
+        assert config["engine"]["dry_run"] is False
 
     def test_ships_without_credentials(self, config, monkeypatch):
         monkeypatch.delenv("BFX_API_KEY", raising=False)

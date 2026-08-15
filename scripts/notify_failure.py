@@ -11,7 +11,7 @@
 分別在已重啟 0、1、2 次時）。設計這支腳本時原本以為重試中途屬於
 `auto-restart` 狀態不會觸發，**實驗證明那是錯的**，見 DECISIONS.md D020。
 
-因此腳本必須自己分辨兩種情況，並且**永遠留下痕跡、不做靜音**：
+因此腳本必須自己分辨三種情況，並且**永遠留下痕跡、不做靜音**：
 
 - **已放棄**（`ActiveState=failed`）：可能是 30 分鐘內啟動次數用盡
   （`StartLimitBurst=4`），也可能是以 `EXIT_FATAL`（離開碼 2）退出而被
@@ -19,9 +19,23 @@
   訊息寫 CRITICAL、要求人工介入。
 - **重試中**（`ActiveState=activating` / `SubState=auto-restart`）：
   訊息寫 ERROR、說明 systemd 正在重試第幾次。
+- **當下正常**（`ActiveState=active` / `SubState=running`）：等 2 秒再查時單元
+  已經在跑了。最常見的來源是**部署或手動 `systemctl restart`**——停掉舊容器
+  那一刻會短暫觸發 `OnFailure=`（TASKS.md B4）。訊息寫 INFO（`NRestarts=0`）
+  或 WARNING（`NRestarts>0`，代表確實失敗過但已自動恢復），都不要求人工介入。
 
-不做靜音是刻意的：兩者的代價不對稱。多送一則「正在重試」的訊息只是稍微吵，
-漏掉那則「已經放棄」的訊息卻等於整個 B2 白做。
+第三種是後來補的。原本只有前兩種，`active/running` 沒有對應分支就落進「重試中」
+的 else，於是**每次部署都送出一則「機器人啟動失敗」的 ERROR**，而單元其實好好的
+（實際發生三次，時間都正好是重啟時刻）。這種假警報比漏報更陰險：它會訓練人
+忽略這個管道，等到哪天推的是真的「已放棄」，看起來會跟前面幾十則一模一樣。
+
+注意 `NRestarts` 是累計值，只有 `systemctl reset-failed` 會清零（CI 的 deploy job
+每次部署前都會清）。所以「昨天崩過、今天部署」理論上會被歸到 WARNING 那一支——
+訊息內容仍然誠實（它確實重啟過 N 次），只是稍微保守，可以接受。
+
+不做靜音是刻意的：三者的代價不對稱。多送一則「正在重試」或「已恢復」只是稍微吵，
+漏掉那則「已經放棄」卻等於整個 B2 白做。所以第三種降級為 INFO／WARNING、
+但**仍然寫進日誌與 DB**，不是靜音。
 
 **設計上的三個刻意選擇**：
 
@@ -87,19 +101,47 @@ def collect_unit_state(unit: str) -> dict:
     return state
 
 
-def has_given_up(state: dict) -> bool:
-    """systemd 是不是已經放棄、不會再自動重啟了。
+# classify() 的三種回傳值。刻意加 STATE_ 前綴：測試檔已經用 GAVE_UP／RETRYING
+# 這兩個名字當「狀態字典」的樣本，同名會讓人讀錯。
+STATE_GAVE_UP = "gave_up"
+STATE_RETRYING = "retrying"
+STATE_RUNNING_NOW = "running_now"
+
+
+def classify(state: dict) -> str:
+    """把單元當下的狀態歸成三種之一（見模組 docstring）。
 
     判斷依據是「現在還會不會再起來」而不是「這次失敗嚴不嚴重」：
-    `activating` / `auto-restart` 代表下一次重啟已經排定，`failed` 才是真的停了。
+    `activating` / `auto-restart` 代表下一次重啟已經排定、`active` / `running`
+    代表它已經起來了、`failed` 才是真的停了。
     問不到狀態時**一律當成已放棄**——寧可多喊一次狼來了，也不要在機器人真的
     死掉時因為查不到狀態而靜悄悄放過。
+
+    順序很重要：先判 `auto-restart`，再判 `running`，最後才落到 `failed`。
+    反過來寫的話，重啟途中短暫的 `active` 會被誤判成「已恢復」。
     """
     if not state:
-        return True
+        return STATE_GAVE_UP
     if state.get("SubState") == "auto-restart":
-        return False
-    return state.get("ActiveState", "failed") == "failed"
+        return STATE_RETRYING
+    if state.get("ActiveState") == "active" and state.get("SubState") == "running":
+        return STATE_RUNNING_NOW
+    if state.get("ActiveState", "failed") == "failed":
+        return STATE_GAVE_UP
+    return STATE_RETRYING
+
+
+def has_given_up(state: dict) -> bool:
+    """systemd 是不是已經放棄、不會再自動重啟了。"""
+    return classify(state) == STATE_GAVE_UP
+
+
+def _restart_count(state: dict) -> int:
+    """`NRestarts` 轉成整數；問不到或不是數字時當成 0（只影響訊息措辭）。"""
+    try:
+        return int(state.get("NRestarts", "0"))
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_message(unit: str, state: dict) -> str:
@@ -112,25 +154,46 @@ def build_message(unit: str, state: dict) -> str:
         f"{label}={state[key]}" for key, label in UNIT_PROPERTIES.items() if key in state
     )
 
-    if has_given_up(state):
+    outcome = classify(state)
+    if outcome == STATE_GAVE_UP:
         message = (
             f"Bitfinex 放貸機器人已停止且 systemd 不會再自動重啟（單元 {unit} 停在 failed）。"
             "請人工介入：先看 `systemctl --user status` 與日誌確認原因，"
             "排除後以 `systemctl --user reset-failed` 清掉計數再啟動。"
         )
-    else:
+    elif outcome == STATE_RETRYING:
         restarts = state.get("NRestarts", "?")
         message = (
             f"Bitfinex 放貸機器人啟動失敗，systemd 正在自動重試（單元 {unit}，"
             f"已重啟 {restarts} 次）。次數用盡後會停在 failed 並再送一次告警。"
+        )
+    elif _restart_count(state) > 0:
+        message = (
+            f"Bitfinex 放貸機器人曾經失敗，但已自動恢復（單元 {unit} 目前 active/running，"
+            f"已重啟 {state.get('NRestarts', '?')} 次）。不需人工介入，"
+            "但建議查日誌確認當時的失敗原因。"
+        )
+    else:
+        message = (
+            f"告警被觸發，但單元 {unit} 目前正常運作中（active/running，尚未重啟過）。"
+            "多半是部署或手動重啟過程中的短暫觸發，不需人工介入。"
         )
 
     return f"{message} 單元狀態：{details}" if details else message
 
 
 def log_level(state: dict) -> str:
-    """已放棄用 CRITICAL、重試中用 ERROR，讓日誌可以直接依嚴重度過濾。"""
-    return "CRITICAL" if has_given_up(state) else "ERROR"
+    """已放棄 CRITICAL、重試中 ERROR、當下正常 INFO／WARNING。
+
+    這樣分是為了讓 `grep ERROR` 保持有意義——部署重啟造成的觸發若也寫成 ERROR，
+    真正的故障就會淹沒在假警報裡（TASKS.md B4）。
+    """
+    outcome = classify(state)
+    if outcome == STATE_GAVE_UP:
+        return "CRITICAL"
+    if outcome == STATE_RETRYING:
+        return "ERROR"
+    return "WARNING" if _restart_count(state) > 0 else "INFO"
 
 
 def append_to_log(log_file: str, message: str, level: str = "CRITICAL") -> bool:

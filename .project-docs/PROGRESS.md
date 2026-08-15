@@ -591,3 +591,59 @@
 - 下一步：M4 只剩 `feature/m4-line-messaging`，仍卡在使用者尚未申請 LINE Channel 憑證；
   小額實單的前置條件仍是使用者補上 `secrets.env`
 
+## 2026-08-15（續）—— 金鑰檔位置與掛載強化（分支 `deploy/m4-secrets-hardening`）
+
+- 起因是使用者問「`secrets.env` 到底放哪裡最安全、要不要用 root 建立」。盤點後
+  發現兩件事：**家目錄那份其實早就存在**（07-12 建立，權限 600 正確，但四個鍵都是空值），
+  而 Quadlet 掛的是**整個部署目錄**——進容器一看，`/run/secrets` 底下躺著
+  `data/` 與 `logs/`，等於把完整交易紀錄放在一個叫「secrets」的目錄裡給容器讀
+- 先界定威脅面再設計：`uid>=1000` 的一般使用者只有 `shuyu` 一個，root 本來就讀得到一切，
+  所以「同機他人偷讀」實質不存在。真正該防的是誤入版控、容器被入侵後的橫向取得、
+  備份誤打包——決策依這三項排（見 DECISIONS.md D022）
+- 三項決策：金鑰唯一真實來源定為 `~/.config/bfx-lending-bot/secrets.env`（在 `/workspace`
+  之外，結構上碰不到版控；且與本機直跑 `main.py` 讀同一份）、Quadlet 改掛**單一檔案**、
+  金鑰一律走檔案不走 `Environment=`（後者會讓金鑰同時出現在單元檔／`podman inspect`／
+  `systemctl show`／`/proc/<pid>/environ` 四個地方）
+- 明確不採用的兩個選項也寫進 D022：`podman secret`（會多出第二個真實來源，
+  而預設驅動的實質保護沒有比 600 的檔案好）、root 擁有金鑰檔（rootless 下容器根本讀不到，
+  安全性也沒提升）
+- 補一道 `ExecStartPre=/usr/bin/test -f`：掛單一檔案時來源不存在的話，podman 會自己
+  建一個同名目錄頂替，程式開檔噴 `IsADirectoryError`——錯誤訊息離真正原因太遠，
+  寧可當場失敗（同 `Pull=never` 的理由）
+- `chmod 700 ~/.config/bfx-lending-bot`（原本 755；上層 `.config` 是 700，所以實際上
+  一直擋得住，但不該依賴上層）
+- 驗證：`quadlet -dryrun` 確認產生的 `podman run` 帶單一檔案的 `-v` 且無錯誤 →
+  安裝單元、`daemon-reload`、重啟 → 服務 `active`、容器 5 秒內回到 `healthy` →
+  容器內 `/run/secrets` 只剩 `secrets.env`（`data/`、`logs/` 已消失）→
+  日誌全文搜尋金鑰樣式 0 筆 → 283 項測試維持全過
+- 順帶釐清一個容易誤會的現象：容器內 `/run/secrets` 還有 `rhsm/`、`redhat.repo`、
+  `etc-pki-entitlement/`，那是 **podman 在 RHEL 上預設注入的訂閱憑證**，
+  與本專案的掛載無關
+- **驗證重啟時抓到一個既有缺陷（B4）**：重啟會觸發一則假的「機器人啟動失敗」ERROR 告警。
+  查日誌發現同樣的訊息在 08-09 22:57 與 08-15 17:26 也各有一筆，**三次都正好是重啟時刻**，
+  所以不是本次改壞的。根因是 `notify_failure.py` 只分辨「重試中」與「已放棄」兩種狀態，
+  重啟後單元回到 `active/running` 這第三種狀態沒有分支，落進了「重試中」的 else。
+  LINE 接上之後每次部署都會推一則假警報到手機，實單前要修，已記為 TASKS.md B4
+- 依使用者指示，B4 併入本分支一起修（見下段）
+
+## 2026-08-15（續）—— B4：失效告警改三分法（同分支 `deploy/m4-secrets-hardening`）
+
+- `notify_failure.py` 新增 `classify()`，把二分法改成三分法；第三種
+  `active/running` 依 `NRestarts` 給 INFO（0 次，部署重啟造成的觸發）或
+  WARNING（>0 次，確實失敗過但已恢復）。判斷順序刻意先問 `auto-restart`，
+  否則重啟途中短暫的 `active` 會被誤判成「已恢復」（見 DECISIONS.md D023）
+- 保留 `has_given_up()`（改成呼叫 `classify()`），既有 18 項測試一行沒改就全過
+  ——這本身就是「兩條既有路徑沒被改壞」的證據
+- 測試 283 → 292 項（新增 9 項：三分法各狀態、順序衝突、非數字 `NRestarts`、
+  兩種新訊息的措辭與等級）
+- **先反證再驗收**：用舊邏輯對同一份 `active/running` 狀態跑一次，確認它確實判成
+  ERROR「啟動失敗」，證明新測試不是套套邏輯
+- **實機驗證**：把新版腳本安裝到 `~/.local/share/shuyu-lending-bot/` 後重啟正式服務，
+  日誌那一行從 `ERROR 放貸機器人啟動失敗` 變成
+  `INFO 告警被觸發，但單元目前正常運作中`，服務 `active`、容器 `healthy`、機器人未中斷
+- **驗證範圍的已知缺口（誠實記錄）**：原本要照 D020 起拋棄式單元實測
+  「重試中 → 已放棄」兩條路徑，使用者當下不希望在 `~/.config/systemd/user/` 放實驗檔，
+  故未做（已建的那個實驗檔當場刪除，目錄恢復原狀）。使用者選擇以單元測試
+  ＋「兩條分支字串未動」作為證據直接提交
+- 下一步：M4 仍只剩 `feature/m4-line-messaging`，等使用者申請 LINE Channel 憑證
+

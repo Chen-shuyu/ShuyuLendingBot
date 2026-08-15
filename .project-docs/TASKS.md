@@ -5,16 +5,56 @@
 
 ## 進行中
 
-**分支 `refactor/m4-layering`（2026-08-15 開，從 main `b844d49`）**：
-分層搬遷已完成，見 DECISIONS.md D021。行為零變動，283 項測試維持全過。
+**分支 `deploy/m4-secrets-hardening`（2026-08-15 開，從 main `2c3d74c`）**：
+金鑰檔位置與掛載方式定案，見 DECISIONS.md D022。金鑰唯一真實來源改為
+`~/.config/bfx-lending-bot/secrets.env`（目錄收緊為 700），Quadlet 改掛單一檔案。
+驗證重啟時發現 **B4**（部署重啟會觸發假的失效告警），依使用者指示併入本分支一起修掉，
+見 DECISIONS.md D023。測試 283 → 292 項。
 
 **M4 只剩 `feature/m4-line-messaging`**——被「使用者尚未申請 LINE Channel 憑證」卡住，
-沒有其他技術阻塞。小額實單的前置條件仍是使用者補上 `secrets.env`。
+沒有其他技術阻塞。小額實單的前置條件仍是使用者**把值填進**
+`~/.config/bfx-lending-bot/secrets.env`（檔案本身早就存在，內容是空殼樣板）。
 
-（前一段：`deploy/m4-failure-alert`，2026-08-09，B2 與 A6 完成，見 D020，
-測試 265 → 283 項；兩輪盤查累積的六項缺陷 A1～A6、B1～B3 至此全部清完。）
+（前一段：`refactor/m4-layering`，2026-08-15，分層搬遷完成，見 D021，行為零變動。）
 
 ## 🔴 下一步・最高優先
+
+### 2026-08-15 發現：部署重啟會觸發假的失效告警
+
+- [x] **B4：每次 `systemctl --user restart`（含每一次 CI 部署）都會送出一則
+      「機器人啟動失敗」的 ERROR 告警，但單元其實好好的**
+      —— **已於 2026-08-15 完成**（分支 `deploy/m4-secrets-hardening`，見 DECISIONS.md D023）。
+      `notify_failure.py` 的二分法改成三分法（新增 `classify()`），第三種
+      `active/running` 依 `NRestarts` 給 INFO／WARNING。測試 283 → 292 項。
+      實機重啟驗證：同一則訊息從 `ERROR 啟動失敗` 變成
+      `INFO 告警被觸發，但單元目前正常運作中`，服務與容器全程正常。
+      **驗證範圍的已知缺口**：沒有像 D020 那樣起拋棄式單元實測「重試中 → 已放棄」
+      兩條路徑（使用者當下不希望在 `~/.config/systemd/user/` 放實驗檔）。
+      依據是那兩條分支的判斷順序與訊息字串一字未改、且各有單元測試涵蓋。
+      以下為原始診斷紀錄，保留備查。
+  - **現象**：日誌裡有三筆完全相同的 ERROR，時間點分別是 2026-08-09 22:57、
+    08-15 17:26、08-15 18:40——**三次都正好是重啟服務的時刻**（最後一次是本次
+    D022 的驗證重啟）。訊息說「systemd 正在自動重試」，但同一行附帶的單元狀態是
+    `失敗結果=success、最後離開碼=0、已重啟次數=0、目前狀態=active、細部狀態=running`
+    ——**六個欄位全都說它是好的**。
+  - **根因**：`OnFailure=` 在重啟過程中會被短暫觸發（停掉舊容器那一刻），
+    但 `scripts/notify_failure.py` 的 `has_given_up()` 只分辨兩種狀態：
+    `SubState=auto-restart` → 重試中、`ActiveState=failed` → 已放棄。
+    重啟情境下等 2 秒再查時，單元早已回到 `active/running`——**這是第三種狀態，
+    而它沒有對應的分支**，於是落進「重試中」的 else，送出 ERROR。
+  - **不是這次改壞的**：08-09 那筆遠早於本分支，當時是 D020 自己的驗證重啟。
+    D020 的「寧可吵也不要漏」原則讓這件事沒被當成問題，但它每次部署都會發生。
+  - **為什麼實單前要修**：`feature/m4-line-messaging` 一旦接上，**每次部署都會推一則
+    「機器人啟動失敗」到手機**。這正是訓練人忽略告警的典型模式——等到哪天推的是
+    真的「已放棄」，那則訊息看起來會跟前面幾十則假警報一模一樣。
+  - **建議修法（很小）**：在 `has_given_up()` 之外補第三種判斷——
+    `ActiveState=active` 且 `SubState=running` 時，代表單元當下是好的，
+    多半是部署重啟造成的觸發。依 D020「不做靜音」的原則仍要留痕跡，
+    但等級降為 INFO／WARNING、訊息改寫成「告警觸發但單元目前正常，無需人工介入」，
+    這樣 `grep ERROR` 才會重新變得有意義。
+  - **驗收方式**：改完後 `systemctl --user restart shuyu-lending-bot.service`，
+    日誌應只出現 INFO／WARNING 那一則；再用 D020 的失敗實驗確認真正的
+    「重試中」與「已放棄」兩條路徑訊息不變。
 
 ### 2026-08-02 部署盤查發現的問題（PR #10 合併後驗收，依建議處理順序排列）
 
@@ -321,8 +361,12 @@
       - [x] 修正部署一直失敗的主機端目錄問題（2026-08-01）：podman 的 bind mount 不會
             自動建立主機端目錄，`.../ShuyuLendingBot/data` 從未存在，deploy job 自 M3
             加上該 volume 起每次都以 exit code 125 失敗。workflow 補 `mkdir -p` 一步
-      - [ ] 補 `secrets.env` 到部署目錄（`/workspace/deploy/active-bots/ShuyuLendingBot/`）。
-            目前該檔不存在，`dry_run: true` 下不影響，**實單前必須補上**（使用者端待辦）
+      - [ ] 把值填進 `~/.config/bfx-lending-bot/secrets.env`（使用者端待辦）。
+            **位置已於 2026-08-15 定案改為家目錄，不再放部署目錄**（見 DECISIONS.md D022）：
+            檔案本身早在 07-12 就建好且權限正確（目錄 700／檔案 600），但四個鍵都是空值。
+            `dry_run: true` 下不影響運作，**實單前必須填上**。填的時候一併把鍵名從
+            `LINE_NOTIFY_TOKEN`／`LINE_NOTIFY_CHANNEL` 改成
+            `LINE_CHANNEL_ACCESS_TOKEN`／`LINE_TO_USER_ID`（配合 `feature/m4-line-messaging`）
       - [x] `podman logs` 取不到內容：改用 `--log-driver=k8s-file`（含 `max-size=10mb`），
             CI 的「取得最近容器日誌」改讀掛載出來的 `logs/bfx_lending_bot.log`
             （2026-08-02，分支 `deploy/m4-podman-hardening`）。

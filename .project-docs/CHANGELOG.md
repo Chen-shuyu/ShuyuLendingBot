@@ -1,6 +1,21 @@
 # CHANGELOG
 
 ## [Unreleased]
+
+### 2026-08-15：M4 完成並切換為小額真金運作
+- LINE Messaging API push 接上，取代 2025-03 停用的 LINE Notify（D024）。
+  環境變數改為 `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_TO_USER_ID`。
+  **例行巡檢不再推 LINE**——免費方案每月 200 則，每輪推一則兩天就用光
+- 金鑰檔唯一真實來源改為 `~/.config/bfx-lending-bot/secrets.env`，
+  Quadlet 改為唯讀掛載**單一檔案**而非整個部署目錄（D022）
+- systemd 失效告警改三分法，修掉「每次部署都送假 ERROR」（D023）
+- `engine.dry_run` 切為 `false`，以 160 USD 起始，曝險由融資錢包餘額鎖住
+- **修正**：掛單金額四捨五入後超出可用餘額，被交易所拒單（D025）。
+  `_split_amount()` 改用整數分運算
+- **修正**：取消掛單時 id 未轉整數導致 `id: invalid`，且失敗被吞掉不觸發任何告警（D026）。
+  改為「查到掛單卻一筆都取消不掉」時拋 `RetryableError`
+- 測試 283 → 315 項
+
 ### Added
 - `.project-docs/` 專案文件結構（PLAN/PROGRESS/DECISIONS/TASKS/CHANGELOG/ARCHITECTURE），
   取代原本散落根目錄的 `PRD.md`／`SHUYU_PROJECT_PLAN.md`（已歸檔至 `archive/`）

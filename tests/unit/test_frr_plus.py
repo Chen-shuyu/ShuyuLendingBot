@@ -114,12 +114,37 @@ class TestAmountSplit:
         assert amounts == [200.0, 200.0, 200.0]
 
     def test_total_never_exceeds_balance(self, strategy_config):
-        """加總超過可用餘額會被交易所直接拒單，這是最不能破的一條。"""
+        """加總超過可用餘額會被交易所直接拒單，這是最不能破的一條。
+
+        2026-08-15 修正：這條原本只餵「漂亮的」餘額（小數點後至多兩位），
+        而那種輸入**在數學上不可能違反這個性質**——floor 與 round 的結果一致。
+        真實的 Bitfinex 餘額有 8 位小數，首次實單就因此被拒單。
+        **斷言一直是對的，是輸入挑得太乾淨。**
+        """
         strategy = FrrPlusStrategy(strategy_config())
-        for balance in (150.0, 344.12, 500.0, 777.77, 1000.01, 12345.67):
+        balances = (
+            150.0, 344.12, 500.0, 777.77, 1000.01, 12345.67,      # 原本的「漂亮」值
+            160.00861413,       # 首次實單的真實餘額
+            344.30861413, 461.23456789, 150.005, 999.999, 150.00999999,
+        )
+        for balance in balances:
             plans = strategy.build_offer_plan(balance, 0.0002)
             total = round(sum(plan.amount for plan in plans), 2)
             assert total <= balance, f"餘額 {balance} 拆出的總額 {total} 超出可用餘額"
+
+    def test_regression_first_live_offer_was_rejected(self, strategy_config):
+        """2026-08-15 首次實單的迴歸測試。
+
+        餘額 160.00861413，程式卻掛出 160.01，Bitfinex 以
+        `Invalid offer: not enough USD balance available in deposit wallet`
+        拒絕整筆。根因是餘數用 `round()` 把 0.0086 進位成 0.01，
+        抵銷掉前一行刻意做的 floor。
+        """
+        strategy = FrrPlusStrategy(strategy_config(min_required_usd=150, min_loan_size_usd=150))
+        plans = strategy.build_offer_plan(160.00861413, 0.00032288767123287674)
+        assert len(plans) == 1
+        assert plans[0].amount == 160.00
+        assert plans[0].amount <= 160.00861413
 
     def test_amounts_are_rounded_to_cents(self, strategy_config):
         strategy = FrrPlusStrategy(strategy_config())

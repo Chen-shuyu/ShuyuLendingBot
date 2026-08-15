@@ -18,6 +18,27 @@ Bitfinex API Key（**建立當下就關掉提現權限**）填進
 
 ## 🔴 下一步・最高優先
 
+### 2026-08-15 首次實單發現
+
+- [x] **首次實單被拒單：掛單金額四捨五入後超出可用餘額**
+      —— **已於 2026-08-15 修正**（分支 `fix/offer-amount-exceeds-balance`，見 DECISIONS.md D025）。
+      `_split_amount()` 改用整數分運算。連帶修正測試輸入：既有的
+      `test_total_never_exceeds_balance` 斷言正確卻只餵「漂亮數字」，
+      那種輸入在數學上不可能違反該性質。資金零損失。
+- [ ] **B5：ccxt 把「餘額不足」歸類成 `AuthenticationError`，日誌寫成「認證失敗」**
+  - **現象**：Bitfinex 回的是
+    `Invalid offer: not enough USD balance available in deposit wallet`（金額問題），
+    但 ccxt 丟出 `ccxt.AuthenticationError`，於是 `create_loan_offer()` 走到
+    `except ccxt.AuthenticationError` 那一支，日誌寫「建立放貸掛單認證失敗」。
+  - **影響**：訊息把人引去查 API 金鑰權限，而真正的問題在掛單金額——
+    半夜看到這則告警會往完全錯誤的方向查。分類為 `FatalError` 導致機器人**永久停止**
+    也偏嚴厲：餘額問題下一輪可能就自己好了（例如有人剛把錢轉走又轉回來）。
+  - **建議修法**：在 `api/bitfinex_client.py` 的 `create_loan_offer()` 裡，
+    先看錯誤訊息內容再決定分類——訊息含 `not enough` / `balance` 之類字樣時，
+    歸為 `SkipCycleError`（本輪略過、下一輪重算金額）而不是 `FatalError`，
+    日誌也要寫成「餘額不足」而不是「認證失敗」。
+    真正的認證問題（金鑰無效、權限不足）才維持 `FatalError`。
+  - **不急**：金額 bug 修掉之後，這條路徑在正常情況下不會再被觸發。
 ### 2026-08-15 發現：部署重啟會觸發假的失效告警
 
 - [x] **B4：每次 `systemctl --user restart`（含每一次 CI 部署）都會送出一則

@@ -152,7 +152,11 @@ class BitfinexClient(ExchangeClient):
         for offer in offers:
             # Bitfinex V2 funding offer 陣列欄位：0=ID, 1=SYMBOL, 4=AMOUNT, 14=RATE, 15=PERIOD
             # https://docs.bitfinex.com/reference/rest-auth-funding-offers
-            offer_id = offer[0]
+            # **id 一定要轉回整數**：ccxt 對這個 implicit 端點回傳的每個欄位都是
+            # 字串（實測 `'5081103121'`），而 Bitfinex 的取消端點只收整數，
+            # 收到字串會回 `id: invalid`。2026-08-15 實單踩到，見 DECISIONS.md D026。
+            # 下面 amount/rate/period 早就有轉型，唯獨要送回 API 的這個漏了。
+            offer_id = int(offer[0])
             offer_info = {
                 "id": offer_id,
                 "symbol": offer[1],
@@ -168,6 +172,18 @@ class BitfinexClient(ExchangeClient):
                 self.logger.error(f"取消掛單 {offer_id} 失敗：{exc}")
                 continue
             cancelled.append(offer_info)
+
+        # 查到掛單卻一筆都取消不掉 = 「每輪全取消重掛」整個策略失效，必須讓它變成
+        # 看得見的失敗。原本這裡只記 ERROR 就往下走，於是本輪仍算成功：
+        # 連續失敗計數不動、不會告警、心跳照常、健康檢查照樣綠燈——
+        # **機器人看起來一切正常，實際上已經停止更新掛單利率**（2026-08-15 實單踩到，
+        # 連續兩輪沒有人發現，見 DECISIONS.md D026）。
+        # 用 RetryableError 而不是 FatalError：多半是暫時性的，下一輪重試合理，
+        # 連續達門檻時 FailureTracker 會送出告警。
+        if offers and not cancelled:
+            raise RetryableError(
+                f"查到 {len(offers)} 筆未成交掛單，但一筆都取消不掉，本輪不掛新單"
+            )
 
         self.logger.info(f"已取消 {len(cancelled)} 筆未成交放貸掛單。")
         return cancelled

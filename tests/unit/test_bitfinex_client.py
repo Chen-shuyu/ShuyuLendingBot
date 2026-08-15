@@ -21,12 +21,20 @@ FUNDING_OFFER_FIELDS = 16
 
 
 def make_offer_array(offer_id=101, symbol="fUSD", amount=200.0, rate=0.0004, period=2):
+    """模擬 ccxt 回傳的 funding offer 陣列。
+
+    **每個數值欄位都是字串**——實測 ccxt 對這個 implicit 端點回傳的就是
+    `'5081103121'`、`'160'`、`'0.000523'`、`'2'`，不是數字。
+    這個替身原本回傳原生型別，比真實 API「乾淨」，於是漏掉了「取消時 id 必須
+    轉回整數」這個 bug：實單下每一輪都取消失敗（2026-08-15，見 DECISIONS.md D026）。
+    替身要像真的，不然測試只是在驗證另一個世界。
+    """
     offer = [None] * FUNDING_OFFER_FIELDS
-    offer[0] = offer_id
+    offer[0] = str(offer_id)
     offer[1] = symbol
-    offer[4] = amount
-    offer[14] = rate
-    offer[15] = period
+    offer[4] = str(amount)
+    offer[14] = str(rate)
+    offer[15] = str(period)
     return offer
 
 
@@ -226,6 +234,38 @@ class TestCancelActiveOffers:
         assert [item["id"] for item in cancelled] == [101, 102]
         cancel_calls = [c for c in exchange.calls if c[0].endswith("offer_cancel")]
         assert [c[1] for c in cancel_calls] == [{"id": 101}, {"id": 102}]
+        # 送回 API 的 id 必須是 int：Bitfinex 收到字串會回 `id: invalid`（D026）
+        assert all(isinstance(call[1]["id"], int) for call in cancel_calls)
+
+    def test_all_cancels_failing_is_surfaced_as_failure(self, make_client):
+        """查到掛單卻一筆都取消不掉，必須讓主迴圈知道。
+
+        原本這裡只記 ERROR 就往下走，本輪仍算成功——連續失敗計數不動、不告警、
+        心跳照常更新、健康檢查綠燈。**機器人看起來完全正常，實際上已經停止更新
+        掛單利率**，2026-08-15 實單下連續兩輪沒有任何人發現（D026）。
+        """
+        exchange = FakeExchange(
+            private_post_auth_r_funding_offers_symbol=[make_offer_array(101)],
+            private_post_auth_w_funding_offer_cancel=ccxt.ExchangeError("id: invalid"),
+        )
+        with pytest.raises(RetryableError, match="一筆都取消不掉"):
+            make_client(exchange).cancel_active_offers("USD")
+
+    def test_partial_cancel_still_returns_the_successful_ones(self, make_client):
+        """部分成功不算失敗：取消得掉的照樣回報，下一輪再處理剩下的。"""
+        def cancel(params):
+            if params["id"] == 101:
+                raise ccxt.ExchangeError("id: invalid")
+            return {}
+
+        exchange = FakeExchange(
+            private_post_auth_r_funding_offers_symbol=[
+                make_offer_array(101), make_offer_array(102)
+            ],
+            private_post_auth_w_funding_offer_cancel=cancel,
+        )
+        cancelled = make_client(exchange).cancel_active_offers("USD")
+        assert [item["id"] for item in cancelled] == [102]
 
     def test_parses_offer_fields(self, make_client):
         exchange = FakeExchange(
@@ -310,9 +350,11 @@ class TestCreateLoanOffer:
         exchange = FakeExchange(
             private_post_auth_w_funding_offer_submit=make_submit_response(offer)
         )
+        # id 維持交易所回傳的字串：ccxt 對這個端點每個欄位都是字串，而 DB 的
+        # offer_id 欄位本來就是 TEXT。需要轉成整數的只有取消端點（見 D026）。
         assert make_client(exchange).create_loan_offer("USD", 200.0, 0.0004, 2) == {
             "status": "submitted",
-            "id": 555,
+            "id": "555",
             "symbol": "fUSD",
             "amount": 200.0,
             "rate": 0.00045,

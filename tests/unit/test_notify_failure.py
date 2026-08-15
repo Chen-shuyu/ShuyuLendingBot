@@ -17,6 +17,17 @@ from scripts import notify_failure
 
 GAVE_UP = {"ActiveState": "failed", "SubState": "failed", "NRestarts": "4"}
 RETRYING = {"ActiveState": "activating", "SubState": "auto-restart", "NRestarts": "1"}
+# 部署／手動 `systemctl restart` 造成的觸發：等 2 秒再查時單元已經在跑了。
+# 這正是實際發生三次的假警報（TASKS.md B4），六個欄位全都說單元是好的。
+RESTARTED = {
+    "Result": "success",
+    "ExecMainStatus": "0",
+    "NRestarts": "0",
+    "ActiveState": "active",
+    "SubState": "running",
+}
+# 真的失敗過、但在查詢前就已經被 systemd 拉回來了
+RECOVERED = dict(RESTARTED, NRestarts="2")
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +53,32 @@ class TestHasGivenUp:
         # 寧可多喊一次狼來了，也不要在機器人真的死掉時因為查不到狀態而靜悄悄放過
         assert notify_failure.has_given_up({}) is True
 
+    def test_running_unit_is_neither_given_up_nor_retrying(self):
+        # B4：這是原本缺的第三種狀態，它以前落進「重試中」的 else
+        assert notify_failure.has_given_up(RESTARTED) is False
+        assert notify_failure.classify(RESTARTED) == notify_failure.STATE_RUNNING_NOW
+
+
+class TestClassifyThreeStates:
+    """三種狀態各自對應一種處置，順序不能顛倒（見 `classify()` docstring）。"""
+
+    def test_gave_up(self):
+        assert notify_failure.classify(GAVE_UP) == notify_failure.STATE_GAVE_UP
+
+    def test_retrying(self):
+        assert notify_failure.classify(RETRYING) == notify_failure.STATE_RETRYING
+
+    def test_running_now(self):
+        assert notify_failure.classify(RESTARTED) == notify_failure.STATE_RUNNING_NOW
+
+    def test_auto_restart_wins_over_active(self):
+        # 重啟途中若同時出現 active 與 auto-restart，必須判成「重試中」而非「已恢復」
+        mixed = {"ActiveState": "active", "SubState": "auto-restart", "NRestarts": "1"}
+        assert notify_failure.classify(mixed) == notify_failure.STATE_RETRYING
+
+    def test_missing_state_still_means_gave_up(self):
+        assert notify_failure.classify({}) == notify_failure.STATE_GAVE_UP
+
 
 class TestBuildMessage:
     def test_given_up_message_asks_for_intervention(self):
@@ -59,6 +96,28 @@ class TestBuildMessage:
         assert "不會再自動重啟" not in message
         assert "已重啟 1 次" in message
         assert notify_failure.log_level(RETRYING) == "ERROR"
+
+    def test_restart_trigger_does_not_claim_a_failure(self):
+        # B4 的核心：單元好好的時候，訊息不可以說「啟動失敗」，等級也不可以是 ERROR
+        message = notify_failure.build_message("shuyu-lending-bot.service", RESTARTED)
+        assert "啟動失敗" not in message
+        assert "不會再自動重啟" not in message
+        assert "正常運作中" in message
+        assert "不需人工介入" in message
+        assert notify_failure.log_level(RESTARTED) == "INFO"
+
+    def test_recovered_unit_is_reported_as_warning(self):
+        # 確實重啟過，就不能講成「什麼事都沒發生」——但也還不到要人半夜爬起來
+        message = notify_failure.build_message("shuyu-lending-bot.service", RECOVERED)
+        assert "已自動恢復" in message
+        assert "已重啟 2 次" in message
+        assert "不需人工介入" in message
+        assert notify_failure.log_level(RECOVERED) == "WARNING"
+
+    def test_non_numeric_restart_count_falls_back_to_info(self):
+        # NRestarts 問不到時不該讓腳本自己爆掉
+        odd = dict(RESTARTED, NRestarts="")
+        assert notify_failure.log_level(odd) == "INFO"
 
     def test_unit_state_is_appended_when_available(self):
         message = notify_failure.build_message(

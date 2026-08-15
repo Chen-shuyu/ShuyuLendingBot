@@ -624,5 +624,26 @@
   所以不是本次改壞的。根因是 `notify_failure.py` 只分辨「重試中」與「已放棄」兩種狀態，
   重啟後單元回到 `active/running` 這第三種狀態沒有分支，落進了「重試中」的 else。
   LINE 接上之後每次部署都會推一則假警報到手機，實單前要修，已記為 TASKS.md B4
-- 下一步：等使用者決定 B4 是否併入本分支；M4 仍只剩 `feature/m4-line-messaging`
+- 依使用者指示，B4 併入本分支一起修（見下段）
+
+## 2026-08-15（續）—— B4：失效告警改三分法（同分支 `deploy/m4-secrets-hardening`）
+
+- `notify_failure.py` 新增 `classify()`，把二分法改成三分法；第三種
+  `active/running` 依 `NRestarts` 給 INFO（0 次，部署重啟造成的觸發）或
+  WARNING（>0 次，確實失敗過但已恢復）。判斷順序刻意先問 `auto-restart`，
+  否則重啟途中短暫的 `active` 會被誤判成「已恢復」（見 DECISIONS.md D023）
+- 保留 `has_given_up()`（改成呼叫 `classify()`），既有 18 項測試一行沒改就全過
+  ——這本身就是「兩條既有路徑沒被改壞」的證據
+- 測試 283 → 292 項（新增 9 項：三分法各狀態、順序衝突、非數字 `NRestarts`、
+  兩種新訊息的措辭與等級）
+- **先反證再驗收**：用舊邏輯對同一份 `active/running` 狀態跑一次，確認它確實判成
+  ERROR「啟動失敗」，證明新測試不是套套邏輯
+- **實機驗證**：把新版腳本安裝到 `~/.local/share/shuyu-lending-bot/` 後重啟正式服務，
+  日誌那一行從 `ERROR 放貸機器人啟動失敗` 變成
+  `INFO 告警被觸發，但單元目前正常運作中`，服務 `active`、容器 `healthy`、機器人未中斷
+- **驗證範圍的已知缺口（誠實記錄）**：原本要照 D020 起拋棄式單元實測
+  「重試中 → 已放棄」兩條路徑，使用者當下不希望在 `~/.config/systemd/user/` 放實驗檔，
+  故未做（已建的那個實驗檔當場刪除，目錄恢復原狀）。使用者選擇以單元測試
+  ＋「兩條分支字串未動」作為證據直接提交
+- 下一步：M4 仍只剩 `feature/m4-line-messaging`，等使用者申請 LINE Channel 憑證
 

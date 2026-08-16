@@ -54,6 +54,7 @@ LINE 免費方案每月 200 則，例行巡檢結果只寫日誌（D024）。
 一定會想把它們合併。
 """
 
+from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
 
 from utils import clock
@@ -106,8 +107,13 @@ def format_rate(rate: float) -> str:
 
     只給日利率看不出划不划算（0.000273 是高是低？），只給年化又對不上交易所畫面上
     的數字，所以兩個一起寫。
+
+    **小數位數要 8 位，不能只給 6 位**：這個市場的價差就落在第 7、8 位上。
+    2026-08-16 夜間的掛單實際利率是 0.00014999，六位小數會顯示成 `0.000150`
+    ——與那道害我們排錯位置的 182 萬 USD 的牆看起來一模一樣，
+    通知與日誌因此都看不出兩者的差別（D033）。
     """
-    return f"{rate:.6f}/日（年化 {rate * DAYS_PER_YEAR * 100:.2f}%）"
+    return f"{rate:.8f}/日（年化 {rate * DAYS_PER_YEAR * 100:.2f}%）"
 
 
 def format_amount(amount: float, currency: str = "USD") -> str:
@@ -318,17 +324,83 @@ def positions_opened(positions: Iterable[Any], balance_usd: Optional[float] = No
     return build(CATEGORY_TRADE, "資金已借出（成交）", fields)
 
 
+def _format_duration(hours: float) -> str:
+    """把小時數寫成人看得懂的長度。"""
+    if hours < 1:
+        return f"{hours * 60:.0f} 分鐘"
+    if hours < 24:
+        return f"{int(hours)} 小時 {int(round((hours - int(hours)) * 60))} 分"
+    days, rest = divmod(hours, 24)
+    return f"{int(days)} 天 {int(rest)} 小時"
+
+
+def _closed_detail(positions: list) -> Dict[str, Any]:
+    """算出這筆借出實際持續多久、是不是提前還款、大約收了多少利息。
+
+    **為什麼要多算這幾個欄位**：Bitfinex 的「天期」是**上限不是保證**，借款人
+    隨時可以提前還。2026-08-16 那筆掛 2 天、實際只借了 1 小時 50 分就還了，
+    而原本的訊息只寫「借出的資金已收回」——使用者看不出那是一次提前還款，
+    也看不出這段時間到底賺了多少。
+
+    只在**單筆**時計算：多筆同時收回時各自的時間不同，硬要合成一個數字只會誤導。
+    `opened_at` 缺漏或格式不對就整組略過——訊息少幾行沒關係，寫錯數字才糟。
+    """
+    if len(positions) != 1:
+        return {}
+
+    position = positions[0]
+    opened_raw = position.get("opened_at") if hasattr(position, "get") else None
+    if not opened_raw:
+        return {}
+    try:
+        opened = datetime.fromisoformat(str(opened_raw))
+    except (TypeError, ValueError):
+        return {}
+
+    now = clock.now()
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=now.tzinfo)
+    hours = (now - opened).total_seconds() / 3600
+    if hours < 0:
+        return {}
+
+    try:
+        amount = float(position["amount"])
+        rate = float(position["rate"])
+        period = int(position["period"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+
+    fields: Dict[str, Any] = {"實際借出": _format_duration(hours)}
+    # 抓 1% 的餘裕：到期還款也不會分秒不差地落在整數天上。
+    if hours < period * 24 * 0.99:
+        fields["結清方式"] = f"借款人提前還款（原訂最長 {period} 天）"
+    else:
+        fields["結清方式"] = f"借滿 {period} 天到期"
+    # 毛利估算：利息按實際借出時間比例計算，Bitfinex 另收利息的手續費，
+    # 所以這裡標明是毛額，不要讓人拿它去對帳。
+    fields["利息（毛估）"] = f"{amount * rate * hours / 24:.4f} USD"
+    return fields
+
+
 def positions_closed(positions: Iterable[Any], balance_usd: Optional[float] = None) -> str:
     """借出的資金已還回來（到期或提前結清）。
 
     值得推一則：錢回到融資錢包代表**下一輪就會重新掛單**，而重新掛單就是重新定價。
     使用者若想在這個時間點調整策略，這是唯一的時機。
     """
+    positions = list(positions)
+    detail = _closed_detail(positions)
     fields = _describe_positions(positions)
+    fields.update(detail)
     if balance_usd is not None:
         fields["目前可放貸"] = format_amount(balance_usd)
     fields["後續"] = "下一輪會重新掛單"
-    return build(CATEGORY_TRADE, "借出的資金已收回", fields)
+
+    title = "借出的資金已收回"
+    if str(detail.get("結清方式", "")).startswith("借款人提前還款"):
+        title = "借款人提前還款，資金已收回"
+    return build(CATEGORY_TRADE, title, fields)
 
 
 def offer_failed(plan: Any, reason: str, retryable: bool = True) -> str:

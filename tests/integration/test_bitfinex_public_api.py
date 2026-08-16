@@ -16,6 +16,7 @@ import ccxt
 import pytest
 
 from api.bitfinex_client import BitfinexClient
+from tests.conftest import FakeLogger
 from utils.exceptions import RetryableError
 
 pytestmark = pytest.mark.live
@@ -108,3 +109,55 @@ class TestUnsupportedCurrencyIsHandled:
             pass  # 兩種分類都是可接受的結果，重點是沒有 ccxt 例外漏出來
         except (ccxt.NetworkError, OSError) as exc:
             pytest.skip(f"連不上 Bitfinex 公開端點，略過：{exc}")
+
+
+@pytest.fixture(scope="module")
+def trades():
+    """近期成交只打一次就好，所以用 module 級，也因此不用函式級的 `fake_logger`。"""
+    client = BitfinexClient({}, FakeLogger(), dry_run=True)
+    try:
+        return client.get_recent_trades("USD", limit=200)
+    except (RetryableError, OSError) as exc:
+        pytest.skip(f"連不上 Bitfinex 公開端點，略過連線測試：{exc}")
+
+
+class TestRecentTradesContract:
+    """守住 `get_recent_trades()` 依賴的回應格式（D033）。
+
+    這支端點是成交價下限的唯一資料來源，而下限正是「不要用半價把錢借出去」
+    的那道防線。欄位索引一旦飄掉，策略會安靜地退回只看訂單簿的行為——
+    那正是 2026-08-16 夜間虧錢的那個版本。
+    """
+
+    def test_returns_something(self, trades):
+        assert trades
+
+    def test_fields_have_the_expected_types(self, trades):
+        trade = trades[0]
+        assert isinstance(trade["mts"], int)
+        assert isinstance(trade["amount"], float)
+        assert isinstance(trade["rate"], float)
+        assert isinstance(trade["period"], int)
+
+    def test_rates_are_plausible_daily_rates(self, trades):
+        """抓到的必須是日利率，不是年化、也不是價格。"""
+        assert all(FRR_LOWER_BOUND < trade["rate"] < FRR_UPPER_BOUND for trade in trades)
+
+    def test_amounts_are_positive(self, trades):
+        """來源資料的正負號只表示吃單方向，`get_recent_trades()` 要負責去掉。"""
+        assert all(trade["amount"] > 0 for trade in trades)
+
+    def test_periods_are_real_funding_terms(self, trades):
+        """天期是 2～120 這種真實放貸天期，抓錯欄位（例如抓到金額）一定超出範圍。"""
+        assert all(2 <= trade["period"] <= 120 for trade in trades)
+
+    def test_sorted_ascending_by_time(self, trades):
+        assert [trade["mts"] for trade in trades] == sorted(trade["mts"] for trade in trades)
+
+    def test_the_sample_is_wide_enough_to_bucket(self, trades):
+        """常態成交價要分桶算，樣本橫跨的時間太短就分不出桶（min_trade_buckets）。
+
+        200 筆在爆發時段可能只涵蓋幾分鐘——這條不是要求時間長度，
+        而是釘住「回應真的帶了會變動的時間戳」，全部同一毫秒代表欄位抓錯了。
+        """
+        assert len({trade["mts"] for trade in trades}) > 1

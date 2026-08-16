@@ -76,6 +76,8 @@ ccxt 對每個交易所都會依官方 REST 端點路徑自動產生一組「imp
 |---|---|---|
 | `public_get_ticker_symbol` | `GET /v2/ticker/{symbol}` | 公開 |
 | `public_get_funding_stats_symbol_hist` | `GET /v2/funding/stats/{symbol}/hist` | 公開 |
+| `public_get_book_symbol_precision` | `GET /v2/book/{symbol}/{precision}` | 公開 |
+| `public_get_trades_symbol_hist` | `GET /v2/trades/{symbol}/hist` | 公開 |
 | `private_post_auth_r_wallets` | `POST /v2/auth/r/wallets` | 私有 |
 | `private_post_auth_r_wallets_hist` | `POST /v2/auth/r/wallets/hist` | 私有 |
 | `private_post_auth_r_funding_offers` | `POST /v2/auth/r/funding/offers` | 私有 |

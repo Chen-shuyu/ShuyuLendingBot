@@ -136,13 +136,15 @@ class BotEngine:
             raise SkipCycleError("FRR 無效（None 或非正值），跳過本輪，避免用錯誤利率掛單")
 
         book = self._fetch_book()
+        trades = self._fetch_trades()
+        self._log_market_rate(trades)
 
         # 掛在場上的錢也是我們的錢。只看 `get_available_balance()` 的話，單子一掛出去
         # 餘額就變成 0，策略會以為沒錢可放而回傳空計畫——於是每一輪都在「取消才有錢、
         # 有錢才算得出計畫」之間打轉，等於強迫自己每輪都重掛。
         committed_usd = sum(float(offer["amount"]) for offer in existing)
         disposable_usd = balance_usd + committed_usd
-        plans = self.strategy.build_offer_plan(disposable_usd, frr, book)
+        plans = self.strategy.build_offer_plan(disposable_usd, frr, book, trades)
 
         if not plans:
             if existing:
@@ -188,7 +190,7 @@ class BotEngine:
             # 那是估計值，而掛單金額只要多一分錢，交易所就會拒絕整筆（D025）。
             balance_usd = self.client.get_available_balance("USD")
             self.logger.info(f"取消後可用 USD 餘額：{balance_usd}")
-            plans = self.strategy.build_offer_plan(balance_usd, frr, book)
+            plans = self.strategy.build_offer_plan(balance_usd, frr, book, trades)
             if not plans:
                 self.repository.save_state(
                     last_frr=frr, last_action="取消後可放貸金額不足，本輪沒有重掛"
@@ -284,6 +286,33 @@ class BotEngine:
         if not book:
             self.logger.warning("市場深度查詢回傳空清單，本輪將沒有掛單計畫。")
         return book
+
+    def _fetch_trades(self):
+        """取得近期成交紀錄；策略用不到就不打這個端點（同 `_fetch_book()` 的理由）。"""
+        if not getattr(self.strategy, "requires_trades", False):
+            return None
+        # 抓幾筆由策略決定：太少會涵蓋不到足夠時間而算不出常態成交價
+        # （實測 1000 筆在活躍時段只有 1.2 分鐘），策略才知道自己要多少。
+        trades = self.client.get_recent_trades("USD", limit=getattr(self.strategy, "trade_limit", 10_000))
+        if not trades:
+            self.logger.warning("近期成交查詢回傳空清單，本輪將沒有掛單計畫。")
+        return trades
+
+    def _log_market_rate(self, trades) -> None:
+        """把「借款人現在實際付多少」寫進日誌，與掛單利率對照。
+
+        沒有這一行，2026-08-16 夜間那次事故在日誌上完全看不出異常：機器人只寫了
+        「掛出 344.30 USD，利率 0.000150」，而當時市場成交價是 0.00026——
+        **日誌裡沒有任何一個數字能讓人看出這個價位是半價**（D033）。
+        """
+        market_rate = getattr(self.strategy, "market_rate", None)
+        if market_rate is None or not trades:
+            return
+        rate = market_rate(trades)
+        if rate is None:
+            self.logger.warning("近期成交樣本不足，無法算出常態成交價，本輪不掛單。")
+            return
+        self.logger.info(f"市場常態成交價：{rate:.8f}/日（年化 {rate * 365 * 100:.2f}%）")
 
     def _log_queue_position(self, book, plans) -> None:
         """把「掛在這個價位時前面排了多少錢」寫進日誌，同天期與全天期各一份。

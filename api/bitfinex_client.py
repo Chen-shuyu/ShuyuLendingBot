@@ -177,6 +177,53 @@ class BitfinexClient(ExchangeClient):
         levels.sort(key=lambda level: level["rate"])
         return levels
 
+    # 純讀取且冪等，可安全重試。
+    @with_retry()
+    def get_recent_trades(self, currency: str, limit: int = 10_000) -> List[Dict[str, Any]]:
+        """取得放貸市場的近期成交紀錄（公開端點，不需簽章）。
+
+        **為什麼定價非要有這一份資料**：訂單簿只講「有人願意用什麼價錢把錢借出去」，
+        它講不出「借款人實際付了多少」。兩者可以差非常多——2026-08-16 夜間的實例是
+        簿子最底端出現一道 **182 萬 USD 掛在 0.00015**，而同一小時的實際成交中位數
+        是 0.00029（年化 10.6%）。只看簿子的策略會一路跟著那道牆把自己的報價砍半，
+        而那道牆代表的只是某一個人願意賤賣，不是市場的價格（見 DECISIONS.md D033）。
+
+        回傳依時間**升冪**排序，每筆含 `mts`（毫秒）／`amount`（一律取正）／
+        `rate`／`period`。方向不分：借款人付的價錢就是成交價，兩邊看到的是同一個數字。
+        """
+        exchange = self._public_exchange()
+        symbol = f"f{currency}"
+        try:
+            # /v2/trades/{symbol}/hist
+            rows = exchange.public_get_trades_symbol_hist({"symbol": symbol, "limit": limit})
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢 {symbol} 近期成交逾時或超過速率限制：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise RetryableError(f"查詢 {symbol} 近期成交時交易所回傳錯誤：{exc}") from exc
+
+        trades: List[Dict[str, Any]] = []
+        try:
+            for row in rows:
+                # [0]=ID, [1]=MTS, [2]=AMOUNT, [3]=RATE, [4]=PERIOD；**欄位可能是字串**
+                # （掛單簿實測就是這樣，見 `get_funding_book`），所以一律自己轉型（D027）。
+                rate = float(row[3])
+                if rate <= 0:
+                    continue
+                trades.append(
+                    {
+                        "mts": int(row[1]),
+                        # 正負號在成交紀錄裡表示的是吃單方向，對「成交價是多少」沒有影響。
+                        "amount": abs(float(row[2])),
+                        "rate": rate,
+                        "period": int(row[4]),
+                    }
+                )
+        except (IndexError, ValueError, TypeError) as exc:
+            raise RetryableError(f"無法解析 {symbol} 近期成交回應：{exc}") from exc
+
+        trades.sort(key=lambda trade: trade["mts"])
+        return trades
+
     @with_retry()
     def get_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """查詢場上未成交的放貸掛單（唯讀，不取消任何東西）。"""

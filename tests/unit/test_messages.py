@@ -6,9 +6,12 @@
 因為格式壞掉的代價是「手機上分不出哪則要處理」，而那不會有人回報給我們。
 """
 
+from datetime import timedelta
+
 from strategies.base import OfferPlan
 
 from notify import messages
+from utils import clock
 
 
 def plan(amount=160.0, rate=0.000273, duration=2, currency="USD"):
@@ -186,9 +189,16 @@ class TestPositionEvents:
         text = messages.positions_opened([self.position(amount=160.0, rate=0.00025, period=2)])
 
         assert "160.00 USD" in text
-        assert "0.000250/日" in text
+        # 八位小數，不是六位：這個市場的價差就落在第 7、8 位上，六位會把
+        # 0.00014999 顯示成 0.000150——與害我們排錯位置的那道牆看起來一模一樣（D033）。
+        assert "0.00025000/日" in text
         assert "年化 9.12%" in text
         assert "2 天" in text
+
+    def test_rate_keeps_the_digits_that_actually_differ(self):
+        text = messages.positions_opened([self.position(rate=0.00014999)])
+
+        assert "0.00014999/日" in text
 
     def test_opened_can_report_remaining_balance(self):
         text = messages.positions_opened([self.position()], balance_usd=184.12)
@@ -217,6 +227,61 @@ class TestPositionEvents:
         """收回的部位是從 DB 讀回來的，欄位型別可能是字串——不該因此炸掉。"""
         row = {"id": "1", "amount": "160.0", "rate": "0.00025", "period": "2"}
         assert "160.00 USD" in messages.positions_closed([row])
+
+
+class TestClosedPositionDetail:
+    """收回時要看得出「是提前還款還是到期」以及賺了多少。
+
+    Bitfinex 的天期是**上限不是保證**：2026-08-16 那筆掛 2 天、實際只借 1 小時 50 分
+    就被還了，而原訊息只寫「借出的資金已收回」——使用者看不出那是一次提前還款。
+    """
+
+    @staticmethod
+    def position(hours_ago, amount=344.30, rate=0.00025, period=2):
+        opened = clock.now() - timedelta(hours=hours_ago)
+        return {
+            "id": "1",
+            "amount": amount,
+            "rate": rate,
+            "period": period,
+            "opened_at": opened.isoformat(),
+        }
+
+    def test_early_repayment_is_said_in_the_first_line(self):
+        text = messages.positions_closed([self.position(hours_ago=1.85)])
+
+        assert "提前還款" in text.splitlines()[0]
+        assert "原訂最長 2 天" in text
+
+    def test_reports_how_long_the_money_was_actually_out(self):
+        text = messages.positions_closed([self.position(hours_ago=1.85)])
+
+        assert "實際借出：1 小時 51 分" in text
+
+    def test_estimates_the_interest_earned(self):
+        text = messages.positions_closed([self.position(hours_ago=24, amount=344.30)])
+
+        # 344.30 × 0.00025 × 1 天 = 0.0861 USD
+        assert "0.0861 USD" in text
+
+    def test_full_term_is_not_called_early_repayment(self):
+        text = messages.positions_closed([self.position(hours_ago=48)])
+
+        assert "提前還款" not in text
+        assert "借滿 2 天到期" in text
+
+    def test_missing_opened_at_just_omits_the_detail(self):
+        """欄位缺漏時少幾行沒關係，寫錯數字才糟。"""
+        text = messages.positions_closed([{"id": "1", "amount": 1.0, "rate": 0.0002, "period": 2}])
+
+        assert "實際借出" not in text
+        assert "收回" in text
+
+    def test_multiple_positions_skip_the_detail(self):
+        """各自的借出時間不同，硬合成一個數字只會誤導。"""
+        text = messages.positions_closed([self.position(hours_ago=1), self.position(hours_ago=40)])
+
+        assert "實際借出" not in text
 
 
 class TestOffersGoneAfterFillDetection:

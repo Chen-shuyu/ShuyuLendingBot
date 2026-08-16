@@ -52,6 +52,7 @@ class FakeClient:
         active_offers=None,
         positions=None,
         book=None,
+        trades=None,
     ):
         self.balance = balance
         self.frr = frr
@@ -65,6 +66,7 @@ class FakeClient:
         self.positions = list(positions) if positions else []
         self.position_calls = 0
         self.book = list(book) if book else []
+        self.trades = list(trades) if trades else []
 
     def cancel_active_offers(self, currency):
         self.cancel_calls += 1
@@ -85,6 +87,9 @@ class FakeClient:
 
     def get_funding_book(self, currency):
         return list(self.book)
+
+    def get_recent_trades(self, currency, limit=1000):
+        return list(self.trades)
 
     def get_available_balance(self, currency):
         return self.balance
@@ -690,3 +695,111 @@ class TestFillDetection:
 
         assert client.position_calls == 1
         assert client.cancel_calls == 1
+
+
+class TestMarketDataReachesTheStrategy:
+    """成交資料要真的送到策略手上，而且要在日誌留下對照（D033）。
+
+    2026-08-16 夜間那次事故在日誌上完全看不出異常：機器人只寫了
+    「掛出 344.30 USD，利率 0.000150」，而當時借款人實際付的是 0.00026。
+    日誌裡沒有任何一個數字能讓人看出那是半價。
+    """
+
+    @staticmethod
+    def market_trades(rate=0.00025, count=60):
+        """同天期等額成交，金額加權中位數就是 `rate`。
+
+        筆數要過 `min_trade_samples`，否則測到的是「樣本不足所以不掛」那條出口。
+        """
+        base = 1_786_879_800_000
+        offsets = (-0.000002, 0.0, 0.000002)
+        return [
+            {
+                "mts": base + index * 15_000,
+                "amount": 25_000.0,
+                "rate": rate + offsets[index % 3],
+                "period": 2,
+            }
+            for index in range(count)
+        ]
+
+    def test_trades_are_fetched_and_handed_to_the_strategy(self, fake_logger, fake_notifier,
+                                                           repository, no_sleep):
+        from strategies.orderbook_depth import OrderBookDepthStrategy
+
+        strategy = OrderBookDepthStrategy(
+            {"strategy": {"spread_count": 1, "target_queue_usd": 1_000_000}}
+        )
+        client = FakeClient(
+            balance=344.30,
+            frr=0.0002,
+            book=[{"rate": 0.00025, "period": 2, "amount": 500_000.0}],
+            trades=self.market_trades(),
+        )
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert len(client.offers) == 1
+        _, _, rate, _ = client.offers[0]
+        assert rate == 0.00025
+
+    def test_market_rate_is_written_to_the_log(self, fake_logger, fake_notifier,
+                                               repository, no_sleep):
+        from strategies.orderbook_depth import OrderBookDepthStrategy
+
+        strategy = OrderBookDepthStrategy(
+            {"strategy": {"spread_count": 1, "target_queue_usd": 1_000_000}}
+        )
+        client = FakeClient(
+            balance=344.30,
+            frr=0.0002,
+            book=[{"rate": 0.00025, "period": 2, "amount": 500_000.0}],
+            trades=self.market_trades(),
+        )
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert any("市場常態成交價" in line for line in fake_logger.messages["info"])
+
+    def test_no_trades_means_no_offer_even_with_a_healthy_book(self, fake_logger, fake_notifier,
+                                                               repository, no_sleep):
+        """看不見成交價就不掛——那正是這次事故發生時唯一擋得住它的條件。"""
+        from strategies.orderbook_depth import OrderBookDepthStrategy
+
+        strategy = OrderBookDepthStrategy(
+            {"strategy": {"spread_count": 1, "target_queue_usd": 1_000_000}}
+        )
+        client = FakeClient(
+            balance=344.30,
+            frr=0.0002,
+            book=[{"rate": 0.00025, "period": 2, "amount": 500_000.0}],
+            trades=[],
+        )
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.offers == []
+
+    def test_a_cheap_wall_no_longer_halves_the_offer_rate(self, fake_logger, fake_notifier,
+                                                          repository, no_sleep):
+        """端到端重現 2026-08-16 21:21：簿子底端一道 182 萬的低價牆。
+
+        修好之前，這一輪會掛出 0.00015（年化 5.47%）並且真的成交。
+        """
+        from strategies.orderbook_depth import OrderBookDepthStrategy
+
+        strategy = OrderBookDepthStrategy(
+            {"strategy": {"spread_count": 1, "target_queue_usd": 1_000_000}}
+        )
+        client = FakeClient(
+            balance=344.30,
+            frr=0.0002,
+            book=[
+                {"rate": 0.00015, "period": 2, "amount": 1_821_212.68},
+                {"rate": 0.00025, "period": 2, "amount": 500_000.0},
+            ],
+            trades=self.market_trades(),
+        )
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        _, _, rate, _ = client.offers[0]
+        assert rate == pytest.approx(0.0002125, rel=1e-6)

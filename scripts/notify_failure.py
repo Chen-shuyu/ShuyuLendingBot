@@ -108,6 +108,16 @@ def timestamp() -> str:
     return f"{moment:%Y-%m-%d %H:%M:%S},{moment.microsecond // 1000:03d} {moment:%z}"
 
 
+def push_timestamp() -> str:
+    """推播訊息用的時間戳：秒為精度，仍帶時區偏移。
+
+    比日誌少了毫秒——訊息是給人在手機上看的，毫秒沒有意義；偏移一定要留，
+    這是 D028 的結論。格式與 `notify/messages.py` 的 `format_timestamp()` 一致，
+    兩邊要一起改。
+    """
+    return datetime.now(resolve_timezone()).strftime("%Y-%m-%d %H:%M:%S %z")
+
+
 def collect_unit_state(unit: str) -> dict:
     """問 systemd 這個單元是怎麼失敗的；問不到就回空的，不讓告警本身失敗。"""
     try:
@@ -222,6 +232,78 @@ def log_level(state: dict) -> str:
     if outcome == STATE_RETRYING:
         return "ERROR"
     return "WARNING" if _restart_count(state) > 0 else "INFO"
+
+
+# 三段式訊息用的常數。**這是 `notify/messages.py` 的第二份實作，不是複製貼上的疏忽**：
+# 這支腳本跑在容器外、而且是在「容器可能正是壞掉的那一個」的前提下執行，所以只用
+# 標準函式庫、不匯入專案任何模組（見模組 docstring 的設計選擇 1、TASKS.md P2-3）。
+# **兩邊的規格要一起改**：分類、圖示、footer 的措辭都必須跟 `notify/messages.py` 一致，
+# 否則同一支手機上會出現兩種長相的訊息，而那正是這次要修掉的問題。
+PUSH_CATEGORY_SYSTEM = "系統"
+PUSH_ABNORMAL_ICONS = {"WARNING": "🟡", "ERROR": "🟠", "CRITICAL": "🔴"}
+PUSH_NORMAL_ICON = "🔵"
+PUSH_FOOTER_ACTION_REQUIRED = "——— 需人工介入"
+PUSH_FOOTER_NO_ACTION = "——— 無需處理"
+
+
+def build_push_message(unit: str, state: dict) -> str:
+    """組出推播用的三段式訊息（規格見 `notify/messages.py`）。
+
+    **與 `build_message()` 分開是刻意的**：那一支給日誌與 DB 用，必須是**一行**——
+    日誌是一筆一行的格式，塞進多行訊息會讓後續幾行看起來不像日誌，
+    `grep ERROR` 也會漏掉它們。手機上要看的則是分行、有欄位、最後明講要不要動手的版本。
+    同一個事件、兩種讀者，措辭一致但排版不同。
+    """
+    level = log_level(state)
+    outcome = classify(state)
+    restarts = state.get("NRestarts", "?")
+
+    if outcome == STATE_GAVE_UP:
+        headline = "機器人已停止，systemd 不會再自動重啟"
+        fields = [
+            ("單元", f"{unit}（停在 failed）"),
+            ("影響", "機器人不在了，掛單留在交易所上沒有人管理"),
+            ("處理方式", "先看 systemctl --user status 與日誌確認原因，"
+                         "排除後以 systemctl --user reset-failed 清掉計數再啟動"),
+        ]
+        action_required = True
+    elif outcome == STATE_RETRYING:
+        headline = "機器人啟動失敗，systemd 正在自動重試"
+        fields = [
+            ("單元", unit),
+            ("已重啟", f"{restarts} 次"),
+            ("後續", "次數用盡後會停在 failed，並再送一次告警"),
+        ]
+        action_required = False
+    elif _restart_count(state) > 0:
+        headline = "機器人曾經失敗，但已自動恢復"
+        fields = [
+            ("單元", f"{unit}（目前 active/running）"),
+            ("已重啟", f"{restarts} 次"),
+            ("建議", "查日誌確認當時的失敗原因"),
+        ]
+        action_required = False
+    else:
+        # 這一支實際上不會被推出去（`send_line_push()` 對 INFO 一律回 False，見 D023），
+        # 仍然組出來是為了 stdout 與測試看得到同一套措辭。
+        headline = "告警被觸發，但單元目前正常運作中"
+        fields = [
+            ("單元", f"{unit}（active/running，尚未重啟過）"),
+            ("研判", "多半是部署或手動重啟過程中的短暫觸發"),
+        ]
+        action_required = False
+
+    details = "，".join(
+        f"{label}={state[key]}" for key, label in UNIT_PROPERTIES.items() if key in state
+    )
+    if details:
+        fields.append(("單元狀態", details))
+
+    icon = PUSH_ABNORMAL_ICONS.get(level, PUSH_NORMAL_ICON)
+    lines = [f"{icon}【{PUSH_CATEGORY_SYSTEM}】{headline}", f"時間：{push_timestamp()}"]
+    lines.extend(f"{label}：{value}" for label, value in fields)
+    lines.append(PUSH_FOOTER_ACTION_REQUIRED if action_required else PUSH_FOOTER_NO_ACTION)
+    return "\n".join(lines)
 
 
 def append_to_log(log_file: str, message: str, level: str = "CRITICAL") -> bool:
@@ -342,6 +424,8 @@ def main() -> int:
 
     state = collect_unit_state(unit)
     message = build_message(unit, state)
+    # 同一個事件、兩種讀者：日誌與 DB 要一行（grep 得到），手機要分行（看得懂）。
+    push_message = build_push_message(unit, state)
     level = log_level(state)
 
     # stdout 一定會有一份：這支腳本由 systemd 執行，輸出會進 journal，
@@ -352,7 +436,7 @@ def main() -> int:
     for name, action in (
         ("日誌檔", lambda: bool(log_file) and append_to_log(log_file, message, level)),
         ("資料庫", lambda: bool(db_path) and record_in_database(db_path, message)),
-        ("LINE", lambda: send_line_push(message, level)),
+        ("LINE", lambda: send_line_push(push_message, level)),
     ):
         try:
             if action():

@@ -13,16 +13,26 @@ from strategies.frr_plus import FrrPlusStrategy
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
 
-def run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=3):
-    """組一台引擎跑單輪，讓下面的測試專注在流程與落帳本身。"""
-    BotEngine(
+def make_engine(logger, notifier, strategy, client, repository, cancel_settle_seconds=3, **kwargs):
+    """組一台引擎並保留參照。
+
+    交易面通知推的是**狀態轉換**，所以驗證它必須在**同一台引擎上跑好幾輪**——
+    每輪都新建一台的話，`_offers_live` 永遠是 None，測到的只有「啟動後首輪」那一種。
+    """
+    return BotEngine(
         logger,
         notifier,
         strategy,
         client,
         repository,
         cancel_settle_seconds=cancel_settle_seconds,
-    ).run_once()
+        **kwargs,
+    )
+
+
+def run_once(logger, notifier, strategy, client, repository, cancel_settle_seconds=3):
+    """組一台引擎跑單輪，讓下面的測試專注在流程與落帳本身。"""
+    make_engine(logger, notifier, strategy, client, repository, cancel_settle_seconds).run_once()
 
 
 class FakeClient:
@@ -131,9 +141,19 @@ class TestHappyPath:
         LINE 免費方案每月 200 則，巡檢間隔 600 秒等於一天 144 輪——每輪推一則
         不到兩天就把額度用光，之後真正的故障告警一則都送不出去。
         這條測試就是釘住「不要再把例行事件接回通知管道」。
+
+        2026-08-16 起交易面通知上線（P2-4），但推的是**狀態轉換**：第一輪掛上去
+        會推一則，之後每輪原價重掛屬於無事發生。所以這裡從第二輪開始數——
+        **只要有人把它改回「每輪都推」，這條就會紅燈。**
         """
-        run_once(fake_logger, fake_notifier, strategy, FakeClient(), repository)
-        assert fake_notifier.sent == []
+        engine = make_engine(fake_logger, fake_notifier, strategy, FakeClient(), repository)
+        engine.run_once()
+        pushed_after_first_cycle = len(fake_notifier.sent)
+
+        engine.run_once()
+        engine.run_once()
+
+        assert len(fake_notifier.sent) == pushed_after_first_cycle
         assert any("本輪巡檢完成" in text for text in fake_logger.messages["info"])
 
     def test_logs_balance_and_frr(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
@@ -242,13 +262,17 @@ class TestOfferFailure:
         assert state["last_action"] is None
         assert state["last_frr"] is None
 
-    def test_failed_round_sends_no_success_notification(
+    def test_failed_round_pushes_the_rejection_not_a_success(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
     ):
+        """拒單要推，但推的必須是「被拒絕」，不能推成「掛單已上線」。"""
         client = FakeClient(offer_effects=[RetryableError("逾時")])
         with pytest.raises(RetryableError):
             run_once(fake_logger, fake_notifier, strategy, client, repository)
-        assert fake_notifier.sent == []
+
+        assert len(fake_notifier.sent) == 1
+        assert "掛單被交易所拒絕" in fake_notifier.sent[0]
+        assert "上線" not in fake_notifier.sent[0]
 
     def test_first_offer_failure_records_only_one_row(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
@@ -298,3 +322,139 @@ class TestConsecutiveRounds:
         run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert "掛出 2 筆掛單" in repository.get_state()["last_action"]
+
+
+class TestTradeEventNotifications:
+    """交易面通知（TASKS.md P2-4）推的是**狀態轉換**，不是每輪的結果。
+
+    這一整組測試的存在理由是額度：LINE 免費方案每月 200 則 ≈ 每天 6.6 則，
+    而巡檢間隔 600 秒等於一天 144 輪。**「每輪推一則」1.4 天就把整月燒光**，
+    之後真正的故障告警一則都送不出去。所以下面每一條都在釘同一件事：
+    只有「場上有沒有我們的單」這個值變了才推。
+    """
+
+    def test_first_successful_cycle_announces_itself(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """剛啟動時我們沒看過「有單」的狀態，第一次掛上去算轉換。
+
+        部署完最想確認的就是機器人回來了、而且真的把單掛上去了。
+        """
+        engine = make_engine(fake_logger, fake_notifier, strategy, FakeClient(), repository)
+        engine.run_once()
+
+        assert len(fake_notifier.sent) == 1
+        assert "啟動後首輪" in fake_notifier.sent[0]
+
+    def test_offers_disappearing_is_pushed_once(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """有單 → 沒單。這是目前唯一能察覺「錢可能借出去了」的訊號。"""
+        client = FakeClient(balance=600.0)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        client.balance = 0.0
+        for _ in range(3):
+            with pytest.raises(SkipCycleError):
+                engine.run_once()
+
+        assert len(fake_notifier.sent) == 2, "連續三輪沒單只該推一則，不是三則"
+        assert "掛單已不在場上" in fake_notifier.sent[1]
+
+    def test_never_claims_the_money_was_lent_out(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """餘額歸零也可能是資金被搬到別的錢包（P2-1 之前分不出來）。"""
+        client = FakeClient(balance=600.0)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        client.balance = 0.0
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert "成交了" not in fake_notifier.sent[1].splitlines()[0]
+
+    def test_coming_back_online_is_pushed(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """沒單 → 有單也是轉換：錢回來了、單重新掛上去了，值得一則。"""
+        client = FakeClient(balance=600.0)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        client.balance = 0.0
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        client.balance = 600.0
+        engine.run_once()
+
+        assert len(fake_notifier.sent) == 3
+        assert "掛單已重新上線" in fake_notifier.sent[2]
+
+    def test_starting_with_no_money_is_silent(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """剛啟動就沒錢不是轉換——我們沒看過「有單」，沒有東西消失。"""
+        engine = make_engine(
+            fake_logger, fake_notifier, strategy, FakeClient(balance=0.0), repository
+        )
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert fake_notifier.sent == []
+
+    def test_invalid_frr_also_counts_as_offers_gone(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """FRR 抓不到同樣代表這一輪場上沒有我們的單——單已經在流程開頭被取消了。"""
+        client = FakeClient(balance=600.0)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        client.frr = None
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert "掛單已不在場上" in fake_notifier.sent[1]
+        assert "FRR 無效" in fake_notifier.sent[1]
+
+    def test_rejection_lets_the_next_success_be_announced(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """拒單那一輪的掛單已全被取消，場上是空的；下一輪掛回去要說一聲。"""
+        client = FakeClient(balance=600.0, offer_effects=[RetryableError("逾時")])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        with pytest.raises(RetryableError):
+            engine.run_once()
+
+        engine.run_once()
+
+        assert "掛單被交易所拒絕" in fake_notifier.sent[0]
+        assert "掛單已重新上線" in fake_notifier.sent[1]
+
+    def test_switch_off_stops_pushing_but_keeps_logging(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """額度的安全閥：關掉的是通知，不是紀錄。"""
+        engine = make_engine(
+            fake_logger, fake_notifier, strategy, FakeClient(), repository, push_trade_events=False
+        )
+        engine.run_once()
+
+        assert fake_notifier.sent == []
+        assert any("交易面事件" in text for text in fake_logger.messages["info"])
+
+    def test_dry_run_offers_are_marked_as_such(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """dry-run 沒有真的送到交易所，不標的話會讓人以為錢已經在市場上了。"""
+        client = FakeClient(
+            offer_effects=[{"status": "dry_run", "amount": 200.0, "rate": 0.0002, "duration": 2}] * 3
+        )
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        assert "dry-run" in fake_notifier.sent[0]

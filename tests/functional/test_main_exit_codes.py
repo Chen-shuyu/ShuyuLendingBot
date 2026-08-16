@@ -45,6 +45,17 @@ class StubClient:
     def get_frr(self, currency):
         return 0.0002
 
+    def get_active_offers(self, currency=None):
+        return []
+
+    def get_active_positions(self, currency):
+        if isinstance(self.cycle_effect, Exception):
+            raise self.cycle_effect
+        return []
+
+    def get_funding_book(self, currency):  # pragma: no cover - StubStrategy 不需要市場深度
+        return []
+
     def create_loan_offer(self, currency, amount, rate, duration):  # pragma: no cover - 用不到
         raise AssertionError("這組測試的策略一律回傳空計畫，不該走到掛單")
 
@@ -52,10 +63,12 @@ class StubClient:
 class StubStrategy:
     """一律回傳空的掛單計畫，讓 `run_once()` 走「略過本輪」那條最短路徑。"""
 
+    requires_book = False
+
     def __init__(self, config):
         pass
 
-    def build_offer_plan(self, balance, frr):
+    def build_offer_plan(self, balance, frr, book=None):
         return []
 
 
@@ -82,7 +95,8 @@ def run_main(tmp_path, monkeypatch, fake_logger, fake_notifier):
     monkeypatch.setattr(main, "load_config", lambda path: config)
     monkeypatch.setattr(main, "BotLogger", lambda *args, **kwargs: fake_logger)
     monkeypatch.setattr(main, "LineNotifier", lambda *args, **kwargs: fake_notifier)
-    monkeypatch.setattr(main, "FrrPlusStrategy", StubStrategy)
+    # 策略改由 `build_strategy()` 依設定挑選，所以攔的是那支工廠函式而不是某個類別
+    monkeypatch.setattr(main, "build_strategy", lambda config, logger: StubStrategy(config))
     monkeypatch.setattr(main, "Repository", RepositoryStub)
     monkeypatch.setattr(main, "BitfinexClient", StubClient)
     # 主迴圈跑完一輪就靠這裡結束，否則測試會永遠轉下去

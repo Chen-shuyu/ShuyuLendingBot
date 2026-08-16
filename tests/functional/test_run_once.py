@@ -36,9 +36,23 @@ def run_once(logger, notifier, strategy, client, repository, cancel_settle_secon
 
 
 class FakeClient:
-    """可設定餘額、FRR、取消結果與掛單行為的交易所替身。"""
+    """可設定餘額、FRR、取消結果與掛單行為的交易所替身。
 
-    def __init__(self, balance=600.0, frr=0.0002, cancelled=None, offer_effects=None):
+    `active_offers` / `positions` / `book` 預設都是空的，等同「場上沒有我們的單、
+    沒有任何已借出部位、拿不到市場深度」——這正是多數既有測試想要的乾淨起點。
+    要驗證「條件沒變就不重掛」或成交偵測的測試，各自把它們設起來。
+    """
+
+    def __init__(
+        self,
+        balance=600.0,
+        frr=0.0002,
+        cancelled=None,
+        offer_effects=None,
+        active_offers=None,
+        positions=None,
+        book=None,
+    ):
         self.balance = balance
         self.frr = frr
         self.cancelled = cancelled if cancelled is not None else []
@@ -46,10 +60,31 @@ class FakeClient:
         self.offer_effects = list(offer_effects) if offer_effects else None
         self.offers = []
         self.cancel_calls = 0
+        self.active_offers = list(active_offers) if active_offers else []
+        # positions 可以是「每輪一份」的清單，用來模擬第 N 輪才成交
+        self.positions = list(positions) if positions else []
+        self.position_calls = 0
+        self.book = list(book) if book else []
 
     def cancel_active_offers(self, currency):
         self.cancel_calls += 1
-        return self.cancelled
+        # 取消之後場上就沒有我們的單了，而那些錢會回到可用餘額——替身不模擬這件事的話，
+        # 「取消後用真實餘額重算」那條路徑永遠會算出 0，測不到真正的行為。
+        released = [dict(offer) for offer in self.active_offers]
+        self.balance += sum(float(offer["amount"]) for offer in released)
+        self.active_offers = []
+        # `cancelled` 有設定就用它（既有測試靠它模擬「取消了東西」），否則回報實際釋放的單
+        return self.cancelled or released
+
+    def get_active_offers(self, currency=None):
+        return list(self.active_offers)
+
+    def get_active_positions(self, currency):
+        self.position_calls += 1
+        return list(self.positions)
+
+    def get_funding_book(self, currency):
+        return list(self.book)
 
     def get_available_balance(self, currency):
         return self.balance
@@ -458,3 +493,200 @@ class TestTradeEventNotifications:
         engine.run_once()
 
         assert "dry-run" in fake_notifier.sent[0]
+
+
+def live_offer(offer_id=1, amount=200.0, rate=0.0004, period=2):
+    """場上一筆掛單，欄位與 `client.get_active_offers()` 的回傳一致。"""
+    return {"id": offer_id, "symbol": "fUSD", "amount": amount, "rate": rate, "period": period}
+
+
+class TestKeepsQueuePosition:
+    """條件沒變就不重掛——這一條保護的是**排隊位置**（見 DECISIONS.md D030）。
+
+    同利率下是時間優先（先掛先成交）。每輪無條件取消重掛，等於以 600 秒為週期
+    把自己送回隊伍末端，一天 144 次；而這個價位的成交本來就是陣發的，
+    每次歸零都可能正好錯過那一波。
+    """
+
+    def test_identical_offer_is_left_untouched(self, fake_logger, fake_notifier, strategy,
+                                               repository, no_sleep):
+        # 錢全掛在場上，可用餘額因此是 0——這正是真實運作時的樣子
+        client = FakeClient(balance=0.0, frr=0.0002, active_offers=[live_offer()])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 0
+        assert client.offers == []
+
+    def test_committed_money_counts_as_disposable(self, fake_logger, fake_notifier, strategy,
+                                                  repository, no_sleep):
+        """掛在場上的錢也是我們的錢。
+
+        只看可用餘額的話，單子一掛出去餘額就變 0，策略會以為沒錢可放而回傳空計畫，
+        於是每輪都得「先取消才有錢算」——等於強迫自己每輪重掛。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002, active_offers=[live_offer()])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        # 有算出計畫（而且判定與場上一致），不是走「餘額不足」那條路
+        assert any("維持場上" in message or "維持不動" in message
+                   for message in fake_logger.messages["info"])
+
+    def test_drift_within_tolerance_does_not_requote(self, fake_logger, fake_notifier, strategy,
+                                                     repository, no_sleep):
+        """市場價位每輪都有小數點後幾位的漂移。
+
+        沒有容差的話這條保護形同虛設——每輪都會判定「不一樣」而重掛，
+        跟改之前一模一樣（P2-4 已經在通知額度上踩過同一個坑，見 D029）。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.015)])  # 差 1.5%
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 0
+
+    def test_drift_beyond_tolerance_requotes(self, fake_logger, fake_notifier, strategy,
+                                             repository, no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)])  # 差 5%
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+        assert len(client.offers) == 1
+
+    def test_different_period_requotes(self, fake_logger, fake_notifier, strategy, repository,
+                                       no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002, active_offers=[live_offer(period=30)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+
+    def test_different_amount_requotes(self, fake_logger, fake_notifier, strategy, repository,
+                                       no_sleep):
+        # 場上掛著 200，但錢包裡又多了 50 可以放——可支配變成 250，
+        # 計畫金額因此與場上那筆不同，這時就該重掛把多的錢也掛出去
+        client = FakeClient(balance=50.0, frr=0.0002, active_offers=[live_offer(amount=200.0)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+        assert [amount for _, amount, _, _ in client.offers] == [250.0]
+
+    def test_different_offer_count_requotes(self, fake_logger, fake_notifier, strategy,
+                                            repository, no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(offer_id=1), live_offer(offer_id=2)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+
+    def test_empty_plan_never_withdraws_a_live_offer(self, fake_logger, fake_notifier,
+                                                     repository, no_sleep):
+        """策略說「這個市場不值得掛」時，**已經在場上的單不要撤**。
+
+        那張單是用更早、也就是更好的市場條件掛出去的；撤掉只會把排隊位置還給市場，
+        換來一輪空手。
+        """
+        from strategies.orderbook_depth import OrderBookDepthStrategy
+
+        # minimum_rate 高到整個市場都不值得掛 → 計畫為空
+        strategy = OrderBookDepthStrategy(
+            {"strategy": {"minimum_rate": 0.9, "spread_count": 1, "target_queue_usd": 1000}}
+        )
+        client = FakeClient(balance=0.0, frr=0.0002, active_offers=[live_offer()],
+                            book=[{"rate": 0.00025, "period": 2, "amount": 500.0}])
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 0
+
+
+class TestFillDetection:
+    """成交偵測（TASKS.md P2-1）。
+
+    在它之前，錢借出去之後餘額歸零，機器人只會寫一句「可放貸金額不足，略過本輪」
+    ——**跟錢包本來就是空的一模一樣**，沒有通知、DB 也沒有任何一筆記錄。
+    """
+
+    @staticmethod
+    def position(position_id="1", amount=160.0, rate=0.00025, period=2):
+        return {"id": position_id, "amount": amount, "rate": rate, "period": period,
+                "kind": "credit", "opened_at": 1786872920000}
+
+    def test_new_position_is_announced(self, fake_logger, fake_notifier, strategy, repository,
+                                       no_sleep):
+        client = FakeClient(balance=600.0, frr=0.0002, positions=[self.position()])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert any("資金已借出" in message for message in fake_notifier.sent)
+
+    def test_new_position_is_recorded(self, fake_logger, fake_notifier, strategy, repository,
+                                      no_sleep):
+        client = FakeClient(balance=600.0, frr=0.0002, positions=[self.position()])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        rows = list(repository.connection.execute("SELECT * FROM funding_positions"))
+        assert len(rows) == 1
+        assert rows[0]["position_id"] == "1"
+
+    def test_same_position_is_announced_only_once(self, fake_logger, fake_notifier, strategy,
+                                                  repository, no_sleep):
+        client = FakeClient(balance=600.0, frr=0.0002, positions=[self.position()])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+        engine.run_once()
+
+        assert sum("資金已借出" in message for message in fake_notifier.sent) == 1
+
+    def test_closed_position_is_announced(self, fake_logger, fake_notifier, strategy, repository,
+                                          no_sleep):
+        client = FakeClient(balance=600.0, frr=0.0002, positions=[self.position()])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+        client.positions = []
+        engine.run_once()
+
+        assert any("資金已收回" in message for message in fake_notifier.sent)
+
+    def test_fill_suppresses_the_vaguer_offers_gone_message(self, fake_logger, fake_notifier,
+                                                            strategy, repository, no_sleep):
+        """成交已經解釋了掛單為什麼不見，就不必再推一則「掛單已不在場上」。
+
+        同一件事講兩遍只是白燒額度——每月只有 200 則（D024）。
+        """
+        client = FakeClient(balance=600.0, frr=0.0002)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()  # 先掛出去，讓 _offers_live 變成 True
+
+        # 下一輪：錢被借走（餘額歸零 + 出現部位）
+        client.balance = 0.0
+        client.positions = [self.position()]
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert any("資金已借出" in message for message in fake_notifier.sent)
+        assert not any("掛單已不在場上" in message for message in fake_notifier.sent)
+
+    def test_offers_gone_without_a_fill_still_warns(self, fake_logger, fake_notifier, strategy,
+                                                   repository, no_sleep):
+        """沒有成交卻掛單消失＝錢可能被搬走，這種才要推「掛單已不在場上」。"""
+        client = FakeClient(balance=600.0, frr=0.0002)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        client.balance = 0.0  # 餘額沒了，但也沒有任何已借出部位
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert any("掛單已不在場上" in message for message in fake_notifier.sent)
+
+    def test_positions_are_checked_before_anything_is_cancelled(self, fake_logger, fake_notifier,
+                                                                strategy, repository, no_sleep):
+        """對帳要在動手之前。
+
+        取消掛單會改變場上狀態，先動手再對帳的話，「這一輪成交了嗎」就永遠答不出來。
+        """
+        client = FakeClient(balance=600.0, frr=0.0002, active_offers=[live_offer(rate=0.001)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.position_calls == 1
+        assert client.cancel_calls == 1

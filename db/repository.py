@@ -8,6 +8,7 @@
 
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -57,8 +58,23 @@ def now_iso() -> str:
     return clock.now().isoformat(timespec="seconds")
 
 
+def _millis_to_iso(millis) -> Optional[str]:
+    """把 Bitfinex 的毫秒時間戳轉成本專案格式的 ISO 字串。
+
+    轉不動就回 None 而不是拋例外：這個欄位是「幾點借出去的」這種輔助資訊，
+    為了它讓一輪巡檢失敗並不划算——真正重要的是部位本身有沒有被記錄下來。
+    """
+    if millis is None:
+        return None
+    try:
+        moment = datetime.fromtimestamp(int(millis) / 1000, tz=clock.get_timezone())
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    return moment.isoformat(timespec="seconds")
+
+
 class Repository:
-    """掛單流水、每日收益、機器人狀態的持久化封裝。"""
+    """掛單流水、已借出部位、每日收益、機器人狀態的持久化封裝。"""
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = resolve_db_path(db_path)
@@ -160,6 +176,79 @@ class Repository:
                 """,
                 (date, currency, float(interest), principal_avg, now_iso()),
             )
+
+    def sync_positions(self, currency: str, positions) -> Dict[str, list]:
+        """把交易所回報的已借出部位與 DB 對帳，回傳這一輪的變化。
+
+        回傳 `{"opened": [...], "closed": [...]}`：
+        - `opened`：DB 沒見過的部位 = **這一輪剛成交**
+        - `closed`：DB 裡還開著、但交易所已經查不到 = **已還款或到期**
+
+        這是整個「成交偵測」的核心。在它之前，錢借出去之後餘額歸零，
+        日誌只會寫「可放貸金額不足，略過本輪」——**跟錢包本來就是空的一模一樣**
+        （TASKS.md P2-1）。
+
+        **交易所回報的是唯一真相**：只要某個 id 這次沒出現，就算它已經結束。
+        不用「猜它是不是暫時查不到」——查詢失敗會在 `api` 層就拋例外，
+        根本走不到這裡，所以能走到這裡的空清單就是真的空。
+        """
+        open_rows = {
+            row["position_id"]: dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM funding_positions WHERE closed_at IS NULL AND currency = ?",
+                (currency,),
+            )
+        }
+
+        seen = set()
+        opened = []
+        for position in positions:
+            position_id = str(position["id"])
+            seen.add(position_id)
+            if position_id in open_rows:
+                continue
+            opened.append(position)
+
+        closed = [row for key, row in open_rows.items() if key not in seen]
+
+        timestamp = now_iso()
+        with self.connection:
+            for position in opened:
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO funding_positions
+                        (position_id, currency, amount, rate, period, kind,
+                         opened_at, first_seen_at, closed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        str(position["id"]),
+                        currency,
+                        float(position["amount"]),
+                        float(position["rate"]),
+                        int(position["period"]),
+                        position.get("kind", "credit"),
+                        _millis_to_iso(position.get("opened_at")),
+                        timestamp,
+                    ),
+                )
+            for row in closed:
+                self.connection.execute(
+                    "UPDATE funding_positions SET closed_at = ? WHERE position_id = ?",
+                    (timestamp, row["position_id"]),
+                )
+
+        return {"opened": opened, "closed": closed}
+
+    def open_positions(self, currency: str) -> list:
+        """目前還在生息中的部位，供總曝險計算與每日摘要使用。"""
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM funding_positions WHERE closed_at IS NULL AND currency = ?",
+                (currency,),
+            )
+        ]
 
     def save_state(
         self,

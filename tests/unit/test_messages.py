@@ -162,3 +162,67 @@ class TestTradeEvents:
         assert "自動重算金額並重試" in retryable
         assert retryable.endswith(messages.FOOTER_NO_ACTION)
         assert fatal.endswith(messages.FOOTER_ACTION_REQUIRED)
+
+
+class TestPositionEvents:
+    """成交與收回（TASKS.md P2-1／P2-4）。
+
+    成交是這個專案存在的理由，也是最值得花額度的一則——在成交偵測做出來之前，
+    這件事發生時機器人只會寫「可放貸金額不足，略過本輪」。
+    """
+
+    @staticmethod
+    def position(amount=160.0, rate=0.00025, period=2):
+        return {"id": "1", "amount": amount, "rate": rate, "period": period}
+
+    def test_opened_leads_with_the_conclusion(self):
+        text = messages.positions_opened([self.position()])
+        first_line = text.splitlines()[0]
+
+        assert first_line.startswith("💰【交易】")
+        assert "借出" in first_line
+
+    def test_opened_shows_amount_rate_and_period(self):
+        text = messages.positions_opened([self.position(amount=160.0, rate=0.00025, period=2)])
+
+        assert "160.00 USD" in text
+        assert "0.000250/日" in text
+        assert "年化 9.12%" in text
+        assert "2 天" in text
+
+    def test_opened_can_report_remaining_balance(self):
+        text = messages.positions_opened([self.position()], balance_usd=184.12)
+        assert "剩餘可放貸：184.12 USD" in text
+
+    def test_multiple_positions_are_listed(self):
+        text = messages.positions_opened([self.position(amount=150.0), self.position(amount=194.0)])
+
+        assert "筆數：2 筆" in text
+        assert "合計：344.00 USD" in text
+        assert "第 1 筆" in text and "第 2 筆" in text
+
+    def test_closed_says_what_happens_next(self):
+        text = messages.positions_closed([self.position()])
+
+        assert text.splitlines()[0].startswith("💰【交易】")
+        assert "收回" in text
+        assert "下一輪會重新掛單" in text
+
+    def test_both_are_no_action_required(self):
+        for text in (messages.positions_opened([self.position()]),
+                     messages.positions_closed([self.position()])):
+            assert text.splitlines()[-1] == messages.FOOTER_NO_ACTION
+
+    def test_accepts_database_rows_not_just_api_dicts(self):
+        """收回的部位是從 DB 讀回來的，欄位型別可能是字串——不該因此炸掉。"""
+        row = {"id": "1", "amount": "160.0", "rate": "0.00025", "period": "2"}
+        assert "160.00 USD" in messages.positions_closed([row])
+
+
+class TestOffersGoneAfterFillDetection:
+    def test_states_that_a_fill_was_ruled_out(self):
+        """有了成交偵測之後，這則訊息的意思變窄也變準了。"""
+        text = messages.offers_gone("可放貸金額不足")
+
+        assert "不是成交" in text
+        assert "餘額被移走" in text

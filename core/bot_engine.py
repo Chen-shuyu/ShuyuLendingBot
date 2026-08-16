@@ -92,6 +92,7 @@ class BotEngine:
         cancel_settle_seconds: int = 3,
         alert_after_failures: int = 3,
         push_trade_events: bool = True,
+        rate_tolerance_pct: float = 2.0,
     ):
         self.logger = logger
         self.notifier = notifier
@@ -101,6 +102,8 @@ class BotEngine:
         self.interval_seconds = int(interval_seconds)
         self.cancel_settle_seconds = int(cancel_settle_seconds)
         self.push_trade_events = bool(push_trade_events)
+        # 場上掛單與新計畫差多少以內算「沒變」，用來決定要不要重掛（見 `_plans_match`）。
+        self.rate_tolerance_pct = float(rate_tolerance_pct)
         self.failures = FailureTracker(logger, notifier, repository, alert_after_failures)
         # 場上有沒有我們的掛單：True 有、False 沒有、None 還不知道（剛啟動）。
         # 交易面通知推的是**這個值的變化**，不是每輪的結果——每輪全取消重掛若每次都推，
@@ -110,12 +113,16 @@ class BotEngine:
         self._offers_live = None
 
     def run_once(self) -> None:
-        """執行一輪巡檢流程：取消舊掛單、查餘額與 FRR、產生掛單計畫、掛單、落帳、送出通知。"""
-        cancelled = self.client.cancel_active_offers("USD")
-        if cancelled:
-            # Bitfinex 取消掛單是非同步處理，回應成功不代表餘額已釋放；
-            # 這裡稍等一下再查餘額，避免用到舊餘額把掛單金額算少。
-            time.sleep(self.cancel_settle_seconds)
+        """執行一輪巡檢：對帳部位、查市場、決定要不要重掛、掛單、落帳、送出通知。
+
+        **順序上有一件事必須最先做**：核對已借出部位。取消掛單會讓場上狀態改變，
+        先動手再對帳的話，「這一輪成交了嗎」就永遠答不出來。
+        """
+        filled = self._sync_positions()
+
+        # 場上現有的掛單。**先看清楚再決定要不要動它**——這一步是後面
+        # 「利率沒變就不重掛」的依據，而那正是保住排隊位置的關鍵（見 D030）。
+        existing = self.client.get_active_offers("USD")
 
         balance_usd = self.client.get_available_balance("USD")
         frr = self.client.get_frr("USD")
@@ -125,14 +132,72 @@ class BotEngine:
         if frr is None or frr <= 0:
             # 略過也要寫狀態：機器人是活著且判斷正確的，心跳不該因此中斷。
             self.repository.save_state(last_action="FRR 無效，略過本輪")
-            self._note_offers_absent("FRR 無效，本輪沒有掛單")
+            self._note_offers_absent("FRR 無效，本輪沒有掛單", explained=filled)
             raise SkipCycleError("FRR 無效（None 或非正值），跳過本輪，避免用錯誤利率掛單")
 
-        plans = self.strategy.build_offer_plan(balance_usd, frr)
+        book = self._fetch_book()
+
+        # 掛在場上的錢也是我們的錢。只看 `get_available_balance()` 的話，單子一掛出去
+        # 餘額就變成 0，策略會以為沒錢可放而回傳空計畫——於是每一輪都在「取消才有錢、
+        # 有錢才算得出計畫」之間打轉，等於強迫自己每輪都重掛。
+        committed_usd = sum(float(offer["amount"]) for offer in existing)
+        disposable_usd = balance_usd + committed_usd
+        plans = self.strategy.build_offer_plan(disposable_usd, frr, book)
+
         if not plans:
+            if existing:
+                # 策略說「這個市場現在不值得掛」，但場上已經有單了。
+                # **不要撤**：那張單是用更早的（也就是更好的）市場條件掛出去的，
+                # 撤掉只會把排隊位置還給市場，換來一輪空手。
+                self.repository.save_state(
+                    last_frr=frr, last_action=f"維持場上 {len(existing)} 筆既有掛單，本輪不重掛"
+                )
+                self.logger.info(
+                    f"本輪不產生新計畫，但場上已有 {len(existing)} 筆掛單，維持不動以保住排隊位置。"
+                )
+                raise SkipCycleError("本輪無新掛單計畫，維持場上既有掛單")
+
             self.repository.save_state(last_frr=frr, last_action="可放貸金額不足，略過本輪")
-            self._note_offers_absent(f"可放貸金額不足（目前 {balance_usd} USD），本輪沒有掛單")
+            self._note_offers_absent(
+                f"可放貸金額不足（目前 {balance_usd} USD），本輪沒有掛單", explained=filled
+            )
             raise SkipCycleError("可放貸金額低於最低門檻或單筆最小量，跳過本輪")
+
+        self._log_queue_position(book, plans)
+
+        if existing and self._plans_match(existing, plans):
+            # **這一輪什麼都不做才是對的。** 同利率下是時間優先（先掛先成交），
+            # 取消重掛會把排隊位置歸零重來。以 600 秒巡檢一輪計，等於一天把自己
+            # 送回隊伍末端 144 次——而這個價位的成交本來就是陣發的，
+            # 每次歸零都可能正好錯過那一波。
+            self.repository.save_state(
+                last_frr=frr, last_action=f"掛單條件未變，維持場上 {len(existing)} 筆不動"
+            )
+            self.logger.info(
+                f"掛單條件與場上 {len(existing)} 筆一致（利率容差 {self.rate_tolerance_pct}%），"
+                "維持不動以保住排隊位置。"
+            )
+            return
+
+        cancelled = self.client.cancel_active_offers("USD")
+        if cancelled:
+            # Bitfinex 取消掛單是非同步處理，回應成功不代表餘額已釋放；
+            # 這裡稍等一下再查餘額，避免用到舊餘額把掛單金額算少。
+            time.sleep(self.cancel_settle_seconds)
+            # 取消後一定要用**真實餘額**重算，不能沿用 `disposable_usd`：
+            # 那是估計值，而掛單金額只要多一分錢，交易所就會拒絕整筆（D025）。
+            balance_usd = self.client.get_available_balance("USD")
+            self.logger.info(f"取消後可用 USD 餘額：{balance_usd}")
+            plans = self.strategy.build_offer_plan(balance_usd, frr, book)
+            if not plans:
+                self.repository.save_state(
+                    last_frr=frr, last_action="取消後可放貸金額不足，本輪沒有重掛"
+                )
+                self._note_offers_absent(
+                    f"取消後可放貸金額不足（目前 {balance_usd} USD），本輪沒有重掛",
+                    explained=filled,
+                )
+                raise SkipCycleError("取消舊掛單後可放貸金額不足，本輪不重掛")
 
         dry_run = False
         for plan in plans:
@@ -175,6 +240,99 @@ class BotEngine:
         # 一則都送不出去（見 DECISIONS.md D024）。
         self.logger.info(f"本輪巡檢完成：掛出 {len(plans)} 筆，合計 {total_amount} USD")
 
+    def _sync_positions(self) -> bool:
+        """核對已借出部位，推出成交／收回通知。回傳「本輪是否偵測到新成交」。
+
+        這是 TASKS.md P2-1：在它之前，錢借出去之後餘額歸零，機器人只會寫一句
+        「可放貸金額不足，略過本輪」——**跟錢包本來就是空的一模一樣**。
+        沒有通知、DB 也沒有任何一筆記錄說「這筆借出去了」，
+        於是機器人在賺錢還是在空轉，從外面完全分不出來。
+
+        成交每筆都推：它罕見、而且是這個專案存在的理由，屬於「額度絕對值得花」
+        的事件（TASKS.md P2-4 的額度分配）。
+        """
+        positions = self.client.get_active_positions("USD")
+        changes = self.repository.sync_positions("USD", positions)
+
+        opened = changes["opened"]
+        closed = changes["closed"]
+
+        if opened:
+            total = sum(float(item["amount"]) for item in opened)
+            self.logger.info(
+                f"偵測到新的已借出部位 {len(opened)} 筆，合計 {total:.2f} USD——資金已借出。"
+            )
+            self._push_trade_event(messages.positions_opened(opened))
+
+        if closed:
+            total = sum(float(item["amount"]) for item in closed)
+            self.logger.info(
+                f"已借出部位收回 {len(closed)} 筆，合計 {total:.2f} USD——資金已回到融資錢包。"
+            )
+            self._push_trade_event(messages.positions_closed(closed))
+
+        return bool(opened)
+
+    def _fetch_book(self):
+        """取得市場深度；策略用不到就不打這個端點。
+
+        用不到卻照打，等於白白多一個會失敗的地方——而這一支是每輪都會執行的路徑。
+        """
+        if not getattr(self.strategy, "requires_book", False):
+            return None
+        book = self.client.get_funding_book("USD")
+        if not book:
+            self.logger.warning("市場深度查詢回傳空清單，本輪將沒有掛單計畫。")
+        return book
+
+    def _log_queue_position(self, book, plans) -> None:
+        """把「掛在這個價位時前面排了多少錢」寫進日誌，同天期與全天期各一份。
+
+        兩個數字都留，是為了**讓第一筆真實成交來裁決一個還沒驗證的假設**：
+        不同天期的掛單到底有沒有在同一個隊伍裡排。策略目前採保守解讀（全天期一起算），
+        若實際成交速度明顯快過這個估計，就代表同天期那個數字才是對的。
+        沒有這兩行，事後只會看到「成交了」，什麼都學不到。
+        """
+        if not book or not plans:
+            return
+        describe = getattr(self.strategy, "describe_queue", None)
+        if describe is None:
+            return
+        queue = describe(book, plans[0].rate)
+        self.logger.info(
+            f"掛單排隊位置估計：同天期前方 {queue['same_period']:,.0f} USD、"
+            f"全天期前方 {queue['all_periods']:,.0f} USD"
+        )
+
+    def _plans_match(self, existing, plans) -> bool:
+        """場上現有掛單與本輪計畫是否「實質相同」（相同就不必重掛）。
+
+        **一定要有容差，不能比對相等**：市場價位每輪都會有小數點後幾位的漂移，
+        逐位元比對等於每輪都判定「不一樣」，這條保護就形同虛設——
+        P2-4 實作交易面通知時已經踩過同一個坑（見 D029），那次是把額度燒光，
+        這次會把排隊位置燒光。
+        """
+        if len(existing) != len(plans):
+            return False
+
+        existing_sorted = sorted(existing, key=lambda offer: float(offer["rate"]))
+        plans_sorted = sorted(plans, key=lambda plan: plan.rate)
+
+        for offer, plan in zip(existing_sorted, plans_sorted):
+            if int(offer["period"]) != int(plan.duration):
+                return False
+            if plan.rate <= 0:
+                return False
+            rate_drift_pct = abs(float(offer["rate"]) - plan.rate) / plan.rate * 100
+            if rate_drift_pct > self.rate_tolerance_pct:
+                return False
+            # 金額容差取「1 USD」與「1%」的較大者：小額時 1 USD 才有意義，
+            # 金額變大之後固定值會過度敏感。
+            amount_tolerance = max(1.0, plan.amount * 0.01)
+            if abs(float(offer["amount"]) - plan.amount) > amount_tolerance:
+                return False
+        return True
+
     def _push_trade_event(self, message: str) -> None:
         """送出一則交易面通知，並在日誌留下同一件事的單行版本。
 
@@ -198,16 +356,17 @@ class BotEngine:
             )
         self._offers_live = True
 
-    def _note_offers_absent(self, reason: str) -> None:
+    def _note_offers_absent(self, reason: str, explained: bool = False) -> None:
         """本輪沒有掛單：只有「原本場上有單 → 現在沒了」才推。
 
-        這一則是目前唯一能察覺「錢可能借出去了」的訊號。機器人還沒有查詢已借出部位的
-        能力（TASKS.md P2-1），所以訊息只講事實、不寫死成「成交」——餘額歸零也可能是
-        資金被搬到別的錢包。**猜錯一次，這個管道就再也不會被相信。**
+        `explained=True` 代表**本輪已經查明掛單消失的原因就是成交**，
+        `_sync_positions()` 已經推過一則更準確的「資金已借出」。這時再推一則
+        「掛單已不在場上」只是把同一件事講第二遍，白白多燒一則額度
+        ——每月只有 200 則（D024）。
 
         剛啟動（`None`）時不推：那代表我們沒看過「有單」的狀態，不算轉換。
         """
-        if self._offers_live is True:
+        if self._offers_live is True and not explained:
             self._push_trade_event(messages.offers_gone(reason))
         self._offers_live = False
 

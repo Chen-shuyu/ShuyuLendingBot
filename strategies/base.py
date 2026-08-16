@@ -8,7 +8,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -28,10 +28,22 @@ class OfferPlan:
 class Strategy(ABC):
     """放貸策略介面。"""
 
-    @abstractmethod
-    def build_offer_plan(self, balance_usd: float, frr: float) -> List[OfferPlan]:
-        """依目前可用餘額與 FRR 產生掛單計畫。
+    # 這個策略需不需要市場深度（訂單簿）。迴圈層據此決定要不要多打一次公開端點：
+    # 用不到卻照打，等於白白多一個會失敗的地方。
+    requires_book = False
 
-        回傳空清單代表「本輪不掛單」（例如餘額低於門檻），迴圈層會據此
-        略過本輪而不視為失敗。
+    @abstractmethod
+    def build_offer_plan(
+        self,
+        balance_usd: float,
+        frr: float,
+        book: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[OfferPlan]:
+        """依目前可用餘額與市場資訊產生掛單計畫。
+
+        `book` 是供給側掛單簿（見 `api/base.py` 的 `get_funding_book()`），只有
+        `requires_book = True` 的策略會拿到；其餘策略可以忽略它。
+
+        回傳空清單代表「本輪不掛單」（例如餘額低於門檻、或市場價格低於底線），
+        迴圈層會據此略過本輪而不視為失敗。
         """

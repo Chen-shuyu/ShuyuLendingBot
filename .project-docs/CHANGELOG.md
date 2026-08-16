@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Changed（2026-08-16，分支 `feature/orderbook-pricing-and-fill-detection`）
+- **定價基準改為訂單簿排隊位置**（TASKS.md P1-1、D030）。新增
+  `strategies/orderbook_depth.py` 並設為預設（`strategy.mode`）。
+  **根因**：舊策略掛 0.000272，而當時簿子頂端就是 0.000272——單子一直落在
+  整個供給側的最後面，78 輪掛空。新演算法只有一句：在「前方排隊金額 ≤
+  `target_queue_usd`」的前提下挑利率最高的一檔。實測會掛 0.000250（年化 9.12%）。
+  **刻意不用 trades 百分位**：那會被爆發桶汙染，等於 FRR 落後問題換個來源重演
+- **`minimum_rate` 語意改變**：從「算出來太低就拉高到這裡」改成
+  「低於這裡就整輪不掛」。舊寫法會把價格拉到簿子外，掛一張永遠不會成交的單
+- **不再每輪無條件取消重掛**：同利率下先掛先成交，每 600 秒重掛等於一天把自己
+  送回隊伍末端 144 次。改為先查場上現況再比對，實質相同就什麼都不做
+  （容差 `engine.rate_tolerance_pct`，預設 2%）
+- **`spread_count` 由 3 改為 1**：344 USD 最多拆 2 筆，而第 2 筆會被乘到 0.000288、
+  簿子頂端才 0.000270——一半的錢會變死單。**觸發條件正是「把資金全部投入」**
+
+### Added（2026-08-16，分支 `feature/orderbook-pricing-and-fill-detection`）
+- **成交偵測**（TASKS.md P2-1、D030）：機器人終於知道自己借出去了。
+  新增 `funding_positions` 表、`Repository.sync_positions()` 對帳，
+  以及「資金已借出」「借出的資金已收回」兩則 LINE 通知。
+  查 credits 與 loans **兩個端點**——只查一個會漏掉一半。
+  **已知缺口**：那兩支的欄位索引取自官方文件、尚未經真實回應核對（至今零成交），
+  解析已寫成防禦式，第一筆成交後要回來核對
+- `api/base.py` 新增 `get_funding_book()`／`get_active_offers()`／`get_active_positions()`
+- `config.yaml` 新增 `strategy.mode`、`strategy.offer_period`、
+  `strategy.target_queue_usd`、`engine.rate_tolerance_pct`
+- 測試 347 → 437 項
+
 ### Added（2026-08-16，分支 `feature/notify-format-and-trade-events`）
 - **交易面通知**（TASKS.md P2-4、D029）：掛單上線／掛單消失／掛單被拒三種事件會推 LINE。
   推的是**狀態轉換**不是每輪結果——原規劃的「內容有變才推」擋不住 FRR 漂移，

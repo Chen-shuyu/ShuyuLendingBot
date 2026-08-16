@@ -78,6 +78,15 @@ class FakeExchange:
     def private_post_auth_w_funding_offer_submit(self, params=None):
         return self._respond("private_post_auth_w_funding_offer_submit", params)
 
+    def public_get_book_symbol_precision(self, params=None):
+        return self._respond("public_get_book_symbol_precision", params)
+
+    def private_post_auth_r_funding_credits_symbol(self, params=None):
+        return self._respond("private_post_auth_r_funding_credits_symbol", params)
+
+    def private_post_auth_r_funding_loans_symbol(self, params=None):
+        return self._respond("private_post_auth_r_funding_loans_symbol", params)
+
 
 @pytest.fixture
 def make_client(fake_logger):
@@ -427,6 +436,9 @@ class TestCcxtContract:
             "private_post_auth_r_funding_offers_symbol",
             "private_post_auth_w_funding_offer_cancel",
             "private_post_auth_w_funding_offer_submit",
+            "public_get_book_symbol_precision",
+            "private_post_auth_r_funding_credits_symbol",
+            "private_post_auth_r_funding_loans_symbol",
         ],
     )
     def test_implicit_method_exists(self, method_name):
@@ -438,3 +450,172 @@ class TestCcxtContract:
     def test_bitfinex2_is_not_used(self):
         """ccxt 4.x 已把 V1/V2 合併為單一 `bitfinex`（見 DECISIONS.md D009）。"""
         assert not hasattr(ccxt, "bitfinex2")
+
+
+# --- 市場深度與已借出部位（2026-08-16 新增，見 DECISIONS.md D030）-----------
+
+
+def make_book_row(rate, period, amount, count=1):
+    """模擬 `/v2/book/fUSD/P0` 的一列：[RATE, PERIOD, COUNT, AMOUNT]。
+
+    **每個欄位都是字串**，利率還是 `'0.0002808219178082192'` 這種長浮點——
+    形狀取自 2026-08-16 的實打回應。負的 AMOUNT 是借款需求側。
+    """
+    return [str(rate), str(period), str(count), str(amount)]
+
+
+def make_position_array(position_id="1", symbol="fUSD", amount=160.0, rate=0.00025, period=2,
+                        opened_at=1786872920000, length=22):
+    """模擬 funding credits／loans 的一列。
+
+    欄位（官方文件）：0=ID, 1=SYMBOL, 5=AMOUNT, 7=STATUS, 11=RATE, 12=PERIOD, 13=MTS_OPENING。
+    **這個形狀還沒被真實回應驗證過**——探測當下帳號一筆都沒成交，兩個端點都是空清單
+    （見 `BitfinexClient.get_active_positions()` 的註解）。
+    """
+    row = [None] * length
+    row[0] = str(position_id)
+    row[1] = symbol
+    row[5] = str(amount)
+    row[7] = "ACTIVE"
+    row[11] = str(rate)
+    row[12] = str(period)
+    row[13] = str(opened_at) if opened_at is not None else None
+    return row
+
+
+class TestGetFundingBook:
+    def test_keeps_only_the_supply_side(self, make_client):
+        # 負數是借款需求側：對放貸方來說那是買家不是競爭者，
+        # 混進來會把「前面排了多少錢」算大好幾倍，掛單價位就整個歪掉。
+        exchange = FakeExchange(public_get_book_symbol_precision=[
+            make_book_row(0.00025, 2, 500_000),
+            make_book_row(0.00028, 120, -9_825_986),
+            make_book_row(0.00024, 2, 700_000),
+        ])
+        book = make_client(exchange).get_funding_book("USD")
+
+        assert len(book) == 2
+        assert all(level["amount"] > 0 for level in book)
+
+    def test_sorted_by_rate_ascending(self, make_client):
+        exchange = FakeExchange(public_get_book_symbol_precision=[
+            make_book_row(0.00026, 2, 100),
+            make_book_row(0.00024, 2, 100),
+            make_book_row(0.00025, 2, 100),
+        ])
+        book = make_client(exchange).get_funding_book("USD")
+
+        assert [level["rate"] for level in book] == [0.00024, 0.00025, 0.00026]
+
+    def test_string_fields_are_converted(self, make_client):
+        exchange = FakeExchange(public_get_book_symbol_precision=[
+            make_book_row(0.0002808219178082192, 120, 12345.67)
+        ])
+        level = make_client(exchange).get_funding_book("USD")[0]
+
+        assert isinstance(level["rate"], float)
+        assert isinstance(level["period"], int)
+        assert isinstance(level["amount"], float)
+        assert level["period"] == 120
+
+    def test_requests_deep_enough_book(self, make_client):
+        """len 預設只給 25 檔（約 3 萬 USD），算不出排隊位置。"""
+        exchange = FakeExchange(public_get_book_symbol_precision=[])
+        make_client(exchange).get_funding_book("USD")
+
+        _, params = exchange.calls[0]
+        assert params["len"] == 250
+        assert params["symbol"] == "fUSD"
+
+    def test_network_error_is_retryable(self, make_client):
+        exchange = FakeExchange(public_get_book_symbol_precision=ccxt.NetworkError("timeout"))
+        with pytest.raises(RetryableError):
+            make_client(exchange).get_funding_book("USD")
+
+    def test_malformed_row_is_retryable(self, make_client):
+        exchange = FakeExchange(public_get_book_symbol_precision=[["only-one-field"]])
+        with pytest.raises(RetryableError):
+            make_client(exchange).get_funding_book("USD")
+
+    def test_works_without_credentials(self, fake_logger, monkeypatch):
+        """行情是公開資料，dry-run 也該拿得到——否則 dry-run 驗不了定價邏輯。"""
+        client = BitfinexClient({}, fake_logger, dry_run=True)
+        exchange = FakeExchange(public_get_book_symbol_precision=[make_book_row(0.00025, 2, 100)])
+        monkeypatch.setattr(client, "_public_exchange", lambda: exchange)
+
+        assert client.get_funding_book("USD")[0]["rate"] == 0.00025
+
+
+class TestGetActivePositions:
+    def test_merges_credits_and_loans(self, make_client):
+        # 兩個端點都要查：credits 是「借款人已拿去用」，loans 是「借走但還沒用掉」，
+        # 對放貸方而言兩者都是錢已經出去、正在生息。只查一個會漏掉另一半。
+        exchange = FakeExchange(
+            private_post_auth_r_funding_credits_symbol=[make_position_array(position_id="1")],
+            private_post_auth_r_funding_loans_symbol=[make_position_array(position_id="2", length=21)],
+        )
+        positions = make_client(exchange).get_active_positions("USD")
+
+        assert [item["id"] for item in positions] == ["1", "2"]
+        assert [item["kind"] for item in positions] == ["credit", "loan"]
+
+    def test_string_fields_are_converted(self, make_client):
+        exchange = FakeExchange(
+            private_post_auth_r_funding_credits_symbol=[
+                make_position_array(amount=160.5, rate=0.000273, period=7)
+            ],
+            private_post_auth_r_funding_loans_symbol=[],
+        )
+        position = make_client(exchange).get_active_positions("USD")[0]
+
+        assert position["amount"] == 160.5
+        assert position["rate"] == 0.000273
+        assert position["period"] == 7
+        assert isinstance(position["opened_at"], int)
+
+    def test_amount_is_always_positive(self, make_client):
+        exchange = FakeExchange(
+            private_post_auth_r_funding_credits_symbol=[make_position_array(amount=-160.0)],
+            private_post_auth_r_funding_loans_symbol=[],
+        )
+        assert make_client(exchange).get_active_positions("USD")[0]["amount"] == 160.0
+
+    def test_unparsable_row_is_logged_not_raised(self, make_client, fake_logger):
+        """一筆壞資料不該害整輪失敗，但**一定要留下原始內容**。
+
+        欄位索引還沒被真實回應驗證過，萬一猜錯，這行日誌就是唯一的線索——
+        沒有它就變成「成交了卻沒人知道」的翻版，只是換個地方發生。
+        """
+        exchange = FakeExchange(
+            private_post_auth_r_funding_credits_symbol=[["too", "short"]],
+            private_post_auth_r_funding_loans_symbol=[],
+        )
+        assert make_client(exchange).get_active_positions("USD") == []
+        assert any("無法解析已借出部位" in message for message in fake_logger.messages["error"])
+        assert any("too" in message for message in fake_logger.messages["error"])
+
+    def test_dry_run_never_queries(self, fake_logger):
+        assert BitfinexClient({}, fake_logger, dry_run=True).get_active_positions("USD") == []
+
+    def test_auth_error_is_fatal(self, make_client):
+        exchange = FakeExchange(
+            private_post_auth_r_funding_credits_symbol=ccxt.AuthenticationError("bad key")
+        )
+        with pytest.raises(FatalError):
+            make_client(exchange).get_active_positions("USD")
+
+
+class TestGetActiveOffers:
+    def test_returns_parsed_offers_without_cancelling(self, make_client):
+        exchange = FakeExchange(
+            private_post_auth_r_funding_offers_symbol=[make_offer_array(offer_id=5081917947)]
+        )
+        offers = make_client(exchange).get_active_offers("USD")
+
+        assert offers[0]["id"] == 5081917947
+        assert isinstance(offers[0]["id"], int)
+        # 唯讀：整個呼叫過程不該碰到取消端點
+        assert all(name != "private_post_auth_w_funding_offer_cancel" for name, _ in exchange.calls)
+
+    def test_dry_run_returns_empty(self, fake_logger):
+        assert BitfinexClient({}, fake_logger, dry_run=True).get_active_offers("USD") == []

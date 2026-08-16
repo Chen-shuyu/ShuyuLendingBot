@@ -27,7 +27,7 @@ systemd 放棄重啟）——免費方案每月 200 則，每輪推一則兩天�
 [core/bot_engine.py]  ──主迴圈狀態機──┐
         │                            │
         ├─ api/bitfinex_client.py ───┤（交易所讀寫、Rate Limit 重試）
-        ├─ strategies/frr_plus.py ───┤（純函式：算利率/金額/天期）
+        ├─ strategies/orderbook_depth.py ┤（純函式：依排隊位置算利率/金額/天期）
         ├─ db/repository.py ─────────┤（SQLite WAL：掛單/收益/狀態）
         └─ notify/line_messaging.py ─┘（LINE Messaging API push）
 ```
@@ -42,17 +42,21 @@ ShuyuLendingBot/
 ├── config/settings.py          # YAML + 環境變數 + secrets 載入
 ├── api/                        # 交易所適配層
 │   ├── base.py                 # ExchangeClient 抽象介面（M4 新增）
-│   ├── bitfinex_client.py      # BitfinexClient：連線、餘額、FRR、取消掛單、建立掛單
-│   │                            # （皆呼叫 ccxt raw API，見 D009／D010）
+│   ├── bitfinex_client.py      # BitfinexClient：連線、餘額、FRR、市場深度、場上掛單、
+│   │                            # 已借出部位、取消掛單、建立掛單
+│   │                            # （皆呼叫 ccxt raw API，見 D009／D010／D030）
 │   └── rate_limiter.py         # RetrySettings + with_retry 指數退避（M3 新增）
 ├── strategies/                 # 策略層（純函式，易測試）
 │   ├── base.py                 # Strategy 介面與 OfferPlan 資料結構（M4 新增）
-│   └── frr_plus.py             # FrrPlusStrategy.build_offer_plan()：門檻/拆單/天期判斷
+│   ├── orderbook_depth.py      # OrderBookDepthStrategy：依訂單簿排隊位置定價
+│   │                            # （2026-08-16 起的預設策略，見 D030）
+│   └── frr_plus.py             # FrrPlusStrategy：舊的 FRR 加減碼，保留供對照
 ├── core/
 │   └── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
 │                                # FailureTracker、離開碼常數（M4 由 main.py 移入）
 ├── db/
-│   ├── models.py               # loan_offers / earnings_daily / bot_state 的 DDL（M3 新增）
+│   ├── models.py               # loan_offers / earnings_daily / funding_positions /
+│   │                            # bot_state 的 DDL（funding_positions 為 D030 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── notify/
 │   └── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
@@ -99,12 +103,20 @@ ShuyuLendingBot/
   `FatalError` 直接往外拋（見 D013）。
 - `strategies/base.py`：`Strategy` 介面與 `OfferPlan` 資料結構——策略層與迴圈層之間的契約。
   `OfferPlan` 是**計畫值不是成交值**，落帳一律以交易所回報為準。
-- `strategies/frr_plus.py`：`FrrPlusStrategy`，FRR+ 策略純函式，輸入餘額與
-  FRR，輸出 `OfferPlan` 清單。已含 `maxtolend` 縮量、spread 百分比遞增階梯、依單筆最小量
-  自動降階、逐筆判斷天期（D011）。尚待：`maxtolend` 只管本輪掛出總額，未計入已放貸部位。
+- `strategies/orderbook_depth.py`：`OrderBookDepthStrategy`，**2026-08-16 起的預設策略**
+  （見 D030）。輸入餘額與市場深度，輸出 `OfferPlan` 清單。定價只有一句話：
+  在「排在我們前面的錢不超過 `target_queue_usd`」的前提下挑利率最高的一檔。
+  `minimum_rate` 在這裡的語意是**「低於它就不掛」而不是「拉高到它」**——
+  後者會把單子推到簿子外，變成永遠不會成交的死單。
+- `strategies/frr_plus.py`：`FrrPlusStrategy`，舊的 FRR 加減碼策略，保留供一行切換對照。
+  **不是備援**：它已知會把單子掛到市場之上（FRR 高過成交天花板），
+  拿不到市場深度時一律不掛，而不是退回這條路。
 - `core/bot_engine.py`：`BotEngine.run_once()` 單輪巡檢，順序為
-  取消舊掛單 → 等待餘額釋放 → 查餘額 → 抓 FRR → 產生掛單計畫 → 逐筆掛單並落帳 →
-  寫入 `bot_state` → 通知；主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`，
+  **對帳已借出部位（成交偵測）** → 查場上現有掛單 → 查餘額 → 抓 FRR → 取得市場深度 →
+  產生掛單計畫 → **與場上比對，實質相同就什麼都不做** → 取消舊掛單 → 等待餘額釋放 →
+  以真實餘額重算 → 逐筆掛單並落帳 → 寫入 `bot_state` → 通知。
+  **對帳一定要排在取消之前**（取消會改變場上狀態），而「條件沒變就不重掛」
+  保護的是排隊位置——同利率下先掛先成交（D030）；主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`，
   並以 `FailureTracker` 累計連續失敗、跨過門檻時告警一次、恢復時再通知一次（D013）。
   `run_forever()` 包住啟動檢查、主迴圈與三條退出路徑，回傳離開碼（`EXIT_OK` / 
   `EXIT_UNEXPECTED` / `EXIT_FATAL` 也定義在這裡，見 D016、D017、D019）。

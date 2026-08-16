@@ -31,6 +31,37 @@ class ExchangeClient(ABC):
         """取得放貸市場的 FRR（Flash Return Rate，日利率）。"""
 
     @abstractmethod
+    def get_funding_book(self, currency: str) -> List[Dict[str, Any]]:
+        """取得放貸市場的**供給側**掛單簿，由低利率往高排序。
+
+        每一檔是 `{"rate": float, "period": int, "amount": float}`，金額一律為正數
+        （借款需求側在來源資料裡是負的，實作要負責濾掉）。回傳空清單代表
+        「這次拿不到市場深度」，策略層據此決定跳過本輪，而不是拿舊資料硬掛。
+
+        用 dict 而不是共用的 dataclass，是為了不讓策略層與交易所層互相 import
+        ——兩邊各自只依賴這份欄位約定（與 `cancel_active_offers()` 的慣例一致）。
+        """
+
+    @abstractmethod
+    def get_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
+        """查詢場上尚未成交的放貸掛單，**不做任何取消動作**。
+
+        與 `cancel_active_offers()` 查的是同一份資料，但職責分開：主迴圈要先看過
+        場上現況才能決定「這一輪到底該不該重掛」。合在一起的話，光是想知道
+        「現在掛的是什麼」就得先把單子取消掉，而取消本身就是我們要避免的動作。
+        """
+
+    @abstractmethod
+    def get_active_positions(self, currency: str) -> List[Dict[str, Any]]:
+        """查詢**已經借出去**的部位（成交後的資金），供成交偵測與總曝險計算使用。
+
+        Bitfinex 把它拆成兩個端點：credits（借款人已用於持倉）與 loans（借出但尚未
+        被使用）。對放貸方而言兩者都是「錢已經出去、正在生息」，所以這裡合併回傳，
+        每一筆是 `{"id": str, "amount": float, "rate": float, "period": int,
+        "opened_at": int|None, "kind": "credit"|"loan"}`。
+        """
+
+    @abstractmethod
     def cancel_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """取消尚未成交的放貸掛單，回傳被取消的掛單資訊清單。"""
 

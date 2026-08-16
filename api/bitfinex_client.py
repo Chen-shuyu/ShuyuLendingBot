@@ -120,6 +120,177 @@ class BitfinexClient(ExchangeClient):
         except (IndexError, ValueError, TypeError) as exc:
             raise RetryableError(f"無法解析 {currency} 的 FRR 回應：{exc}") from exc
 
+    def _public_exchange(self):
+        """回傳可用於**公開端點**的 ccxt 實例。
+
+        行情是公開資料，不需要簽章、也沒有下單風險，所以 dry-run 或沒設定金鑰時
+        照樣建得起來——這讓 dry-run 能用真實的市場深度驗證定價，而不是拿假資料
+        空跑。餘額與掛單那些私有端點仍然受 `self.exchange is None` 擋著，
+        dry-run 不會因為這個實例而動到真錢。
+        """
+        if self.exchange is not None:
+            return self.exchange
+        if getattr(self, "_public_client", None) is None:
+            if ccxt is None:
+                raise FatalError("ccxt 尚未安裝，無法查詢市場行情。")
+            self._public_client = ccxt.bitfinex({"enableRateLimit": True, "timeout": 10000})
+        return self._public_client
+
+    # 純讀取且冪等，可安全重試。
+    @with_retry()
+    def get_funding_book(self, currency: str) -> List[Dict[str, Any]]:
+        """取得放貸市場供給側掛單簿（由低利率往高排序）。
+
+        **為什麼要抓 250 檔**：`len` 預設只給 25 檔，那只涵蓋簿子最前面約 3 萬 USD，
+        算不出「我們排在多少錢後面」——而排隊位置正是這個策略唯一在意的東西
+        （見 DECISIONS.md D030）。250 檔對應約 500 萬 USD，足以蓋過整個供給側。
+
+        回傳的 `amount` 一律為正。Bitfinex 用正負號區分方向：**負數是借款需求側**，
+        對放貸方來說那是買家不是競爭者，混進來會把排隊金額算大好幾倍。
+        """
+        exchange = self._public_exchange()
+        symbol = f"f{currency}"
+        try:
+            # /v2/book/{symbol}/{precision}。P0 是精度最高的聚合層級。
+            rows = exchange.public_get_book_symbol_precision(
+                {"symbol": symbol, "precision": "P0", "len": 250}
+            )
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢 {symbol} 掛單簿逾時或超過速率限制：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise RetryableError(f"查詢 {symbol} 掛單簿時交易所回傳錯誤：{exc}") from exc
+
+        levels: List[Dict[str, Any]] = []
+        try:
+            for row in rows:
+                # [0]=RATE, [1]=PERIOD, [2]=COUNT, [3]=AMOUNT；**每個欄位都是字串**
+                # （實測 `'0.0002808219178082192'`），所以一律自己轉型（D027）。
+                amount = float(row[3])
+                if amount <= 0:
+                    continue
+                levels.append(
+                    {"rate": float(row[0]), "period": int(row[1]), "amount": amount}
+                )
+        except (IndexError, ValueError, TypeError) as exc:
+            raise RetryableError(f"無法解析 {symbol} 掛單簿回應：{exc}") from exc
+
+        levels.sort(key=lambda level: level["rate"])
+        return levels
+
+    @with_retry()
+    def get_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
+        """查詢場上未成交的放貸掛單（唯讀，不取消任何東西）。"""
+        if self.dry_run:
+            return []
+
+        if self.exchange is None:
+            raise FatalError("交易所客戶端尚未初始化，無法查詢掛單。")
+
+        symbol = f"f{currency}" if currency else "fUSD"
+        return self._parse_offers(self._fetch_raw_offers(symbol))
+
+    def _fetch_raw_offers(self, symbol: str):
+        """打 funding offers 端點並統一例外分類（查詢與取消兩條路徑共用）。"""
+        try:
+            offers = self.exchange.private_post_auth_r_funding_offers_symbol({"symbol": symbol})
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢未成交放貸掛單逾時或超過速率限制：{exc}") from exc
+        except ccxt.AuthenticationError as exc:
+            raise FatalError(f"查詢未成交放貸掛單認證失敗：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise FatalError(f"查詢未成交放貸掛單時交易所回傳錯誤：{exc}") from exc
+        return offers
+
+    @staticmethod
+    def _parse_offers(offers) -> List[Dict[str, Any]]:
+        """把 funding offer 陣列轉成統一的 dict。
+
+        欄位索引以 2026-08-16 對正式帳號實打的回應核對過（21 欄，全部是字串）：
+        0=ID, 1=SYMBOL, 4=AMOUNT(剩餘), 5=AMOUNT_ORIG, 10=STATUS, 14=RATE, 15=PERIOD。
+        """
+        parsed: List[Dict[str, Any]] = []
+        for offer in offers:
+            parsed.append(
+                {
+                    # **id 一定要轉成整數**：取消端點只收整數，收到字串會回 `id: invalid`
+                    # （2026-08-15 實單踩過，見 DECISIONS.md D026）。
+                    "id": int(offer[0]),
+                    "symbol": offer[1],
+                    "amount": float(offer[4]),
+                    "rate": float(offer[14]),
+                    "period": int(offer[15]),
+                }
+            )
+        return parsed
+
+    @with_retry()
+    def get_active_positions(self, currency: str) -> List[Dict[str, Any]]:
+        """查詢已經借出去的部位（credits ＋ loans 合併）。
+
+        **為什麼要查兩個端點**：Bitfinex 把已成交的放貸拆成 credits（借款人已拿去
+        用在持倉上）與 loans（已被借走但還沒用掉）。對放貸方來說兩者都是
+        「錢已經出去、正在生息」，只查其中一個會漏掉另一半。
+
+        **欄位索引取自官方文件，尚未經真實回應核對**——本專案至今一筆都沒成交過，
+        探測時兩個端點都是空清單。所以解析刻意寫成防禦式：長度不足就跳過該筆並把
+        原始內容寫進日誌，讓第一筆真實成交自己把結構告訴我們（D027 的做法）。
+        拿到真實回應後要回來把這段註解改成「已核對」。
+        """
+        if self.dry_run:
+            return []
+
+        if self.exchange is None:
+            raise FatalError("交易所客戶端尚未初始化，無法查詢已借出部位。")
+
+        symbol = f"f{currency}"
+        positions: List[Dict[str, Any]] = []
+        for kind, method in (
+            ("credit", "private_post_auth_r_funding_credits_symbol"),
+            ("loan", "private_post_auth_r_funding_loans_symbol"),
+        ):
+            try:
+                rows = getattr(self.exchange, method)({"symbol": symbol})
+            except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+                raise RetryableError(f"查詢已借出部位（{kind}）逾時或超過速率限制：{exc}") from exc
+            except ccxt.AuthenticationError as exc:
+                raise FatalError(f"查詢已借出部位（{kind}）認證失敗：{exc}") from exc
+            except ccxt.ExchangeError as exc:
+                raise FatalError(f"查詢已借出部位（{kind}）時交易所回傳錯誤：{exc}") from exc
+
+            positions.extend(self._parse_positions(rows, kind))
+        return positions
+
+    def _parse_positions(self, rows, kind: str) -> List[Dict[str, Any]]:
+        """解析 funding credits／loans 陣列。
+
+        欄位（官方文件）：0=ID, 1=SYMBOL, 5=AMOUNT, 7=STATUS, 11=RATE, 12=PERIOD,
+        13=MTS_OPENING。credits 比 loans 多一個 21=POSITION_PAIR，前 14 欄一致，
+        所以兩者共用這支解析。
+        """
+        parsed: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                if len(row) <= 13:
+                    raise IndexError(f"欄位數只有 {len(row)}，少於預期的 14")
+                parsed.append(
+                    {
+                        "id": str(row[0]),
+                        "symbol": row[1],
+                        "amount": abs(float(row[5])),
+                        "rate": float(row[11]),
+                        "period": int(row[12]),
+                        "opened_at": int(row[13]) if row[13] is not None else None,
+                        "kind": kind,
+                    }
+                )
+            except (IndexError, ValueError, TypeError) as exc:
+                # 不讓一筆解析不了的資料害整輪失敗——但一定要留下原始內容，
+                # 否則就是「成交了卻沒人知道」的翻版，只是換個地方發生。
+                self.logger.error(
+                    f"無法解析已借出部位（{kind}）：{exc}；原始回應：{row!r}"
+                )
+        return parsed
+
     # 取消是冪等操作（重試時會重新查詢，已取消的單不會再出現在清單裡），可安全重試。
     # 唯一的邊界情況：某筆取消其實已在交易所生效、只是回應逾時，重試後該筆不會被算進
     # 回傳清單，主迴圈因此可能略過「等待餘額釋放」而讀到偏舊的餘額——結果只是本輪少掛
@@ -135,35 +306,16 @@ class BitfinexClient(ExchangeClient):
             raise FatalError("交易所客戶端尚未初始化，無法取消掛單。")
 
         symbol = f"f{currency}" if currency else "fUSD"
-        try:
-            # 目前釘選的 ccxt 版本（合併版 bitfinex）沒有提供統一的
-            # fetch_funding_offers / cancel_funding_offer，只能直接呼叫
-            # Bitfinex V2 底層 implicit API（與 get_frr() 呼叫 public_get_ticker_symbol
-            # 是同一種做法）。
-            offers = self.exchange.private_post_auth_r_funding_offers_symbol({"symbol": symbol})
-        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
-            raise RetryableError(f"查詢未成交放貸掛單逾時或超過速率限制：{exc}") from exc
-        except ccxt.AuthenticationError as exc:
-            raise FatalError(f"查詢未成交放貸掛單認證失敗：{exc}") from exc
-        except ccxt.ExchangeError as exc:
-            raise FatalError(f"查詢未成交放貸掛單時交易所回傳錯誤：{exc}") from exc
+        # 目前釘選的 ccxt 版本（合併版 bitfinex）沒有提供統一的
+        # fetch_funding_offers / cancel_funding_offer，只能直接呼叫
+        # Bitfinex V2 底層 implicit API（與 get_frr() 呼叫 public_get_ticker_symbol
+        # 是同一種做法）。查詢與解析和 `get_active_offers()` 共用同一份實作——
+        # 欄位索引只寫在一個地方，才不會有一邊改了另一邊沒改。
+        offers = self._parse_offers(self._fetch_raw_offers(symbol))
 
         cancelled: List[Dict[str, Any]] = []
-        for offer in offers:
-            # Bitfinex V2 funding offer 陣列欄位：0=ID, 1=SYMBOL, 4=AMOUNT, 14=RATE, 15=PERIOD
-            # https://docs.bitfinex.com/reference/rest-auth-funding-offers
-            # **id 一定要轉回整數**：ccxt 對這個 implicit 端點回傳的每個欄位都是
-            # 字串（實測 `'5081103121'`），而 Bitfinex 的取消端點只收整數，
-            # 收到字串會回 `id: invalid`。2026-08-15 實單踩到，見 DECISIONS.md D026。
-            # 下面 amount/rate/period 早就有轉型，唯獨要送回 API 的這個漏了。
-            offer_id = int(offer[0])
-            offer_info = {
-                "id": offer_id,
-                "symbol": offer[1],
-                "amount": float(offer[4]),
-                "rate": float(offer[14]),
-                "period": int(offer[15]),
-            }
+        for offer_info in offers:
+            offer_id = offer_info["id"]
             try:
                 self.exchange.private_post_auth_w_funding_offer_cancel({"id": offer_id})
             except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:

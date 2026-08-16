@@ -47,14 +47,14 @@ class TestInitialisation:
         # NORMAL = 1；搭配 WAL 已足夠，最壞情況只失去最後幾筆寫入
         assert repository.connection.execute("PRAGMA synchronous").fetchone()[0] == 1
 
-    def test_creates_all_three_tables(self, repository):
+    def test_creates_every_table(self, repository):
         names = {
             row[0]
             for row in repository.connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        assert {"loan_offers", "earnings_daily", "bot_state"} <= names
+        assert {"loan_offers", "earnings_daily", "funding_positions", "bot_state"} <= names
 
     def test_creates_loan_offers_index(self, repository):
         names = {
@@ -334,3 +334,110 @@ class TestNowIso:
         """時區資料查不到不該讓機器人停擺——退回 UTC，而 +0000 偏移會讓人看得出來。"""
         monkeypatch.setenv("BFX_TIMEZONE", "Mars/Olympus_Mons")
         assert now_iso().endswith("+00:00")
+
+
+class TestSyncPositions:
+    """成交偵測的核心（TASKS.md P2-1）。
+
+    在它之前，錢借出去之後餘額歸零，機器人只會寫一句「可放貸金額不足，略過本輪」
+    ——跟錢包本來就是空的完全無法區分。
+    """
+
+    @staticmethod
+    def position(position_id="1", amount=160.0, rate=0.00025, period=2, kind="credit",
+                 opened_at=1786872920000):
+        return {
+            "id": position_id,
+            "amount": amount,
+            "rate": rate,
+            "period": period,
+            "kind": kind,
+            "opened_at": opened_at,
+        }
+
+    def test_first_sighting_counts_as_opened(self, repository):
+        changes = repository.sync_positions("USD", [self.position()])
+
+        assert [item["id"] for item in changes["opened"]] == ["1"]
+        assert changes["closed"] == []
+
+    def test_same_position_is_not_reported_twice(self, repository):
+        repository.sync_positions("USD", [self.position()])
+        changes = repository.sync_positions("USD", [self.position()])
+
+        assert changes["opened"] == []
+        assert changes["closed"] == []
+
+    def test_disappearing_position_counts_as_closed(self, repository):
+        repository.sync_positions("USD", [self.position()])
+        changes = repository.sync_positions("USD", [])
+
+        assert [row["position_id"] for row in changes["closed"]] == ["1"]
+
+    def test_closed_position_is_not_reported_again(self, repository):
+        repository.sync_positions("USD", [self.position()])
+        repository.sync_positions("USD", [])
+        changes = repository.sync_positions("USD", [])
+
+        assert changes["closed"] == []
+
+    def test_reopening_the_database_does_not_replay_old_fills(self, repository, tmp_path):
+        """**重啟不能把場上既有部位當成新成交。**
+
+        狀態只放記憶體的話，每次部署都會推一輪假的成交通知——
+        而這個管道只要騙過人一次，之後就不會再被相信（同 D023、D029 的判斷）。
+        """
+        repository.sync_positions("USD", [self.position()])
+
+        from db.repository import Repository
+
+        reopened = Repository(str(repository.db_path))
+        changes = reopened.sync_positions("USD", [self.position()])
+        reopened.close()
+
+        assert changes["opened"] == []
+
+    def test_records_the_position_details(self, repository):
+        repository.sync_positions("USD", [self.position(amount=160.5, rate=0.000273, period=7)])
+        row = dict(
+            repository.connection.execute("SELECT * FROM funding_positions").fetchone()
+        )
+
+        assert row["amount"] == 160.5
+        assert row["rate"] == 0.000273
+        assert row["period"] == 7
+        assert row["kind"] == "credit"
+        assert row["closed_at"] is None
+
+    def test_opened_at_is_converted_to_local_iso(self, repository):
+        repository.sync_positions("USD", [self.position(opened_at=1786872920000)])
+        row = repository.connection.execute(
+            "SELECT opened_at FROM funding_positions"
+        ).fetchone()
+
+        # 帶時區偏移，與專案其他時間戳一致（D028）
+        assert row["opened_at"].endswith("+08:00") or row["opened_at"].endswith("+00:00")
+
+    def test_unparsable_opened_at_does_not_break_the_row(self, repository):
+        """時間轉不動就留 None——為了一個輔助欄位讓整輪失敗並不划算。"""
+        repository.sync_positions("USD", [self.position(opened_at="not-a-timestamp")])
+        row = repository.connection.execute(
+            "SELECT position_id, opened_at FROM funding_positions"
+        ).fetchone()
+
+        assert row["position_id"] == "1"
+        assert row["opened_at"] is None
+
+    def test_open_positions_lists_only_live_ones(self, repository):
+        repository.sync_positions("USD", [self.position("1"), self.position("2")])
+        repository.sync_positions("USD", [self.position("2")])
+
+        assert [row["position_id"] for row in repository.open_positions("USD")] == ["2"]
+
+    def test_currencies_do_not_interfere(self, repository):
+        repository.sync_positions("USD", [self.position("1")])
+        changes = repository.sync_positions("EUR", [self.position("2")])
+
+        # 查 EUR 時不該把 USD 的部位判成「消失了」
+        assert changes["closed"] == []
+        assert len(repository.open_positions("USD")) == 1

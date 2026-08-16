@@ -48,6 +48,34 @@ CREATE TABLE IF NOT EXISTS earnings_daily (
 );
 """
 
+# 已借出部位（Bitfinex 的 funding credits ＋ loans）。
+#
+# **為什麼一定要落地而不是只放記憶體**：成交偵測靠的是「這個 id 以前沒見過」。
+# 狀態只放記憶體的話，每次重啟都會把場上所有部位當成新成交，推一輪假的成交通知
+# ——而這個管道只要騙過人一次，之後就不會再被相信（同 D023、D029 的判斷）。
+#
+# closed_at 為 NULL 代表還在生息中；部位從交易所的清單裡消失時才補上時間，
+# 這樣「什麼時候借出、什麼時候還回來」兩個時間點都留得下來，日後算實際年化
+# （含閒置時間）才有依據。
+CREATE_FUNDING_POSITIONS = """
+CREATE TABLE IF NOT EXISTS funding_positions (
+    position_id   TEXT PRIMARY KEY,
+    currency      TEXT    NOT NULL,
+    amount        REAL    NOT NULL,
+    rate          REAL    NOT NULL,
+    period        INTEGER NOT NULL,
+    kind          TEXT    NOT NULL,
+    opened_at     TEXT,
+    first_seen_at TEXT    NOT NULL,
+    closed_at     TEXT
+);
+"""
+
+CREATE_FUNDING_POSITIONS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_funding_positions_open
+    ON funding_positions (closed_at);
+"""
+
 # 單列狀態表。CHECK (id = 1) 從結構上保證只會有一列，不必靠程式自律。
 # consecutive_failures 存進 DB 而非只放記憶體，是為了讓外部健康檢查
 # （未來的容器 healthcheck）不必啟動 Python 就能判斷機器人是否已連續失敗。
@@ -70,6 +98,8 @@ ALL_STATEMENTS = (
     CREATE_LOAN_OFFERS,
     CREATE_LOAN_OFFERS_INDEX,
     CREATE_EARNINGS_DAILY,
+    CREATE_FUNDING_POSITIONS,
+    CREATE_FUNDING_POSITIONS_INDEX,
     CREATE_BOT_STATE,
     INIT_BOT_STATE_ROW,
 )

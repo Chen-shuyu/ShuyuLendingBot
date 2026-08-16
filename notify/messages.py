@@ -257,22 +257,78 @@ def offers_placed(plans: Iterable[Any], first_cycle: bool = False, dry_run: bool
 
 
 def offers_gone(reason: str) -> str:
-    """掛單從場上消失了。
+    """掛單從場上消失，**而且查過部位、確認不是成交**。
 
-    **刻意不寫成「成交了」**：機器人目前還沒有查詢已借出部位的能力（TASKS.md P2-1），
-    餘額歸零可能是被借走、也可能是資金被搬到別的錢包。訊息只講看得到的事實，
-    推測留給人——寫死成「成交」而事後發現是轉帳，這個管道就再也不可信了。
+    成交偵測（P2-1）做出來之後，這則訊息的意思變窄也變準了：機器人每輪都會核對
+    已借出部位，真的成交會走 `positions_opened()`。所以還會走到這裡，代表掛單消失
+    **不是**因為被借走——比較可能是餘額被移走、或是掛單被交易所端取消。
+
+    仍然刻意不把原因寫死：訊息只講查得到的事實，推測留給人。猜錯一次，
+    這個管道就再也不會被相信（同 D023 的判斷）。
     """
     return build(
         CATEGORY_TRADE,
         "掛單已不在場上",
         {
             "機器人的說法": reason,
-            "可能原因": "掛單被借走（成交），或融資錢包餘額被移走",
-            "備註": "機器人尚無法查詢已借出部位，分不出是哪一種（TASKS.md P2-1）",
+            "已排除": "本輪沒有偵測到新的已借出部位，所以不是成交",
+            "可能原因": "融資錢包餘額被移走，或掛單在交易所端被取消",
         },
         level=LEVEL_WARNING,
     )
+
+
+def _describe_positions(positions: Iterable[Any]) -> Dict[str, Any]:
+    """把已借出部位攤成訊息欄位（單筆攤平、多筆逐列，與掛單的寫法一致）。
+
+    部位可能是交易所回傳的 dict，也可能是從 DB 讀回來的列；兩者的鍵名刻意取成一樣
+    （`amount` / `rate` / `period`），這裡才不必分兩套。
+    """
+    positions = list(positions)
+    total = sum(float(item["amount"]) for item in positions)
+
+    fields: Dict[str, Any] = {}
+    if len(positions) == 1:
+        item = positions[0]
+        fields["金額"] = format_amount(float(item["amount"]))
+        fields["利率"] = format_rate(float(item["rate"]))
+        fields["天期"] = f"{int(item['period'])} 天"
+        return fields
+
+    fields["筆數"] = f"{len(positions)} 筆"
+    fields["合計"] = format_amount(total)
+    for index, item in enumerate(positions, start=1):
+        fields[f"第 {index} 筆"] = (
+            f"{format_amount(float(item['amount']))}／"
+            f"{format_rate(float(item['rate']))}／{int(item['period'])} 天"
+        )
+    return fields
+
+
+def positions_opened(positions: Iterable[Any], balance_usd: Optional[float] = None) -> str:
+    """**錢真的借出去了。**
+
+    這是整個專案存在的理由，也是最值得花額度的一則訊息（TASKS.md P2-4）。
+    在成交偵測做出來之前，這件事發生時機器人只會寫一句「可放貸金額不足，略過本輪」
+    ——與「錢包本來就是空的」完全無法區分（P2-1）。
+    """
+    fields = _describe_positions(positions)
+    if balance_usd is not None:
+        fields["剩餘可放貸"] = format_amount(balance_usd)
+    return build(CATEGORY_TRADE, "資金已借出（成交）", fields)
+
+
+def positions_closed(positions: Iterable[Any], balance_usd: Optional[float] = None) -> str:
+    """借出的資金已還回來（到期或提前結清）。
+
+    值得推一則：錢回到融資錢包代表**下一輪就會重新掛單**，而重新掛單就是重新定價。
+    使用者若想在這個時間點調整策略，這是唯一的時機。
+    """
+    fields = _describe_positions(positions)
+    if balance_usd is not None:
+        fields["目前可放貸"] = format_amount(balance_usd)
+    fields["後續"] = "下一輪會重新掛單"
+    return build(CATEGORY_TRADE, "借出的資金已收回", fields)
 
 
 def offer_failed(plan: Any, reason: str, retryable: bool = True) -> str:

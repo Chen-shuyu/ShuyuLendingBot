@@ -8,6 +8,7 @@
 """
 
 import io
+import re
 import json
 import sqlite3
 
@@ -345,3 +346,28 @@ class TestLoadSecrets:
     def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.setenv("BFX_SECRETS_FILE", str(tmp_path / "nope.env"))
         assert notify_failure.load_secrets() == {}
+
+
+class TestTimestamp:
+    """告警腳本與機器人寫進**同一個日誌檔**，時間戳必須是同一個時區。
+
+    舊版兩邊都用 `datetime.now()`，看起來一致，實際上取的是各自行程的本地時區——
+    機器人在容器（UTC）、這支腳本在主機（CST），於是相鄰兩行差 8 小時（TASKS.md）。
+    """
+
+    def test_uses_taipei_timezone_with_offset(self):
+        stamp = notify_failure.timestamp()
+        assert stamp.endswith("+0800")
+
+    def test_format_matches_bot_log_lines(self):
+        """格式要跟 `utils/logger.ZonedFormatter` 一致：`YYYY-MM-DD HH:MM:SS,mmm +0800`。"""
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [+-]\d{4}", notify_failure.timestamp())
+
+    def test_follows_timezone_env_override(self, monkeypatch):
+        monkeypatch.setenv("BFX_TIMEZONE", "UTC")
+        assert notify_failure.timestamp().endswith("+0000")
+
+    def test_falls_back_to_utc_when_timezone_unknown(self, monkeypatch):
+        """告警腳本跑在致命錯誤的通報路徑上，絕不能因為時區查不到就自己爆掉。"""
+        monkeypatch.setenv("BFX_TIMEZONE", "Mars/Olympus_Mons")
+        assert notify_failure.timestamp().endswith("+0000")

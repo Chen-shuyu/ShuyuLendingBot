@@ -72,7 +72,8 @@ def evaluate(state: Optional[Dict[str, Any]], limit_seconds: int, now: Optional[
         return False, f"心跳時間無法解析：{raw}"
 
     if last_run_at.tzinfo is None:
-        # 寫入端一律帶 UTC 時區，這裡只是防呆：沒有時區就當成 UTC，
+        # 寫入端一律帶時區偏移（2026-08-16 起是 `+08:00`，之前是 `+00:00`，兩者
+        # 都是 aware 所以相減都正確），這裡只是防呆：沒有時區就當成 UTC，
         # 免得跟 now 相減直接拋 TypeError。
         last_run_at = last_run_at.replace(tzinfo=timezone.utc)
 

@@ -60,7 +60,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_UNIT = "shuyu-lending-bot.service"
 # 主機端的金鑰檔（見 DECISIONS.md D022）。容器內是 /run/secrets/secrets.env，
@@ -81,9 +82,30 @@ UNIT_PROPERTIES = {
 }
 
 
+def resolve_timezone():
+    """本專案時區，查不到就退回 UTC（見 `utils/clock.py` 的同名邏輯）。
+
+    **刻意與 `utils/clock.py` 重複**，不是疏漏：這支腳本由 systemd 在主機上直接執行，
+    只用標準函式庫、不匯入專案任何模組（D024 的獨立實作原則——它跑在致命錯誤的
+    告警路徑上，多一個 import 就多一個失敗點）。兩邊共用的只有環境變數名與預設值。
+    """
+    raw = os.getenv("BFX_TIMEZONE") or "Asia/Taipei"
+    try:
+        return ZoneInfo(raw)
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc
+
+
 def timestamp() -> str:
-    """與機器人日誌同格式的時間戳，讓兩邊的行可以一起看。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+    """與機器人日誌同格式的時間戳，讓兩邊的行可以一起看。
+
+    **原本這句話是假的。** 舊版用 `datetime.now()` 取本地時間，格式確實一樣，
+    但這支腳本跑在主機（CST）、機器人跑在容器（UTC），於是兩邊寫進**同一個日誌檔**
+    的時間差了 8 小時，而且行內看不出來是哪一個時區。現在兩邊都明確指定時區並附上
+    `+0800` 偏移，這句 docstring 才真的成立。
+    """
+    moment = datetime.now(resolve_timezone())
+    return f"{moment:%Y-%m-%d %H:%M:%S},{moment.microsecond // 1000:03d} {moment:%z}"
 
 
 def collect_unit_state(unit: str) -> dict:

@@ -52,6 +52,11 @@ retry:
 logging:
   level: INFO
   file: logs/bfx_lending_bot.log
+  # 時區。留空就採 `utils/clock.py` 的預設 `Asia/Taipei`（也可用環境變數 BFX_TIMEZONE
+  # 覆寫，主機端的 scripts/notify_failure.py 只吃得到環境變數那條路）。
+  # 日誌時間戳一律附上 `+0800` 偏移，這樣每一行自己就講得清楚是什麼時區——
+  # 2026-08-16 之前機器人在容器裡寫 UTC、主機腳本寫 CST，兩者混在同一個檔案裡差 8 小時。
+  timezone: Asia/Taipei
   max_bytes: 10485760       # 單一 log 檔上限（10MB），超過就輪替
   backup_count: 5           # 最多保留幾份輪替後的舊檔（.1 ~ .5）
 

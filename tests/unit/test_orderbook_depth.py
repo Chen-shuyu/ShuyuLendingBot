@@ -321,6 +321,27 @@ class TestMarketFloor:
 
         assert plans[0].rate == pytest.approx(0.00025, rel=1e-6)
 
+    def test_absolute_floor_still_wins_over_the_market_floor(self, make_strategy):
+        """兩道下限的分工：成交價下限把價位拉起來，`minimum_rate` 再決定賣不賣。
+
+        正式設定是 `minimum_rate` = 0.00021918（年化 8.00%，使用者指定）。
+        事故那種簿子下，成交價下限只拉得到年化 7.76%，仍低於地板 → **整輪不掛單**。
+        """
+        strategy = make_strategy(minimum_rate=0.00021918)
+        plans = strategy.build_offer_plan(344.30, 0.0003, self.WALL_BOOK, MARKET_TRADES)
+
+        # 成交價下限單獨算得出價位（0.00025 × 0.85 = 0.0002125），但它低於地板
+        assert strategy.market_rate(MARKET_TRADES) * strategy.market_floor_pct < 0.00021918
+        assert plans == []
+
+    def test_a_healthy_market_is_untouched_by_the_absolute_floor(self, make_strategy):
+        """正常市場上兩道下限都不介入，排隊規則照常運作。"""
+        plans = make_strategy(minimum_rate=0.00021918).build_offer_plan(
+            344.0, 0.0003, MARKET_BOOK, MARKET_TRADES
+        )
+
+        assert plans[0].rate == 0.00025
+
     def test_no_trades_means_no_offer(self, make_strategy):
         """看不見成交價就不掛。代價不對稱：少掛一輪損失幾毫，掛錯價位是半價鎖住好幾天。"""
         assert make_strategy().build_offer_plan(344.0, 0.0003, MARKET_BOOK, None) == []

@@ -42,14 +42,15 @@ ShuyuLendingBot/
 ├── config/settings.py          # YAML + 環境變數 + secrets 載入
 ├── api/                        # 交易所適配層
 │   ├── base.py                 # ExchangeClient 抽象介面（M4 新增）
-│   ├── bitfinex_client.py      # BitfinexClient：連線、餘額、FRR、市場深度、場上掛單、
-│   │                            # 已借出部位、取消掛單、建立掛單
-│   │                            # （皆呼叫 ccxt raw API，見 D009／D010／D030）
+│   ├── bitfinex_client.py      # BitfinexClient：連線、餘額、FRR、市場深度、近期成交、
+│   │                            # 場上掛單、已借出部位、取消掛單、建立掛單
+│   │                            # （皆呼叫 ccxt raw API，見 D009／D010／D030／D033）
 │   └── rate_limiter.py         # RetrySettings + with_retry 指數退避（M3 新增）
 ├── strategies/                 # 策略層（純函式，易測試）
 │   ├── base.py                 # Strategy 介面與 OfferPlan 資料結構（M4 新增）
-│   ├── orderbook_depth.py      # OrderBookDepthStrategy：依訂單簿排隊位置定價
-│   │                            # （2026-08-16 起的預設策略，見 D030）
+│   ├── orderbook_depth.py      # OrderBookDepthStrategy：依訂單簿排隊位置定價，
+│   │                            # 並以近期成交價為下限
+│   │                            # （2026-08-16 起的預設策略，見 D030／D033）
 │   └── frr_plus.py             # FrrPlusStrategy：舊的 FRR 加減碼，保留供對照
 ├── core/
 │   └── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
@@ -91,8 +92,12 @@ ShuyuLendingBot/
   重試」與「直接停止」；漏一個 ccxt 例外出去就會被最外層當成未預期例外，離開碼與重啟
   決策全錯（見 D021）。
 - `api/bitfinex_client.py`：封裝 `ccxt.bitfinex`，實作上述介面，提供
-  `test_connection`、`get_available_balance`、`get_frr`、`cancel_active_offers`、
-  `create_loan_offer`。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
+  `test_connection`、`get_available_balance`、`get_frr`、`get_funding_book`、
+  `get_recent_trades`、`get_active_offers`、`get_active_positions`、
+  `cancel_active_offers`、`create_loan_offer`。**`get_funding_book()` 與
+  `get_recent_trades()` 回答的是不同問題**：前者是「別人開價多少、我排第幾位」，
+  後者是「借款人實際付了多少」——只看前者會被一筆低價大單牽著走（D033）。
+  兩者都走公開端點，dry-run 下也拿得到，所以離線也驗得了定價。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
   `private_post_auth_r_funding_offers_symbol`／`private_post_auth_w_funding_offer_cancel`／
   `private_post_auth_w_funding_offer_submit`），詳細盤點見
   `.project-docs/CCXT_BITFINEX_API_INVESTIGATION.md`（D009／D010）。讀取類與取消類已包上
@@ -104,16 +109,24 @@ ShuyuLendingBot/
 - `strategies/base.py`：`Strategy` 介面與 `OfferPlan` 資料結構——策略層與迴圈層之間的契約。
   `OfferPlan` 是**計畫值不是成交值**，落帳一律以交易所回報為準。
 - `strategies/orderbook_depth.py`：`OrderBookDepthStrategy`，**2026-08-16 起的預設策略**
-  （見 D030）。輸入餘額與市場深度，輸出 `OfferPlan` 清單。定價只有一句話：
-  在「排在我們前面的錢不超過 `target_queue_usd`」的前提下挑利率最高的一檔。
-  `minimum_rate` 在這裡的語意是**「低於它就不掛」而不是「拉高到它」**——
-  後者會把單子推到簿子外，變成永遠不會成交的死單。
+  （見 D030、D033）。輸入餘額、市場深度與近期成交，輸出 `OfferPlan` 清單。
+  定價是一句話加兩道下限：
+  1. **排隊規則**：在「排在我們前面的錢不超過 `target_queue_usd`」的前提下挑利率最高的一檔。
+  2. **成交價下限**（D033）：不得低於「同天期成交的金額加權中位數 × `market_floor_pct`」。
+     訂單簿講「有人開價多少」，講不出「借款人實際付多少」——2026-08-16 夜間
+     一道 182 萬 USD 的低價牆讓排隊規則把報價砍到年化 5.47% 並真的成交。
+     **下限只往上拉不往下壓**：排隊規則算出的價位更高時不動它。
+  3. **絕對地板** `minimum_rate`：語意是**「低於它就不掛」而不是「拉高到它」**——
+     後者會把單子推到簿子外，變成永遠不會成交的死單。
+  送出前一律用 `_quantize()` **無條件捨去**（不可 `round()`）：對放貸方而言利率越低
+  排得越前面，四捨五入有一半機率把價位往上推、跨過某一檔就從「排它前面」
+  變成「同價而排它後面」（D033）。
 - `strategies/frr_plus.py`：`FrrPlusStrategy`，舊的 FRR 加減碼策略，保留供一行切換對照。
   **不是備援**：它已知會把單子掛到市場之上（FRR 高過成交天花板），
   拿不到市場深度時一律不掛，而不是退回這條路。
 - `core/bot_engine.py`：`BotEngine.run_once()` 單輪巡檢，順序為
-  **對帳已借出部位（成交偵測）** → 查場上現有掛單 → 查餘額 → 抓 FRR → 取得市場深度 →
-  產生掛單計畫 → **與場上比對，實質相同就什麼都不做** → 取消舊掛單 → 等待餘額釋放 →
+  **對帳已借出部位（成交偵測）** → 查場上現有掛單 → 查餘額 → 抓 FRR →
+  取得市場深度與近期成交 → 產生掛單計畫 → **與場上比對，實質相同就什麼都不做** → 取消舊掛單 → 等待餘額釋放 →
   以真實餘額重算 → 逐筆掛單並落帳 → 寫入 `bot_state` → 通知。
   **對帳一定要排在取消之前**（取消會改變場上狀態），而「條件沒變就不重掛」
   保護的是排隊位置——同利率下先掛先成交（D030）；主迴圈分類處理 `RetryableError` / `FatalError` / `SkipCycleError`，

@@ -18,6 +18,7 @@
 """
 
 import time
+from typing import Optional
 
 from notify import messages
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
@@ -93,6 +94,7 @@ class BotEngine:
         alert_after_failures: int = 3,
         push_trade_events: bool = True,
         rate_tolerance_pct: float = 2.0,
+        queue_clear_usd_per_hour: float = 540_000.0,
     ):
         self.logger = logger
         self.notifier = notifier
@@ -104,6 +106,10 @@ class BotEngine:
         self.push_trade_events = bool(push_trade_events)
         # 場上掛單與新計畫差多少以內算「沒變」，用來決定要不要重掛（見 `_plans_match`）。
         self.rate_tolerance_pct = float(rate_tolerance_pct)
+        # 排隊的錢被吃掉的速率，用來把「前方多少錢」換算成「要等多久」
+        # （見 `_cheaper_repost_is_not_worth_it`）。**只有一個校準樣本**，
+        # 目前僅用於分母差異不大的比較，敏感度低；D032 會把它換成每輪自己算。
+        self.queue_clear_usd_per_hour = float(queue_clear_usd_per_hour)
         self.failures = FailureTracker(logger, notifier, repository, alert_after_failures)
         # 場上有沒有我們的掛單：True 有、False 沒有、None 還不知道（剛啟動）。
         # 交易面通知推的是**這個值的變化**，不是每輪的結果——每輪全取消重掛若每次都推，
@@ -166,6 +172,9 @@ class BotEngine:
             raise SkipCycleError("可放貸金額低於最低門檻或單筆最小量，跳過本輪")
 
         self._log_queue_position(book, plans)
+        ahead_of_live = self._queue_ahead_of_live(book, existing)
+        if ahead_of_live is not None:
+            self.logger.info(f"場上掛單排隊位置：前方 {ahead_of_live:,.0f} USD")
 
         if existing and self._plans_match(existing, plans):
             # **這一輪什麼都不做才是對的。** 同利率下是時間優先（先掛先成交），
@@ -181,11 +190,44 @@ class BotEngine:
             )
             return
 
+        # **用確定的利息去換估出來的速度，要先證明划得來。** 這是 2026-08-16 19:31 的
+        # 形狀：低價牆把候選價位往下拖，機器人送出取消，25 秒後那張單成交——
+        # 是市場先一步吃單才沒把第一筆成交砍掉（D031／D034）。
+        not_worth_it = self._cheaper_repost_is_not_worth_it(book, existing, plans)
+        if not_worth_it:
+            self.repository.save_state(
+                last_frr=frr,
+                last_action=f"往下重掛不划算，維持場上 {len(existing)} 筆不動",
+            )
+            self.logger.info(
+                f"候選價位比場上那張單低，而排隊位置的改善補不回少收的利息"
+                f"（{not_worth_it}），維持不動。"
+            )
+            return
+
         cancelled = self.client.cancel_active_offers("USD")
         if cancelled:
             # Bitfinex 取消掛單是非同步處理，回應成功不代表餘額已釋放；
             # 這裡稍等一下再查餘額，避免用到舊餘額把掛單金額算少。
             time.sleep(self.cancel_settle_seconds)
+
+            # **等完還要問一次「單子真的離場了嗎」，不能用餘額回推。**
+            # 這兩件事會分岔：2026-08-16 19:31 取消送出後餘額確實沒回來，
+            # 但原因不是「還沒生效」而是「那張單根本沒被取消掉，25 秒後成交了」（D031）。
+            # 只看餘額的話兩種情況長得一模一樣，而處置完全相反——
+            # 單子還在場上時再掛一筆就是雙倍曝險。
+            still_live = self.client.get_active_offers("USD")
+            if still_live:
+                self.repository.save_state(
+                    last_frr=frr,
+                    last_action=f"取消未生效，場上仍有 {len(still_live)} 筆掛單，本輪不重掛",
+                )
+                self.logger.warning(
+                    f"已送出取消，但場上仍有 {len(still_live)} 筆掛單（可能尚未生效，"
+                    "也可能已經成交）。本輪不重掛，等下一輪重新判斷。"
+                )
+                raise SkipCycleError("取消尚未生效，場上仍有掛單，本輪不重掛")
+
             # 取消後一定要用**真實餘額**重算，不能沿用 `disposable_usd`：
             # 那是估計值，而掛單金額只要多一分錢，交易所就會拒絕整筆（D025）。
             balance_usd = self.client.get_available_balance("USD")
@@ -314,8 +356,113 @@ class BotEngine:
             return
         self.logger.info(f"市場常態成交價：{rate:.8f}/日（年化 {rate * 365 * 100:.2f}%）")
 
+    def _queue_ahead(self, book, rate, period) -> Optional[float]:
+        """掛在 `rate`／`period` 時前面排著多少錢。拿不到就回 `None`。
+
+        `same_period` 與 `all_periods` 取**小的那個**（也就是同天期）。
+        兩個數字誰才對還沒有定論（見 `describe_queue`），而這裡只拿它做**比較**，
+        兩邊用同一把尺，偏差會抵銷掉大半。
+        """
+        describe = getattr(self.strategy, "describe_queue", None)
+        if describe is None or not book:
+            return None
+        queue = describe(book, float(rate), int(period))
+        return min(float(queue["same_period"]), float(queue["all_periods"]))
+
+    def _queue_ahead_of_live(self, book, existing) -> Optional[float]:
+        """**場上那張單**前面還排著多少錢——不是本輪候選價位的，是已經在排隊的那張。
+
+        這個區別是 D031 的核心。`_log_queue_position()` 描述的一直是**候選價位**
+        （`plans[0].rate`），而「我們快成交了嗎」是**場上那張單**的性質，兩者在
+        市場變動時會指向完全相反的方向：低價牆一出現，候選價位會被拉到簿子底端，
+        而場上那張既有的單反而變成隊伍最前面最快成交的一張。
+
+        取**多筆掛單裡利率最低的那筆**：利率越低排得越前面，最先成交的一定是它。
+        """
+        if not existing:
+            return None
+        front = min(existing, key=lambda offer: float(offer["rate"]))
+        return self._queue_ahead(book, float(front["rate"]), int(front["period"]))
+
+    def _cheaper_repost_is_not_worth_it(self, book, existing, plans) -> Optional[str]:
+        """**把價格往下調**的重掛划不划算：划不來就回傳一句說明，否則回 `None`。
+
+        ## 為什麼只管往下這個方向
+
+        排隊金額對利率是單調的——掛得越便宜，排在前面的錢越少。所以重掛**永遠**是
+        一個取捨，不存在「兩邊都更差」這種好判斷的情況。但兩個方向的不確定性擺放
+        方式相反：
+
+        - **往下調**：放棄的利息是**確定的**，換來的速度是**估的**
+        - **往上調**：多賺的利息是**確定的**，付出的速度是**估的**
+
+        而「估的」那一半正是目前最不可靠的東西：把排隊金額換算成等待時間只有
+        **一個校準樣本**，而且實際比估計慢 1.7 倍（D031）。所以只在「不可靠的那半邊
+        是行動的理由」時才要求它先過關；反過來時讓確定的那半邊說了算。
+        這就是 D031「判斷不出來時偏向代價小的那一邊」按方向拆開之後的樣子。
+
+        ## 判準是推導出來的，不是拍板的
+
+        兩條路比的是**單位時間報酬**：`利息 ÷ (等待 + 借出期間)`。設 `r` 為利率、
+        `W` 為等待天數、`P` 為天期，重掛較好的條件是
+
+            r_new / (W_new + P) > r_live / (W_live + P)
+
+        `W = 前方金額 ÷ 隊列消化速率`。以 2026-08-16 深夜的簿子代入，等待多在 0～6.4
+        小時之間，而 `P` 是 48 小時——**分母幾乎不動**，於是利率那一項壓倒性地決定
+        結果。把 19:31 那道牆放回簿子重演（當晚的候選價位沒有進日誌，這裡餵入牆價
+        0.00014999，也就是 21:31 真的掛出去的那個價）：利率掉 40%，換來的是等待從
+        3.9 小時降到 0——**在 48 小時的天期面前，省下那 3.9 小時遠遠補不回四成利息**。
+
+        **這不是 D032 的替代品**：真正的期望值計算還要處理天期選擇、爆發桶剔除與
+        持續校準（`queue_clear_usd_per_hour` 現在只有一個樣本）。這裡只用它最不需要
+        精度的那一段——分母差異小的時候，結論對速率估得準不準並不敏感。
+
+        金額變多時一律不否決：那代表錢包裡有新的錢要投入，而 `spread_count=1` 時
+        重掛是唯一的投入手段，少賺的價差遠小於讓那筆錢繼續空轉。
+        """
+        if not existing or not plans or not book:
+            return None
+
+        live = min(existing, key=lambda offer: float(offer["rate"]))
+        candidate = min(plans, key=lambda plan: plan.rate)
+
+        live_total = sum(float(offer["amount"]) for offer in existing)
+        plan_total = sum(plan.amount for plan in plans)
+        if plan_total > live_total + max(1.0, live_total * 0.01):
+            return None
+
+        live_rate = float(live["rate"])
+        if candidate.rate >= live_rate:
+            return None
+
+        ahead_live = self._queue_ahead(book, live_rate, int(live["period"]))
+        ahead_candidate = self._queue_ahead(book, candidate.rate, candidate.duration)
+        if ahead_live is None or ahead_candidate is None or self.queue_clear_usd_per_hour <= 0:
+            return None
+
+        def daily_yield(rate, ahead, period):
+            wait_days = ahead / self.queue_clear_usd_per_hour / 24
+            return rate * period / (wait_days + period)
+
+        live_yield = daily_yield(live_rate, ahead_live, int(live["period"]))
+        candidate_yield = daily_yield(candidate.rate, ahead_candidate, candidate.duration)
+        if candidate_yield > live_yield:
+            return None
+
+        return (
+            f"利率 {live_rate:.8f} → {candidate.rate:.8f}、"
+            f"前方 {ahead_live:,.0f} → {ahead_candidate:,.0f} USD，"
+            f"單位時間報酬 {live_yield:.10f} → {candidate_yield:.10f}"
+        )
+
     def _log_queue_position(self, book, plans) -> None:
-        """把「掛在這個價位時前面排了多少錢」寫進日誌，同天期與全天期各一份。
+        """把「**本輪候選價位**掛下去時前面排了多少錢」寫進日誌，同天期與全天期各一份。
+
+        **主詞是候選價位，不是場上那張單。** 這兩個數字在 2026-08-16 19:31 被讀成
+        後者，於是「前方 0 USD」被當成「我們排到第一位了」——實際上它講的是
+        「新算出來的價位落在簿子最低檔」，而當時舊版用 `<` 比較，最低檔自己那筆
+        沒被算進去才會顯示 0。場上那張單的排隊位置請看 `_queue_ahead_of_live()`。
 
         兩個數字都留，是為了**讓第一筆真實成交來裁決一個還沒驗證的假設**：
         不同天期的掛單到底有沒有在同一個隊伍裡排。策略目前採保守解讀（全天期一起算），

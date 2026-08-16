@@ -53,6 +53,7 @@ class FakeClient:
         positions=None,
         book=None,
         trades=None,
+        cancel_takes_effect=True,
     ):
         self.balance = balance
         self.frr = frr
@@ -67,12 +68,17 @@ class FakeClient:
         self.position_calls = 0
         self.book = list(book) if book else []
         self.trades = list(trades) if trades else []
+        # 取消是非同步的：交易所回應成功不代表單子已經離場（D011／D031）。
+        # 設 False 就模擬「回應說取消了，但單子還在場上」——2026-08-16 19:31 的真實情況。
+        self.cancel_takes_effect = cancel_takes_effect
 
     def cancel_active_offers(self, currency):
         self.cancel_calls += 1
         # 取消之後場上就沒有我們的單了，而那些錢會回到可用餘額——替身不模擬這件事的話，
         # 「取消後用真實餘額重算」那條路徑永遠會算出 0，測不到真正的行為。
         released = [dict(offer) for offer in self.active_offers]
+        if not self.cancel_takes_effect:
+            return self.cancelled or released
         self.balance += sum(float(offer["amount"]) for offer in released)
         self.active_offers = []
         # `cancelled` 有設定就用它（既有測試靠它模擬「取消了東西」），否則回報實際釋放的單
@@ -603,6 +609,220 @@ class TestKeepsQueuePosition:
             run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert client.cancel_calls == 0
+
+
+def market_trades(rate=0.00025, count=60, period=2):
+    """同天期等額成交，金額加權中位數就是 `rate`。
+
+    筆數要過 `min_trade_samples`，否則測到的是「樣本不足所以不掛」那條出口。
+    """
+    base = 1_786_879_800_000
+    offsets = (-0.000002, 0.0, 0.000002)
+    return [
+        {
+            "mts": base + index * 15_000,
+            "amount": 25_000.0,
+            "rate": rate + offsets[index % 3],
+            "period": period,
+        }
+        for index in range(count)
+    ]
+
+
+class TestCheaperRepostMustPayForItself:
+    """**把價格往下調**的重掛要先證明划得來（DECISIONS.md D034，源自 D031）。
+
+    2026-08-16 19:31 機器人送出取消，25 秒後那張單就成交了：**是市場先一步吃單，
+    才沒有把上線以來的第一筆成交親手砍掉。** 那一輪低價牆把候選價位往下拖 15%，
+    而隊伍只縮短 2.7%——用確定的利息換一點點速度。
+
+    只管往下這一個方向，因為兩邊的不確定性擺放方式相反：往下調時放棄的利息是確定的、
+    換來的速度是估的；往上調時剛好相反。只在「估的那半邊是行動的理由」時才要求它過關。
+
+    與 `TestKeepsQueuePosition` 的分工：那邊擋的是「條件其實沒變」，
+    這邊擋的是「條件真的變了，但這個方向的變動不值得動手」。
+    """
+
+    @staticmethod
+    def make_strategy(**overrides):
+        from strategies.orderbook_depth import OrderBookDepthStrategy
+
+        config = {"spread_count": 1, "target_queue_usd": 1_000_000}
+        config.update(overrides)
+        return OrderBookDepthStrategy({"strategy": config})
+
+    # 19:31 的形狀：底端一道低價牆把候選價位往下拖，但牆就排在我們前面，
+    # 所以隊伍幾乎沒有縮短——利率掉很多、速度沒換到。
+    WALLED = [
+        {"rate": 0.00021, "period": 2, "amount": 1_820_000.0},
+        {"rate": 0.00025, "period": 2, "amount": 50_000.0},
+        {"rate": 0.00035, "period": 2, "amount": 5_000_000.0},
+    ]
+    # 對照組：只降 4% 就跳過 200 萬 USD 的隊伍——這種降價換得回來。
+    # 兩組的差別正是這條判準在量的東西：降 15% 跳過 182 萬不划算，
+    # 降 4% 跳過 200 萬划算。差在**放棄的利息**，不在跳過多少錢。
+    WORTH_IT = [
+        {"rate": 0.00024, "period": 2, "amount": 1_000.0},
+        {"rate": 0.00025, "period": 2, "amount": 2_000_000.0},
+        {"rate": 0.00035, "period": 2, "amount": 5_000_000.0},
+    ]
+
+    def test_cheaper_and_barely_faster_is_refused(self, fake_logger, fake_notifier,
+                                                  repository, no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.00025)],
+                            book=self.WALLED, trades=market_trades(rate=0.00025))
+        run_once(fake_logger, fake_notifier, self.make_strategy(), client, repository)
+
+        assert client.cancel_calls == 0
+        assert client.offers == []
+
+    def test_it_is_the_repost_path_that_gets_blocked(self, fake_logger, fake_notifier,
+                                                     repository, no_sleep):
+        """擋下來的必須是「條件真的變了」那條路。
+
+        沒有這一條，上面那個測試可能只是 `_plans_match()` 判定相同、或策略整輪不掛，
+        什麼都沒驗證到。
+        """
+        strategy = self.make_strategy()
+        plans = strategy.build_offer_plan(200.0, 0.0002, self.WALLED,
+                                          market_trades(rate=0.00025))
+
+        assert plans, "策略本輪確實有算出計畫"
+        assert plans[0].rate < 0.00025, "而且比場上那張便宜"
+        engine = make_engine(fake_logger, fake_notifier, strategy, FakeClient(), repository)
+        assert not engine._plans_match([live_offer(rate=0.00025)], plans), "2% 容差擋不住"
+
+    def test_cheaper_but_much_faster_is_allowed(self, fake_logger, fake_notifier,
+                                                repository, no_sleep):
+        """速度真的換到了就該重掛——這條保護不是「一律不准降價」。"""
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.00025)],
+                            book=self.WORTH_IT, trades=market_trades(rate=0.00025))
+        run_once(fake_logger, fake_notifier, self.make_strategy(), client, repository)
+
+        assert client.cancel_calls == 1
+        assert len(client.offers) == 1
+
+    def test_repricing_upward_is_never_blocked(self, fake_logger, fake_notifier,
+                                               repository, no_sleep):
+        """往上調不套用這條判準：多賺的利息是確定的，讓它說了算。
+
+        實測支持這個方向——2026-08-16 深夜的簿子上，2% 容差擋不住的 64 個往上調
+        價位，重掛的期望值全部為正，連前方只剩 411 USD 的那一檔都是（D034）。
+        """
+        book = [
+            {"rate": 0.00025, "period": 2, "amount": 50_000.0},
+            {"rate": 0.00028, "period": 2, "amount": 100_000.0},
+            {"rate": 0.00035, "period": 2, "amount": 5_000_000.0},
+        ]
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.00025)],
+                            book=book, trades=market_trades())
+        run_once(fake_logger, fake_notifier, self.make_strategy(), client, repository)
+
+        assert client.cancel_calls == 1
+
+    def test_new_money_is_always_put_to_work(self, fake_logger, fake_notifier,
+                                             repository, no_sleep):
+        """錢包裡多了錢就一定重掛：`spread_count=1` 時那是唯一的投入手段，
+        少賺的價差遠小於讓那筆錢繼續空轉。"""
+        client = FakeClient(balance=500.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.00025, amount=200.0)],
+                            book=self.WALLED, trades=market_trades(rate=0.00025))
+        run_once(fake_logger, fake_notifier, self.make_strategy(), client, repository)
+
+        assert client.cancel_calls == 1
+
+    def test_lowest_rate_offer_decides(self, fake_logger, fake_notifier, repository, no_sleep):
+        """場上有好幾筆時看**利率最低**的那筆：先成交的一定是它。"""
+        client = FakeClient(
+            balance=0.0, frr=0.0002,
+            active_offers=[live_offer(offer_id=1, rate=0.00025, amount=100.0),
+                           live_offer(offer_id=2, rate=0.00033, amount=100.0)],
+            book=self.WALLED, trades=market_trades(rate=0.00025),
+        )
+        run_once(fake_logger, fake_notifier, self.make_strategy(), client, repository)
+
+        assert client.cancel_calls == 0
+
+    def test_live_offer_queue_is_logged_with_a_clear_subject(self, fake_logger, fake_notifier,
+                                                             repository, no_sleep):
+        """日誌要分得出「候選價位排在哪」與「場上那張單排在哪」。
+
+        19:31 的誤讀就是這麼來的：日誌只有前者，卻被當成後者。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.00025)],
+                            book=self.WALLED, trades=market_trades(rate=0.00025))
+        run_once(fake_logger, fake_notifier, self.make_strategy(), client, repository)
+
+        assert any("場上掛單排隊位置" in line for line in fake_logger.messages["info"])
+        assert any("掛單排隊位置估計" in line for line in fake_logger.messages["info"])
+
+    def test_strategy_without_queue_information_still_requotes(self, fake_logger, fake_notifier,
+                                                               strategy, repository, no_sleep):
+        """`FrrPlusStrategy` 沒有 `describe_queue()`——沒有這個數字就不能否決，
+        但也不能因此炸掉或整輪卡住。"""
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+
+
+class TestCancelActuallyTookEffect:
+    """取消送出之後，要問「單子真的離場了嗎」，不能用餘額回推（D031）。
+
+    這兩件事會分岔：19:31 取消送出後餘額確實沒回來，但原因不是「還沒生效」，
+    而是那張單根本沒被取消掉、25 秒後成交了。只看餘額的話兩種情況長得一模一樣，
+    處置卻完全相反——單子還在場上時再掛一筆就是雙倍曝險。
+    """
+
+    def test_offers_still_live_means_no_new_offer(self, fake_logger, fake_notifier, strategy,
+                                                  repository, no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)],
+                            cancel_takes_effect=False)
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+        assert client.offers == []  # **沒有再掛一筆**
+
+    def test_it_is_reported_as_a_warning_not_as_offers_gone(self, fake_logger, fake_notifier,
+                                                            strategy, repository, no_sleep):
+        """場上明明還有單，不能推「掛單已不在場上」——那是猜錯方向的訊息。"""
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)],
+                            cancel_takes_effect=False)
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert any("仍有" in line for line in fake_logger.messages["warning"])
+        assert not any("不在場上" in message for message in fake_notifier.sent)
+
+    def test_state_records_why_the_round_did_nothing(self, fake_logger, fake_notifier, strategy,
+                                                     repository, no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)],
+                            cancel_takes_effect=False)
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert "取消未生效" in repository.get_state()["last_action"]
+
+    def test_normal_cancel_is_unaffected(self, fake_logger, fake_notifier, strategy,
+                                         repository, no_sleep):
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1
+        assert len(client.offers) == 1
 
 
 class TestFillDetection:

@@ -240,6 +240,26 @@ class TestDescribeQueue:
 
         assert queue["all_periods"] == 100_000
 
+    def test_period_can_be_given_explicitly(self, make_strategy):
+        """問「場上那張單排在哪」時，天期要取自那張單，不能取自設定檔。
+
+        兩者不保證一致：掛單的天期是掛出去當下決定的，而分桶實驗一開始，
+        同時掛著 2 天與 30 天就是常態（D031／TASKS.md P1-4）。
+        """
+        book = [
+            level(0.000240, 500_000, period=2),
+            level(0.000242, 300_000, period=30),
+        ]
+        strategy = make_strategy()  # 設定檔的 offer_period 是 2
+
+        assert strategy.describe_queue(book, 0.000250, period=30)["same_period"] == 300_000
+        assert strategy.describe_queue(book, 0.000250, period=2)["same_period"] == 500_000
+
+    def test_falls_back_to_configured_period(self, make_strategy):
+        book = [level(0.000240, 500_000, period=2), level(0.000242, 300_000, period=30)]
+
+        assert make_strategy().describe_queue(book, 0.000250)["same_period"] == 500_000
+
 
 class TestMarketRate:
     """常態成交價：借款人實際付了多少。訂單簿答不出這件事（D033）。"""

@@ -81,6 +81,9 @@ def main() -> int:
         # 不是機器人怎麼跑。關掉之後事件照樣寫日誌（見 `BotEngine._push_trade_event`）。
         push_trade_events=bool(config.get("line", {}).get("push_trade_events", True)),
         rate_tolerance_pct=float(engine_config.get("rate_tolerance_pct", 2.0)),
+        queue_clear_usd_per_hour=float(
+            engine_config.get("queue_clear_usd_per_hour", 540_000)
+        ),
     )
 
     logger.info("開始執行 Bitfinex 放貸機器人")

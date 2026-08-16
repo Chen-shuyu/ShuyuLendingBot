@@ -28,7 +28,7 @@ jobs:
           fi
 
       - name: 執行語法檢查
-        run: python -m py_compile main.py config/settings.py api/base.py api/bitfinex_client.py api/rate_limiter.py core/bot_engine.py db/models.py db/repository.py notify/line_messaging.py scripts/healthcheck.py scripts/notify_failure.py strategies/base.py strategies/frr_plus.py utils/logger.py utils/exceptions.py
+        run: python -m py_compile main.py config/settings.py api/base.py api/bitfinex_client.py api/rate_limiter.py core/bot_engine.py db/models.py db/repository.py notify/line_messaging.py notify/messages.py scripts/healthcheck.py scripts/notify_failure.py strategies/base.py strategies/frr_plus.py utils/logger.py utils/exceptions.py
 
       - name: 執行單元與功能測試
         # 這裡刻意不加 `|| true`：測試失敗就要擋下合併，否則寫了測試也攔不住壞掉的程式碼

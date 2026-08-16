@@ -371,3 +371,70 @@ class TestTimestamp:
         """告警腳本跑在致命錯誤的通報路徑上，絕不能因為時區查不到就自己爆掉。"""
         monkeypatch.setenv("BFX_TIMEZONE", "Mars/Olympus_Mons")
         assert notify_failure.timestamp().endswith("+0000")
+
+
+class TestPushMessage:
+    """推播訊息走三段式（規格見 `notify/messages.py`），與日誌用的一行版分開。
+
+    分開是刻意的：日誌是一筆一行的格式，塞進多行訊息會讓後續幾行看起來不像日誌、
+    `grep ERROR` 也會漏掉它們；而手機上要看的是分行、有欄位、最後明講要不要動手的版本。
+    這一組測試釘的是**兩份實作的格式一致性**——這支腳本不能 import 專案模組
+    （見模組 docstring 的設計選擇 1），所以規格只能靠測試守住。
+    """
+
+    def test_structure_matches_the_shared_spec(self):
+        lines = notify_failure.build_push_message("shuyu-lending-bot.service", GAVE_UP).splitlines()
+
+        assert lines[0].startswith("🔴【系統】")
+        assert lines[1].startswith("時間：")
+        assert lines[-1] in (
+            notify_failure.PUSH_FOOTER_ACTION_REQUIRED,
+            notify_failure.PUSH_FOOTER_NO_ACTION,
+        )
+
+    def test_push_timestamp_has_no_milliseconds_but_keeps_offset(self):
+        """訊息是給人看的，毫秒沒有意義；時區偏移一定要留（D028）。"""
+        stamp = notify_failure.push_timestamp()
+
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}", stamp)
+
+    def test_giving_up_demands_human_action(self):
+        text = notify_failure.build_push_message("shuyu-lending-bot.service", GAVE_UP)
+
+        assert "不會再自動重啟" in text
+        assert "reset-failed" in text
+        assert text.endswith(notify_failure.PUSH_FOOTER_ACTION_REQUIRED)
+
+    def test_retrying_does_not_demand_action_yet(self):
+        """還在重試就要求人工介入，等於把「等一下」寫成「快起來」。"""
+        text = notify_failure.build_push_message("shuyu-lending-bot.service", RETRYING)
+
+        assert text.startswith("🟠【系統】")
+        assert "正在自動重試" in text
+        assert text.endswith(notify_failure.PUSH_FOOTER_NO_ACTION)
+
+    def test_recovered_is_a_warning_not_an_error(self):
+        text = notify_failure.build_push_message("shuyu-lending-bot.service", RECOVERED)
+
+        assert text.startswith("🟡【系統】")
+        assert "已自動恢復" in text
+        assert text.endswith(notify_failure.PUSH_FOOTER_NO_ACTION)
+
+    def test_false_alarm_stays_informational(self):
+        """部署重啟造成的觸發（B4）：單元好好的，訊息不能看起來像故障。"""
+        text = notify_failure.build_push_message("shuyu-lending-bot.service", RESTARTED)
+
+        assert text.startswith("🔵【系統】")
+        assert "正常運作中" in text
+        assert text.endswith(notify_failure.PUSH_FOOTER_NO_ACTION)
+
+    def test_unit_state_is_carried_as_a_field(self):
+        """六個欄位是判讀的依據，不能因為換了排版就掉了。"""
+        text = notify_failure.build_push_message("shuyu-lending-bot.service", RESTARTED)
+
+        assert "單元狀態：" in text
+        assert "最後離開碼=0" in text
+
+    def test_log_message_stays_single_line(self):
+        """一行才 grep 得到。這條是防止有人把兩份訊息又合成一份。"""
+        assert "\n" not in notify_failure.build_message("shuyu-lending-bot.service", GAVE_UP)

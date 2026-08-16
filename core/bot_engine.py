@@ -19,6 +19,7 @@
 
 import time
 
+from notify import messages
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
 # 離開碼語意
@@ -54,9 +55,11 @@ class FailureTracker:
         self.repository.save_state(consecutive_failures=0)
 
         if recovered:
-            message = "Bitfinex 放貸機器人已恢復正常巡檢。"
-            self.logger.info(message)
-            self.notifier.send(message)
+            # 日誌寫一行、LINE 推三段式（見 `notify/messages.py`）。兩邊刻意不共用同一個
+            # 字串：日誌是一筆一行的格式，塞進多行訊息會讓後續幾行看起來不像日誌，
+            # `grep ERROR` 也會漏掉它們。
+            self.logger.info("Bitfinex 放貸機器人已恢復正常巡檢。")
+            self.notifier.send(messages.recovered())
 
     def record_failure(self, reason: str) -> None:
         """本輪巡檢失敗，累計次數並在跨過門檻時告警。"""
@@ -68,12 +71,11 @@ class FailureTracker:
 
         if self.consecutive_failures >= self.alert_after and not self.alerted:
             self.alerted = True
-            message = (
+            self.logger.error(
                 f"Bitfinex 放貸機器人已連續 {self.consecutive_failures} 輪巡檢失敗，"
                 f"請確認交易所連線與 API 金鑰狀態。最近一次原因：{reason}"
             )
-            self.logger.error(message)
-            self.notifier.send(message)
+            self.notifier.send(messages.consecutive_failures(self.consecutive_failures, reason))
 
 
 class BotEngine:
@@ -89,6 +91,7 @@ class BotEngine:
         interval_seconds: int = 600,
         cancel_settle_seconds: int = 3,
         alert_after_failures: int = 3,
+        push_trade_events: bool = True,
     ):
         self.logger = logger
         self.notifier = notifier
@@ -97,7 +100,14 @@ class BotEngine:
         self.repository = repository
         self.interval_seconds = int(interval_seconds)
         self.cancel_settle_seconds = int(cancel_settle_seconds)
+        self.push_trade_events = bool(push_trade_events)
         self.failures = FailureTracker(logger, notifier, repository, alert_after_failures)
+        # 場上有沒有我們的掛單：True 有、False 沒有、None 還不知道（剛啟動）。
+        # 交易面通知推的是**這個值的變化**，不是每輪的結果——每輪全取消重掛若每次都推，
+        # 一天 144 則、不到兩天就把每月 200 則的額度燒光（見 D024）。
+        # 狀態只放記憶體、不落 DB：重啟後回到 None，下一次掛單成功會推一則
+        # 「啟動後首輪」——那正是部署完最想確認的事，不算浪費額度。
+        self._offers_live = None
 
     def run_once(self) -> None:
         """執行一輪巡檢流程：取消舊掛單、查餘額與 FRR、產生掛單計畫、掛單、落帳、送出通知。"""
@@ -115,13 +125,16 @@ class BotEngine:
         if frr is None or frr <= 0:
             # 略過也要寫狀態：機器人是活著且判斷正確的，心跳不該因此中斷。
             self.repository.save_state(last_action="FRR 無效，略過本輪")
+            self._note_offers_absent("FRR 無效，本輪沒有掛單")
             raise SkipCycleError("FRR 無效（None 或非正值），跳過本輪，避免用錯誤利率掛單")
 
         plans = self.strategy.build_offer_plan(balance_usd, frr)
         if not plans:
             self.repository.save_state(last_frr=frr, last_action="可放貸金額不足，略過本輪")
+            self._note_offers_absent(f"可放貸金額不足（目前 {balance_usd} USD），本輪沒有掛單")
             raise SkipCycleError("可放貸金額低於最低門檻或單筆最小量，跳過本輪")
 
+        dry_run = False
         for plan in plans:
             self.logger.info(
                 f"建立掛單方案：{plan.amount} {plan.currency}，利率 {plan.rate:.6f}，天期 {plan.duration} 天"
@@ -134,10 +147,23 @@ class BotEngine:
                 # 掛單 API 無法 rollback：同一輪若前幾筆已成功，錢就已經出去了。
                 # 失敗這筆也要留痕，事後才對得出當下的真實狀態。
                 self.repository.record_offer_failure(plan, str(exc))
+                # 拒單很罕見（實單至今只發生過一次，見 D025），所以每次都推——
+                # 這是少數「額度絕對值得花」的交易面事件。
+                self._push_trade_event(
+                    messages.offer_failed(plan, str(exc), retryable=isinstance(exc, RetryableError))
+                )
+                # 這一輪的掛單已經全被取消，而重掛失敗了：場上沒有我們的單。
+                # 標成 False 是為了讓下一輪成功時推得出「掛單已重新上線」。
+                self._offers_live = False
                 raise
             self.logger.info(f"掛單結果：{result}")
+            # dry-run 由交易所回應自己表明（`status: dry_run`），不必再從別處傳一個旗標
+            # 進來——資料怎麼說就怎麼寫，少一條會走岔的路。
+            if isinstance(result, dict) and result.get("status") == "dry_run":
+                dry_run = True
             self.repository.record_offer(plan, result)
 
+        self._note_offers_placed(plans, dry_run)
         total_amount = round(sum(plan.amount for plan in plans), 2)
         self.repository.save_state(
             last_frr=frr,
@@ -149,6 +175,42 @@ class BotEngine:
         # 一則都送不出去（見 DECISIONS.md D024）。
         self.logger.info(f"本輪巡檢完成：掛出 {len(plans)} 筆，合計 {total_amount} USD")
 
+    def _push_trade_event(self, message: str) -> None:
+        """送出一則交易面通知，並在日誌留下同一件事的單行版本。
+
+        `push_trade_events` 是留給額度的安全閥：真的燒太快時可以只留系統面告警，
+        交易面退回只寫日誌。日誌不受這個開關影響——**關掉的是通知，不是紀錄**。
+        """
+        first_line = message.splitlines()[0]
+        self.logger.info(f"交易面事件：{first_line}")
+        if self.push_trade_events:
+            self.notifier.send(message)
+
+    def _note_offers_placed(self, plans, dry_run: bool = False) -> None:
+        """本輪掛單成功：只有「原本場上沒單 → 現在有了」才推。
+
+        `None`（剛啟動）算成需要推，訊息會寫「啟動後首輪」——部署完最想確認的
+        就是機器人回來了而且真的把單掛上去了。
+        """
+        if self._offers_live is not True:
+            self._push_trade_event(
+                messages.offers_placed(plans, first_cycle=self._offers_live is None, dry_run=dry_run)
+            )
+        self._offers_live = True
+
+    def _note_offers_absent(self, reason: str) -> None:
+        """本輪沒有掛單：只有「原本場上有單 → 現在沒了」才推。
+
+        這一則是目前唯一能察覺「錢可能借出去了」的訊號。機器人還沒有查詢已借出部位的
+        能力（TASKS.md P2-1），所以訊息只講事實、不寫死成「成交」——餘額歸零也可能是
+        資金被搬到別的錢包。**猜錯一次，這個管道就再也不會被相信。**
+
+        剛啟動（`None`）時不推：那代表我們沒看過「有單」的狀態，不算轉換。
+        """
+        if self._offers_live is True:
+            self._push_trade_event(messages.offers_gone(reason))
+        self._offers_live = False
+
     def run_forever(self) -> int:
         """啟動檢查後進入常駐主迴圈，回傳離開碼。"""
         try:
@@ -157,7 +219,7 @@ class BotEngine:
                 # 落帳再退出：容器收掉之後日誌也可能一起看不到（見 D016），
                 # DB 是唯一一定留得下來的地方，健康檢查與事後追查都靠它。
                 self._record_exit_reason("啟動檢查失敗，機器人未進入主迴圈")
-                self.notifier.send("Bitfinex 放貸機器人啟動檢查失敗，已停止運作。")
+                self.notifier.send(messages.startup_check_failed("交易所連線或金鑰檢查沒有通過"))
                 return EXIT_FATAL
 
             self.logger.info(f"進入常駐主迴圈，巡檢間隔 {self.interval_seconds} 秒")
@@ -174,7 +236,7 @@ class BotEngine:
                 except FatalError as exc:
                     self.logger.error(f"致命錯誤，機器人即將停止：{exc}")
                     self._record_exit_reason(f"致命錯誤已停止：{exc}")
-                    self.notifier.send(f"Bitfinex 放貸機器人發生致命錯誤，已停止運作：{exc}")
+                    self.notifier.send(messages.fatal_error(str(exc)))
                     return EXIT_FATAL
                 else:
                     self.failures.record_success()
@@ -189,7 +251,7 @@ class BotEngine:
             # 這裡改寫進日誌檔與 DB，兩者都掛載在主機上。
             self.logger.exception(f"未預期的例外，機器人即將停止：{exc}")
             self._record_exit_reason(f"未預期的例外已停止：{exc}")
-            self.notifier.send(f"Bitfinex 放貸機器人發生未預期的例外，已停止運作：{exc}")
+            self.notifier.send(messages.unexpected_error(f"{type(exc).__name__}: {exc}"))
             return EXIT_UNEXPECTED
         finally:
             # 同 `_record_exit_reason` 的理由：DB 故障時 close() 也可能拋例外，

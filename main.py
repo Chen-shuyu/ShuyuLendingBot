@@ -47,6 +47,9 @@ def main() -> int:
         interval_seconds=int(engine_config.get("interval_seconds", 600)),
         cancel_settle_seconds=int(engine_config.get("cancel_settle_seconds", 3)),
         alert_after_failures=int(engine_config.get("alert_after_failures", 3)),
+        # 交易面通知的開關放在 line: 底下而不是 engine: ——它管的是「要不要推播」，
+        # 不是機器人怎麼跑。關掉之後事件照樣寫日誌（見 `BotEngine._push_trade_event`）。
+        push_trade_events=bool(config.get("line", {}).get("push_trade_events", True)),
     )
 
     logger.info("開始執行 Bitfinex 放貸機器人")

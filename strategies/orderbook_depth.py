@@ -248,8 +248,18 @@ class OrderBookDepthStrategy(Strategy):
         quantum = Decimal(1).scaleb(-self.rate_decimals)
         return float(Decimal(str(rate)).quantize(quantum, rounding=ROUND_DOWN))
 
-    def describe_queue(self, book: List[Dict[str, Any]], rate: float) -> Dict[str, float]:
+    def describe_queue(
+        self,
+        book: List[Dict[str, Any]],
+        rate: float,
+        period: Optional[int] = None,
+    ) -> Dict[str, float]:
         """回報「掛在 `rate` 時，前面排了多少錢」——同天期與全天期各算一份。
+
+        `period` 不給就採設定檔的 `offer_period`。**要問「場上那張單排在哪」時
+        一定要明確傳它**：那張單的天期是掛出去當下決定的，不保證等於設定檔現在的值
+        （分桶實驗一旦開始，同時掛 2 天與 30 天就是常態）。拿設定值去描述另一個天期的
+        單子，算出來的是一個不存在的隊伍。
 
         兩個數字都寫進日誌，是為了**讓真實成交來裁決一個還沒驗證的假設**：
         不同天期的掛單到底有沒有在同一個隊伍裡排。如果同天期那個數字才是對的，
@@ -264,10 +274,11 @@ class OrderBookDepthStrategy(Strategy):
         已知的小誤差：我們自己那張掛單若已經在場上，也會落在這一檔而被算成「前面」。
         以目前的金額量級（數百 USD vs 數萬起跳的門檻）不影響判斷，而且方向偏保守。
         """
+        target_period = self.offer_period if period is None else int(period)
         same_period = sum(
             level["amount"]
             for level in book
-            if level["rate"] <= rate and level["period"] == self.offer_period
+            if level["rate"] <= rate and level["period"] == target_period
         )
         all_periods = sum(level["amount"] for level in book if level["rate"] <= rate)
         return {"same_period": same_period, "all_periods": all_periods}

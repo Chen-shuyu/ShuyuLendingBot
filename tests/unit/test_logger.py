@@ -11,7 +11,9 @@ from logging.handlers import RotatingFileHandler
 
 import pytest
 
-from utils.logger import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, BotLogger
+from zoneinfo import ZoneInfo
+
+from utils.logger import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, BotLogger, ZonedFormatter
 
 LOGGER_NAME = "bfx_lending_bot"
 
@@ -172,3 +174,50 @@ class TestMethods:
         content = log_file.read_text(encoding="utf-8")
         assert "不該出現" not in content
         assert "該出現" in content
+
+
+class TestZonedFormatter:
+    """時間戳的時區必須由程式決定，不能由「這支程式跑在哪」決定。
+
+    2026-08-16 之前 `%(asctime)s` 走行程本地時區，於是機器人在容器裡寫 UTC、
+    主機端的 `scripts/notify_failure.py` 寫 CST，兩者混進**同一個日誌檔**差 8 小時，
+    而且行內看不出是哪個時區。這組測試就是釘住「不會再退回那個狀態」。
+    """
+
+    def make_record(self, created):
+        record = logging.LogRecord(
+            name=LOGGER_NAME, level=logging.INFO, pathname=__file__, lineno=1,
+            msg="測試訊息", args=(), exc_info=None,
+        )
+        record.created = created
+        record.msecs = 123.0
+        return record
+
+    def test_renders_in_taipei_regardless_of_process_timezone(self, monkeypatch):
+        # 2026-08-16 05:20:48 UTC == 13:20:48 台北。這正是實際踩到的那一輪：
+        # 日誌寫 05:20:48，主機腳本寫 13:20:42，兩行相鄰卻差 8 小時。
+        monkeypatch.setenv("TZ", "UTC")
+        formatter = ZonedFormatter("%(asctime)s %(message)s", ZoneInfo("Asia/Taipei"))
+        rendered = formatter.formatTime(self.make_record(1786857648.123))
+        assert rendered.startswith("2026-08-16 13:20:48")
+
+    def test_includes_utc_offset_so_each_line_is_self_describing(self):
+        formatter = ZonedFormatter("%(asctime)s", ZoneInfo("Asia/Taipei"))
+        assert formatter.formatTime(self.make_record(1786857648.123)).endswith("+0800")
+
+    def test_keeps_millisecond_format_compatible_with_old_lines(self):
+        """毫秒維持 `,123`，新舊日誌在同一個檔案裡才不會看起來像兩種格式。"""
+        formatter = ZonedFormatter("%(asctime)s", ZoneInfo("Asia/Taipei"))
+        assert ",123 " in formatter.formatTime(self.make_record(1786857648.123))
+
+    def test_bot_logger_uses_configured_timezone(self, make_logger):
+        bot_logger = make_logger({"timezone": "UTC"})
+        formatter = bot_logger.logger.handlers[0].formatter
+        assert formatter.formatTime(self.make_record(1786857648.123)).startswith(
+            "2026-08-16 05:20:48"
+        )
+
+    def test_bot_logger_defaults_to_taipei(self, make_logger):
+        bot_logger = make_logger({})
+        formatter = bot_logger.logger.handlers[0].formatter
+        assert formatter.formatTime(self.make_record(1786857648.123)).endswith("+0800")

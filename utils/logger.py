@@ -7,11 +7,36 @@
 """
 
 import logging
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from utils import clock
+
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 單檔 10MB
 DEFAULT_BACKUP_COUNT = 5
+
+
+class ZonedFormatter(logging.Formatter):
+    """時間戳固定走專案時區，並在尾端標出 UTC 偏移。
+
+    `logging` 預設的 `%(asctime)s` 用的是**行程的本地時區**，也就是說同一份程式碼
+    在容器裡（UTC）和在主機上（CST）會寫出差 8 小時的時間，而且行內看不出是哪一個。
+    這裡改成明確指定時區，並把 `+0800` 附在時間後面——多這六個字元，就讓每一行日誌
+    自己說得清楚是什麼時區，不必靠讀的人記得它是在哪裡跑的。
+    """
+
+    def __init__(self, fmt, tz=None):
+        super().__init__(fmt)
+        self._tz = tz or clock.get_timezone()
+
+    def formatTime(self, record, datefmt=None):
+        moment = datetime.fromtimestamp(record.created, self._tz)
+        if datefmt:
+            return moment.strftime(datefmt)
+        # 毫秒沿用 logging 既有的 `record.msecs`，維持原本 `,123` 的格式，
+        # 讓舊日誌與新日誌在同一個檔案裡看起來仍然一致。
+        return f"{moment:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d} {moment:%z}"
 
 
 class BotLogger:
@@ -24,7 +49,10 @@ class BotLogger:
         if self.logger.handlers:
             return
 
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        formatter = ZonedFormatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            clock.get_timezone(config.get("timezone")),
+        )
 
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)

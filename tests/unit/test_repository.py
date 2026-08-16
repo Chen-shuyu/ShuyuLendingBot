@@ -6,6 +6,7 @@
 """
 
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -18,7 +19,7 @@ from db.repository import (
     STATUS_SUBMITTED,
     Repository,
     resolve_db_path,
-    utc_now,
+    now_iso,
 )
 from strategies.base import OfferPlan
 
@@ -187,10 +188,11 @@ class TestRecordOffer:
         repository.record_offer(make_plan(), {"id": 7})
         assert fetch_offers(repository)[0]["status"] == STATUS_SUBMITTED
 
-    def test_created_at_is_utc_iso_string(self, repository):
+    def test_created_at_is_aware_iso_string_in_project_timezone(self, repository):
         repository.record_offer(make_plan(), {"status": STATUS_DRY_RUN})
         created_at = fetch_offers(repository)[0]["created_at"]
-        assert created_at.endswith("+00:00")
+        assert datetime.fromisoformat(created_at).tzinfo is not None
+        assert created_at.endswith("+08:00")
 
 
 class TestRecordOfferFailure:
@@ -280,7 +282,7 @@ class TestBotState:
     def test_heartbeat_moves_forward(self, repository, monkeypatch):
         repository.save_state(last_action="第一輪")
         first = repository.get_state()["last_run_at"]
-        monkeypatch.setattr("db.repository.utc_now", lambda: "2099-01-01T00:00:00+00:00")
+        monkeypatch.setattr("db.repository.now_iso", lambda: "2099-01-01T00:00:00+00:00")
         repository.save_state(last_action="第二輪")
         assert repository.get_state()["last_run_at"] != first
 
@@ -314,8 +316,21 @@ class TestModels:
         assert count == 1
 
 
-class TestUtcNow:
-    def test_returns_second_precision_utc(self):
-        stamp = utc_now()
-        assert stamp.endswith("+00:00")
+class TestNowIso:
+    def test_returns_second_precision_in_project_timezone(self):
+        stamp = now_iso()
+        assert stamp.endswith("+08:00")
         assert "." not in stamp  # timespec="seconds"，不帶微秒
+
+    def test_is_timezone_aware(self):
+        """帶時區是硬性要求：naive 值會讓 healthcheck 的相減直接拋 TypeError。"""
+        assert datetime.fromisoformat(now_iso()).tzinfo is not None
+
+    def test_follows_timezone_env_override(self, monkeypatch):
+        monkeypatch.setenv("BFX_TIMEZONE", "UTC")
+        assert now_iso().endswith("+00:00")
+
+    def test_falls_back_to_utc_when_timezone_unknown(self, monkeypatch):
+        """時區資料查不到不該讓機器人停擺——退回 UTC，而 +0000 偏移會讓人看得出來。"""
+        monkeypatch.setenv("BFX_TIMEZONE", "Mars/Olympus_Mons")
+        assert now_iso().endswith("+00:00")

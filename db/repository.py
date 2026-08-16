@@ -8,11 +8,11 @@
 
 import os
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from db import models
+from utils import clock
 
 DEFAULT_DB_PATH = "data/lending.sqlite3"
 
@@ -44,9 +44,17 @@ STATUS_DRY_RUN = "dry_run"
 STATUS_FAILED = "failed"
 
 
-def utc_now() -> str:
-    """目前時間的 UTC ISO 8601 字串，秒為精度。"""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def now_iso() -> str:
+    """目前時間的 ISO 8601 字串（秒為精度），**一律帶時區偏移**。
+
+    2026-08-16 起改寫專案時區（預設 `Asia/Taipei`），寫出來長這樣：
+    `2026-08-16T14:11:14+08:00`。原本是 UTC，於是 DB 查出來的心跳跟主機時間差 8 小時，
+    對帳時要自己在腦內加減。
+
+    **舊資料不需要遷移**：舊列帶的是 `+00:00`、新列帶 `+08:00`，兩者都是 aware，
+    `scripts/healthcheck.py` 拿去相減得到的秒數完全正確——時區偏移不同不影響時間點比較。
+    """
+    return clock.now().isoformat(timespec="seconds")
 
 
 class Repository:
@@ -97,7 +105,7 @@ class Repository:
                     int(result.get("period", result.get("duration", plan.duration))),
                     result.get("status") or STATUS_SUBMITTED,
                     result.get("symbol"),
-                    utc_now(),
+                    now_iso(),
                 ),
             )
 
@@ -121,7 +129,7 @@ class Repository:
                     int(plan.duration),
                     STATUS_FAILED,
                     str(reason),
-                    utc_now(),
+                    now_iso(),
                 ),
             )
 
@@ -150,7 +158,7 @@ class Repository:
                     principal_avg = COALESCE(excluded.principal_avg, earnings_daily.principal_avg),
                     updated_at    = excluded.updated_at
                 """,
-                (date, currency, float(interest), principal_avg, utc_now()),
+                (date, currency, float(interest), principal_avg, now_iso()),
             )
 
     def save_state(
@@ -174,7 +182,7 @@ class Repository:
                     consecutive_failures = COALESCE(?, consecutive_failures)
                 WHERE id = 1
                 """,
-                (utc_now(), last_frr, last_action, consecutive_failures),
+                (now_iso(), last_frr, last_action, consecutive_failures),
             )
 
     def get_state(self) -> Optional[Dict[str, Any]]:

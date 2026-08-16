@@ -56,6 +56,9 @@ class StubClient:
     def get_funding_book(self, currency):  # pragma: no cover - StubStrategy 不需要市場深度
         return []
 
+    def get_recent_trades(self, currency, limit=1000):  # pragma: no cover - 同上
+        return []
+
     def create_loan_offer(self, currency, amount, rate, duration):  # pragma: no cover - 用不到
         raise AssertionError("這組測試的策略一律回傳空計畫，不該走到掛單")
 
@@ -64,11 +67,12 @@ class StubStrategy:
     """一律回傳空的掛單計畫，讓 `run_once()` 走「略過本輪」那條最短路徑。"""
 
     requires_book = False
+    requires_trades = False
 
     def __init__(self, config):
         pass
 
-    def build_offer_plan(self, balance, frr, book=None):
+    def build_offer_plan(self, balance, frr, book=None, trades=None):
         return []
 
 

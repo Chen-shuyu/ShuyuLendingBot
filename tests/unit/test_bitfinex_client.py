@@ -81,6 +81,9 @@ class FakeExchange:
     def public_get_book_symbol_precision(self, params=None):
         return self._respond("public_get_book_symbol_precision", params)
 
+    def public_get_trades_symbol_hist(self, params=None):
+        return self._respond("public_get_trades_symbol_hist", params)
+
     def private_post_auth_r_funding_credits_symbol(self, params=None):
         return self._respond("private_post_auth_r_funding_credits_symbol", params)
 
@@ -619,3 +622,67 @@ class TestGetActiveOffers:
 
     def test_dry_run_returns_empty(self, fake_logger):
         assert BitfinexClient({}, fake_logger, dry_run=True).get_active_offers("USD") == []
+
+
+def make_trade_row(trade_id=1, mts=1_786_879_800_000, amount=-25_000.0, rate=0.00025, period=2):
+    """模擬 `/v2/trades/fUSD/hist` 的一列。
+
+    欄位：0=ID, 1=MTS, 2=AMOUNT, 3=RATE, 4=PERIOD。形狀取自 2026-08-16 的實打回應
+    ——**AMOUNT 有正有負**（表示吃單方向），而成交價是同一個數字，兩邊看到的都一樣。
+    """
+    return [str(trade_id), str(mts), str(amount), str(rate), str(period)]
+
+
+class TestGetRecentTrades:
+    def test_amount_sign_is_dropped_because_it_only_means_direction(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[
+            make_trade_row(amount=-25_000.0),
+            make_trade_row(amount=18_000.0),
+        ])
+        trades = make_client(exchange).get_recent_trades("USD")
+
+        assert [trade["amount"] for trade in trades] == [25_000.0, 18_000.0]
+
+    def test_sorted_by_time_ascending(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[
+            make_trade_row(mts=300), make_trade_row(mts=100), make_trade_row(mts=200),
+        ])
+        trades = make_client(exchange).get_recent_trades("USD")
+
+        assert [trade["mts"] for trade in trades] == [100, 200, 300]
+
+    def test_string_fields_are_converted(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[
+            make_trade_row(rate=0.0002808219178082192, period=120)
+        ])
+        trade = make_client(exchange).get_recent_trades("USD")[0]
+
+        assert isinstance(trade["mts"], int)
+        assert isinstance(trade["rate"], float)
+        assert isinstance(trade["period"], int)
+        assert trade["period"] == 120
+
+    def test_non_positive_rate_is_skipped(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[
+            make_trade_row(rate=0.0), make_trade_row(rate=0.00025),
+        ])
+
+        assert len(make_client(exchange).get_recent_trades("USD")) == 1
+
+    def test_network_error_is_retryable(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=ccxt.NetworkError("timeout"))
+        with pytest.raises(RetryableError):
+            make_client(exchange).get_recent_trades("USD")
+
+    def test_malformed_row_is_retryable(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[["only-one-field"]])
+        with pytest.raises(RetryableError):
+            make_client(exchange).get_recent_trades("USD")
+
+    def test_works_without_credentials(self, fake_logger, monkeypatch):
+        """與掛單簿同一個理由：dry-run 也要能用真實市場資料驗定價。"""
+        client = BitfinexClient({}, fake_logger, dry_run=True)
+        exchange = FakeExchange(public_get_trades_symbol_hist=[make_trade_row(rate=0.00025)])
+        monkeypatch.setattr(client, "_public_exchange", lambda: exchange)
+
+        assert client.get_recent_trades("USD")[0]["rate"] == 0.00025

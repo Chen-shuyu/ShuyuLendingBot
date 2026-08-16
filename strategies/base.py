@@ -32,17 +32,26 @@ class Strategy(ABC):
     # 用不到卻照打，等於白白多一個會失敗的地方。
     requires_book = False
 
+    # 這個策略需不需要近期成交紀錄。同上，用不到就不打。
+    requires_trades = False
+
     @abstractmethod
     def build_offer_plan(
         self,
         balance_usd: float,
         frr: float,
         book: Optional[List[Dict[str, Any]]] = None,
+        trades: Optional[List[Dict[str, Any]]] = None,
     ) -> List[OfferPlan]:
         """依目前可用餘額與市場資訊產生掛單計畫。
 
         `book` 是供給側掛單簿（見 `api/base.py` 的 `get_funding_book()`），只有
-        `requires_book = True` 的策略會拿到；其餘策略可以忽略它。
+        `requires_book = True` 的策略會拿到；`trades` 是近期成交紀錄
+        （`get_recent_trades()`），只有 `requires_trades = True` 的策略會拿到。
+        其餘策略可以忽略它們。
+
+        **兩份資料回答的是不同問題**：掛單簿講「別人開價多少、我排第幾位」，
+        成交紀錄講「借款人實際付了多少」。只看前者會被一筆低價大單牽著走（D033）。
 
         回傳空清單代表「本輪不掛單」（例如餘額低於門檻、或市場價格低於底線），
         迴圈層會據此略過本輪而不視為失敗。

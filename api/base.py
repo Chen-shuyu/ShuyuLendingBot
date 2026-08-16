@@ -43,6 +43,17 @@ class ExchangeClient(ABC):
         """
 
     @abstractmethod
+    def get_recent_trades(self, currency: str, limit: int = 10_000) -> List[Dict[str, Any]]:
+        """取得放貸市場的近期成交紀錄，依時間**升冪**排序。
+
+        每一筆是 `{"mts": int, "amount": float, "rate": float, "period": int}`，
+        `amount` 一律為正（來源資料的正負號表示吃單方向，與成交價無關）。
+
+        掛單簿講的是「有人開價多少」，這一份講的是「借款人實際付了多少」——
+        兩者可以差一倍以上，而只有後者能證明某個價位真的賣得掉（見 D033）。
+        """
+
+    @abstractmethod
     def get_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """查詢場上尚未成交的放貸掛單，**不做任何取消動作**。
 

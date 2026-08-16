@@ -64,11 +64,86 @@ jobs:
         # 不掛單。連不上時測試內部自行 skip，不會讓 CI 因外部服務抖動變紅燈。
         run: pytest tests/integration -q
 
+  changes:
+    name: 判斷這次是不是只動了文件
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+        with:
+          # 預設是 fetch-depth: 1（只有一個 commit），那樣 HEAD~1 根本不在本地，
+          # 下面的退路會失效。抓兩層剛好夠比對「這次推上來的變更」。
+          fetch-depth: 2
+
+      - name: 比對變更路徑
+        id: detect
+        # 為什麼要有這個 job（TASKS.md P1-3）：deploy 會 `systemctl --user restart`，
+        # 而重啟的代價不是「機器人斷幾秒」——**掛單會被取消後重掛一筆新的**，
+        # 中間有一段訂單簿上沒有我們單子的空窗，同利率下的時間優先權也跟著歸零。
+        # 我們這個價位的成交本來就是陣發的，用一次純文件同步去重置一張正在排隊的單子
+        # 完全不划算。所以只動 .project-docs/ 的推送不重新部署。
+        #
+        # **刻意不用 `on.push.paths-ignore`**：那會連 test／integration 一起跳掉，
+        # 若分支保護設了必要檢查，被跳過的檢查會永遠停在未完成而擋住合併。
+        # 這裡只擋 deploy，測試照跑。
+        #
+        # **所有判斷不出來的情況一律照常部署**（fail-open）：這個判斷錯在「多部署一次」
+        # 只是白重啟一輪，錯在「少部署一次」卻是程式改了但機器人還在跑舊版，
+        # 而且不會有任何人發現。兩種錯的代價差太多了。
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "事件是 ${{ github.event_name }}，不是 push，沒有「上一版」可比；照常部署"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BASE="${{ github.event.before }}"
+          # force push 或分支第一次推送時，before 會是全 0；淺層 clone 也可能撈不到那個 commit
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
+              BASE=$(git rev-parse HEAD~1)
+              echo "github.event.before 不可用，改以 HEAD~1（$BASE）為基準"
+            else
+              echo "::warning::算不出比對基準，照常部署"
+              echo "docs_only=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+            echo "::warning::git diff 失敗，照常部署"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "::warning::比對不出任何變更檔案，照常部署"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "--- 這次變更的檔案（基準 $BASE）---"
+          printf '%s\n' "$CHANGED"
+
+          # 有任何一行不是 .project-docs/ 開頭，就代表這次不只動文件
+          if printf '%s\n' "$CHANGED" | grep -qv '^\.project-docs/'; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "有 .project-docs/ 以外的變更，照常部署"
+          else
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::這次只動了 .project-docs/，跳過部署——不重啟機器人，掛單維持原樣"
+          fi
+
   deploy:
     name: 容器化部署階段
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    if: >-
+      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+      && needs.changes.outputs.docs_only != 'true'
     runs-on: [self-hosted, linux, shuyulendingbot]
-    needs: [test, integration]
+    needs: [test, integration, changes]
     steps:
       - name: 取出程式碼
         uses: actions/checkout@v4

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed（2026-08-16，分支 `docs/tasks-notify-and-ci-deploy-skip`）
+- **只動 `.project-docs/` 的推送不再觸發部署**（TASKS.md P1-3、D017 的 2026-08-16 補充）。
+  先前每次文件同步都會 `systemctl --user restart`，等於**把交易所上正在排隊的掛單
+  取消後重掛一筆新的**——空窗加上時間優先權歸零，白白拉長成交的等待。
+  新增 `changes` job 比對變更路徑，`deploy` 整個 job 被條件擋下；
+  `test`／`integration` 照跑。判斷不出來的情況一律照常部署（fail-open）
+
 ### 2026-08-15：M4 完成並切換為小額真金運作
 - LINE Messaging API push 接上，取代 2025-03 停用的 LINE Notify（D024）。
   環境變數改為 `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_TO_USER_ID`。

@@ -42,9 +42,11 @@ jobs:
   integration:
     name: 整合/系統測試
     # **不要改回自架 runner**（TASKS.md C1，2026-08-17）。原本掛在自架 runner 上，
-    # 但那台機器同時跑兩個 runner、共用一個對外 IP，`actions/checkout` 的下載會被
-    # codeload.github.com 限流（429）。實測連續兩次 CI 都死在 `Set up job`——
-    # **測試根本沒跑到**，卻顯示成「整合測試失敗」。
+    # 但自架 runner 要自己去公開的 codeload.github.com 下載 action，
+    # 而 GitHub 託管的 runner 不走那條路。2026-08-17 的 GitHub 全域事故
+    # （archive downloads 約 50% 錯誤率）因此只打死自架這一邊：
+    # 連續兩次 CI 都死在 `Set up job`（429）——**測試根本沒跑到**，
+    # 卻顯示成「整合測試失敗」。
     # 同一次 workflow 裡，跑在 ubuntu-latest 的 test job 用同一個 actions/checkout
     # 兩次都成功：唯一的變數就是 runner。
     #

@@ -143,8 +143,26 @@
     `Fail to download archive 'https://codeload.github.com/actions/checkout/tar.gz/...'`
     `HttpRequestException: 429 (Too Many Requests)`，三次重試全失敗。
     同一份測試在本機直接跑是 **26 passed**。
-  - **成因**：這台機器上有 **2 個 Actions runner**（ShuyuLendingBot、CrawlZhongzheng）
-    共用同一個對外 IP，而 `_work/_actions/` **沒有快取**——每個 job 都要重新下載一次。
+  - **🔴 成因已更正（2026-08-17 稍晚，使用者找到 githubstatus.com）**：
+    真正的原因是 **GitHub 的全域事故**，不是這台機器。
+    - 事故建立於 **2026-08-17T13:40:03Z**，影響元件含
+      `Webhooks / API Requests / Issues / **Pull Requests** / Actions / Pages / Copilot`，
+      公告明寫：**「Archive downloads and raw repository content downloads are
+      experiencing an approximate 50% error rate」**——
+      `codeload.github.com/.../tar.gz/...` 正是 archive download。
+    - 元件清單裡的 **Pull Requests** 同時解釋了另外兩個症狀：
+      「Merge status cannot be loaded」與 PR 頁面載不進去。**三個症狀同一個根因。**
+  - **⚠️ 原本寫的成因是錯的，留在這裡當教訓**：先前判定為
+    「這台機器有 2 個 runner 共用對外 IP、`_work/_actions` 沒快取」。
+    那是**從有限資料推出的合理故事，沒有直接證據**——與 D036 記錄的毛病完全相同，
+    而且是在寫下 D036 的隔天犯的。**「聽起來合理」不是證據。**
+  - **修正仍然成立，但理由不同**：自架 runner 要自己去公開的 codeload 下載 action，
+    GitHub 託管的 runner 不走那條路。所以每次 GitHub 的 archive download 出問題，
+    自架 CI 就會斷、託管的不會。實測 3 比 0（同一段劣化期間，ubuntu-latest 三次全成功、
+    自架兩次全滅）。**只是沒有原本以為的那麼緊急。**
+  - **⬜ 連帶未解的暴露面**：`deploy` job 仍在自架 runner，第一步就是 `actions/checkout`。
+    **GitHub 再出一次同樣的事故，部署就會斷。** 做法 2（自架的 job 改用
+    `git fetch` + `git checkout`，不碰 codeload）因此值得為 deploy 單獨做一次。
   - **為什麼值得修而不是每次重跑**：這條路徑上，整合測試內部那個
     「連不上 Bitfinex 就 skip」的保護**根本輪不到執行**，所以它偽裝成
     「整合測試失敗」，但其實跟測試、跟這次的變更都無關。

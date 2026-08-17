@@ -1333,3 +1333,36 @@ DB 有四張表，**沒有一張存過市場長什麼樣**。
 所以路線圖把**量測基礎建設排在下一個策略決策之前**（第 1 期）：
 市場資料落地、回測工具、成效量測。第 2 期以後的策略工作都做在那之上。
 五個舊優先級的內容保留，只有排序被取代。
+
+### 更正：CI 紅燈的成因是 GitHub 全域事故，不是這台機器（同日稍晚）
+
+使用者找到 githubstatus.com 的公告，**推翻了先前對 C1 的成因判斷**。
+
+事故建立於 **2026-08-17T13:40:03Z**（截至 15:10Z 仍在 `investigating`），
+影響元件含 `Webhooks / API Requests / Issues / **Pull Requests** / Actions / Pages / Copilot`，
+公告明寫 **「Archive downloads and raw repository content downloads are experiencing
+an approximate 50% error rate」**——而 `codeload.github.com/.../tar.gz/...`
+正是 archive download。
+
+**今晚三個症狀因此是同一個根因**：CI 紅燈、「Merge status cannot be loaded」、
+以及 PR 頁面載不進去（後兩者對應元件清單裡的 **Pull Requests**）。
+
+### 🔴 這次的教訓：D036 的毛病，隔一天就自己犯了一次
+
+先前把成因判定為「這台機器有 2 個 runner 共用對外 IP、`_work/_actions` 沒快取」。
+那個說法**從頭到尾沒有直接證據**，是從「兩個 runner」這個事實推出來的合理故事。
+`curl` 三次 429 同時符合兩種解釋，我卻只採用了自己那一個。
+
+**D036 才剛寫完「每個決策都是用一個時間切片做出來的」，隔天就原封不動再犯一次。**
+差別在於這次有人（使用者）去查了外部狀態頁——**而那正是我應該做而沒做的第一件事：
+在歸咎自己的基礎設施之前，先確認上游是不是掛了。**
+
+### 修正仍然保留，但理由改寫
+
+自架 runner 要自己去公開的 codeload 下載 action，GitHub 託管的 runner 不走那條路。
+所以 GitHub 的 archive download 一出問題，只有自架這邊會斷——
+實測 3 比 0（同一段劣化期間 ubuntu-latest 三次全成功、自架兩次全滅）。
+減少對公開 codeload 的依賴仍然正確，**只是沒有原本以為的那麼緊急**。
+
+**連帶未解**：`deploy` 仍在自架 runner 且第一步就是 `actions/checkout`，
+**GitHub 再出一次同樣的事故，部署就會斷**。已記進 C1。

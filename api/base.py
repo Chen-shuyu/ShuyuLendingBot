@@ -54,6 +54,22 @@ class ExchangeClient(ABC):
         """
 
     @abstractmethod
+    def get_rate_candles(
+        self, currency: str, period: int = 2, timeframe: str = "1h", limit: int = 5_000
+    ) -> List[Dict[str, Any]]:
+        """取得放貸利率的 K 線，依時間**升冪**排序。
+
+        每一根是 `{"mts": int, "open": float, "close": float, "high": float,
+        "low": float, "volume": float}`，價格欄位都是**日利率**。
+
+        **為什麼需要這一份而不是用 `get_recent_trades()` 代替**：`/v2/trades` 一次
+        最多 10000 筆，活躍時段只涵蓋約 4 小時，而**樣本窗太短正是 D035 第一個錯誤
+        結論的成因**（用一個時間切片當成市場的常態）。K 線一次可取 5000 根、
+        涵蓋 7 個月，且每根的 `high` 直接就是「那段時間需求掃到多高」——
+        那正是期望值定價要問的問題（見 D035）。
+        """
+
+    @abstractmethod
     def get_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """查詢場上尚未成交的放貸掛單，**不做任何取消動作**。
 

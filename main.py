@@ -15,21 +15,25 @@ from config.settings import load_config, load_secrets_from_disk, resolve_config_
 from core.bot_engine import EXIT_FATAL, EXIT_OK, EXIT_UNEXPECTED, BotEngine
 from db.repository import Repository
 from notify.line_messaging import LineNotifier
+from strategies.expected_value import ExpectedValueStrategy
 from strategies.frr_plus import FrrPlusStrategy
 from strategies.orderbook_depth import OrderBookDepthStrategy
 from utils.logger import BotLogger
 
 __all__ = ["EXIT_OK", "EXIT_UNEXPECTED", "EXIT_FATAL", "build_strategy", "main"]
 
-# 可選的策略。`orderbook_depth` 是 2026-08-16 起的正式路線（見 DECISIONS.md D030）；
-# `frr_plus` 保留下來不是為了備援，而是為了能一行設定切回去做對照——
-# 它已知會把單子掛到市場之上（FRR 高過成交天花板），不該當成自動退路。
+# 可選的策略。`expected_value` 是 2026-08-17 起的正式路線（見 DECISIONS.md D035）。
+# 另外兩個保留下來不是為了備援，而是為了能一行設定切回去做對照，
+# **兩個都已知有系統性的定價錯誤，不該當成自動退路**：
+# `frr_plus` 會把單子掛到市場之上（FRR 高過成交天花板，D030）；
+# `orderbook_depth` 會在簿子底端有低價牆時把報價押到牆價上（D033、D035）。
 STRATEGIES = {
+    "expected_value": ExpectedValueStrategy,
     "orderbook_depth": OrderBookDepthStrategy,
     "frr_plus": FrrPlusStrategy,
 }
 
-DEFAULT_STRATEGY = "orderbook_depth"
+DEFAULT_STRATEGY = "expected_value"
 
 
 def build_strategy(config, logger):

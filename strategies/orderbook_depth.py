@@ -105,6 +105,7 @@ class OrderBookDepthStrategy(Strategy):
         frr: float,
         book: Optional[List[Dict[str, Any]]] = None,
         trades: Optional[List[Dict[str, Any]]] = None,
+        candles: Optional[List[Dict[str, Any]]] = None,
     ) -> List[OfferPlan]:
         """依餘額、市場深度與近期成交產生掛單計畫。`frr` 只作記錄用途，不參與定價。"""
         if balance_usd < self.min_required_usd:

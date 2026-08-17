@@ -134,6 +134,30 @@
   - `strategies/orderbook_depth.py` 的模組 docstring 沒有標示它已被 D035 取代，
     讀起來仍像是現行路線。
 
+### C. CI 基礎建設債（2026-08-17 由 PR #32 自己踩到）
+
+- [ ] **C1　自架 runner 下載 `actions/checkout` 會被 GitHub CDN 限流（429）**
+  - **實際發生**：PR #32（純文件）的「整合/系統測試」紅燈，但**測試根本沒跑到**
+    ——job 死在 `Set up job`。Runner 診斷日誌：
+    `Fail to download archive 'https://codeload.github.com/actions/checkout/tar.gz/...'`
+    `HttpRequestException: 429 (Too Many Requests)`，三次重試全失敗。
+    同一份測試在本機直接跑是 **26 passed**。
+  - **成因**：這台機器上有 **2 個 Actions runner**（ShuyuLendingBot、CrawlZhongzheng）
+    共用同一個對外 IP，而 `_work/_actions/` **沒有快取**——每個 job 都要重新下載一次。
+  - **為什麼值得修而不是每次重跑**：這條路徑上，整合測試內部那個
+    「連不上 Bitfinex 就 skip」的保護**根本輪不到執行**，所以它偽裝成
+    「整合測試失敗」，但其實跟測試、跟這次的變更都無關。
+    **看到紅燈卻不是真的壞掉，是最會消耗信任的一種失敗。**
+  - **建議做法（成本由低到高）**：
+    1. **整合測試改回 `ubuntu-latest`** ——它只打 Bitfinex 公開唯讀端點，
+       不需要這台機器的任何東西。**只有 `deploy` job 真的需要自架 runner。**
+       改動最小，一行 `runs-on`。
+    2. 自架 runner 的 job 不用 `actions/checkout`，改直接 `git fetch` +
+       `git checkout`（機器上本來就有 repo，完全不碰 codeload）。要自己處理
+       PR 的 merge ref，比較囉嗦但一勞永逸。
+  - **與分支保護的關係**：若先開了「required status checks」再修這一項，
+    這種與內容無關的 flaky 會把純文件 PR 也卡死。**順序是先修 C1，再開保護。**
+
 ## 🎯 工作計畫（2026-08-16 規劃，依優先級）
 
 > ⚠️ **2026-08-17：這五個優先級的「順序」已由 [PLAN.md](PLAN.md) 的分期路線圖取代**

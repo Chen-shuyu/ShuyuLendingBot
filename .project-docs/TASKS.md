@@ -136,7 +136,8 @@
 
 ### C. CI 基礎建設債（2026-08-17 由 PR #32 自己踩到）
 
-- [ ] **C1　自架 runner 下載 `actions/checkout` 會被 GitHub CDN 限流（429）**
+- [x] **C1　自架 runner 下載 `actions/checkout` 會被 GitHub CDN 限流（429）**
+      —— **2026-08-17 完成**，整合測試的 `runs-on` 改為 `ubuntu-latest`（做法 1）。
   - **實際發生**：PR #32（純文件）的「整合/系統測試」紅燈，但**測試根本沒跑到**
     ——job 死在 `Set up job`。Runner 診斷日誌：
     `Fail to download archive 'https://codeload.github.com/actions/checkout/tar.gz/...'`
@@ -157,6 +158,24 @@
        PR 的 merge ref，比較囉嗦但一勞永逸。
   - **與分支保護的關係**：若先開了「required status checks」再修這一項，
     這種與內容無關的 flaky 會把純文件 PR 也卡死。**順序是先修 C1，再開保護。**
+  - **動手前的驗證（使用者要求「先確認是正確的解法，不要亂改」）**：
+    1. **CI 裡本來就有一個對照實驗**：同一次 workflow、同一個 commit、
+       同一個 `actions/checkout@v4`——跑在 `ubuntu-latest` 的 test job 兩次都成功，
+       跑在自架 runner 的 integration job 兩次都 429。**唯一的變數是 runner。**
+    2. **直接用 `curl` 從那台機器抓同一個檔案，三次全 429**，完全沒有 CI 參與。
+    3. **integration 的測試不需要那台機器**：`grep` 過沒有 systemd／podman／
+       本機路徑／金鑰的依賴；`conftest.py` 的隔離 fixture 用 `tmp_path_factory`，可攜。
+    4. **絕大部分測試早就在 `ubuntu-latest` 上跑了**：test job 的最後一步是
+       `pytest tests/integration -q -m "not live"`，一直是綠的。
+       自架那個 job 唯一多做的只有 6 個 `live` 測試。
+    5. **查過為什麼當初選自架**：從第一個 commit（`7ec9859`）起就寫死 self-hosted，
+       DECISIONS.md 裡**沒有任何一條解釋理由**，看起來只是跟 deploy job 設在一起。
+    6. **最壞情況不會變紅**：若 Bitfinex 擋雲端 IP，測試內部
+       `except (ccxt.NetworkError, ccxt.ExchangeError, OSError) → pytest.skip`，
+       job 仍是綠的。**但那會變成安靜的失敗**，所以一併加上 `-rs` 讓 skip 原因印出來。
+  - **⬜ 上線後要確認的一件事**：CI 輸出裡那 6 個 `live` 測試是**真的跑了**還是 skip。
+    若永遠 skip，代表 Bitfinex 擋掉 GitHub 的 IP，那就要改回自架 runner
+    並改用做法 2（不用 `actions/checkout`）——**別讓它安靜地 skip 下去**。
 
 ## 🎯 工作計畫（2026-08-16 規劃，依優先級）
 

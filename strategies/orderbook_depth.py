@@ -108,34 +108,44 @@ class OrderBookDepthStrategy(Strategy):
         candles: Optional[List[Dict[str, Any]]] = None,
     ) -> List[OfferPlan]:
         """依餘額、市場深度與近期成交產生掛單計畫。`frr` 只作記錄用途，不參與定價。"""
+        self.last_skip_reason = None
+
         if balance_usd < self.min_required_usd:
-            return []
+            return self._skip(
+                f"可用餘額 {balance_usd:.2f} USD 低於下限 {self.min_required_usd:.2f} USD"
+            )
 
         lendable_usd = self._apply_lend_limit(balance_usd)
         if lendable_usd < self.min_loan_size_usd:
-            return []
+            return self._skip(
+                f"風控上限套用後只剩 {lendable_usd:.2f} USD，"
+                f"低於單筆最小量 {self.min_loan_size_usd:.2f} USD"
+            )
 
         # 沒有市場深度就不掛。**刻意不退回 FRR 那條路**：那正是已知會掛空的定價方式，
         # 拿它當備援等於「失敗時自動切換成一個確定無效的策略」，還會讓人以為有在放貸。
         if not book:
-            return []
+            return self._skip("拿不到市場深度（訂單簿），無法定價（刻意不退回 FRR）")
 
         # 沒有成交資料同樣不掛。代價是不對稱的：少掛一輪只損失幾毫（344 USD 空轉
         # 一整天也才 0.074 USD），而在看不見成交價的情況下掛錯價位，
         # 是把資金用半價鎖住好幾天——2026-08-16 夜間那筆正是如此（D033）。
         market_rate = self.market_rate(trades)
         if market_rate is None:
-            return []
+            return self._skip("近期成交樣本不足，算不出常態成交價，無法設定成交價下限")
 
         base_rate = self._price_from_depth(book)
         if base_rate is None:
-            return []
+            return self._skip("訂單簿上找不到可用的檔位")
 
         # **下限只往上拉，不往下壓**：排隊規則算出來的價位若已經高於常態成交價，
         # 那是市場自己給的好價錢，沒有理由砍掉它。
         base_rate = self._quantize(max(base_rate, market_rate * self.market_floor_pct))
         if base_rate < self.minimum_rate:
-            return []
+            return self._skip(
+                f"排隊定價加上成交價下限後為年化 {base_rate * 365 * 100:.2f}%，"
+                f"仍低於地板年化 {self.minimum_rate * 365 * 100:.2f}%，本輪不賣"
+            )
 
         count = self._resolve_spread_count(lendable_usd)
         amounts = self._split_amount(lendable_usd, count)

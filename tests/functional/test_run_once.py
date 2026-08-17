@@ -251,15 +251,21 @@ class TestSkipPaths:
     def test_insufficient_balance_skips_cycle(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
     ):
+        """餘額不足時，訊息要講得出**具體是多少對多少**（TASKS.md A1）。
+
+        舊版寫死一句「可放貸金額低於最低門檻或單筆最小量」——那句話在策略的
+        六個出口裡有五個是錯的，而且沒有任何數字可以核對。
+        """
         client = FakeClient(balance=100.0, frr=0.0002)
-        with pytest.raises(SkipCycleError, match="低於最低門檻"):
+        with pytest.raises(SkipCycleError, match="可用餘額 100.00 USD 低於下限 150.00 USD"):
             run_once(fake_logger, fake_notifier, strategy, client, repository)
 
         assert client.offers == []
         state = repository.get_state()
         assert state["last_run_at"] is not None
         assert state["last_frr"] == pytest.approx(0.0002)
-        assert "略過本輪" in state["last_action"]
+        # 落帳的理由要跟丟出來的例外講同一件事，否則事後對不起來
+        assert "可用餘額 100.00 USD" in state["last_action"]
 
     def test_skip_writes_no_offers(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
         client = FakeClient(balance=100.0)

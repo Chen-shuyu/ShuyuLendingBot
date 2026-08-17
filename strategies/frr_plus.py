@@ -38,12 +38,19 @@ class FrrPlusStrategy(Strategy):
         不看市場深度、實際成交或 K 線（`requires_book` / `requires_trades` /
         `requires_candles` 都維持 False，迴圈層根本不會去抓）。
         """
+        self.last_skip_reason = None
+
         if balance_usd < self.min_required_usd:
-            return []
+            return self._skip(
+                f"可用餘額 {balance_usd:.2f} USD 低於下限 {self.min_required_usd:.2f} USD"
+            )
 
         lendable_usd = self._apply_lend_limit(balance_usd)
         if lendable_usd < self.min_loan_size_usd:
-            return []
+            return self._skip(
+                f"風控上限套用後只剩 {lendable_usd:.2f} USD，"
+                f"低於單筆最小量 {self.min_loan_size_usd:.2f} USD"
+            )
 
         base_rate = max(frr + self.premium_rate, self.minimum_rate)
         count = self._resolve_spread_count(lendable_usd)

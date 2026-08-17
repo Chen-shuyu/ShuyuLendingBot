@@ -109,6 +109,43 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # **策略層仍然不碰 IO**：這裡只是把算過的東西留下來，不主動輸出。
         self.last_evaluation: List[Dict[str, float]] = []
 
+
+    # ------------------------------------------------------------------
+    # 小工具
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _annual(daily_rate: float) -> float:
+        """日利率換算成年化百分比。日誌與說明一律用年化，因為人只看得懂那個。"""
+        return daily_rate * 365 * 100
+
+    def describe_decision(self) -> Optional[str]:
+        """把最近一次定價決策濃縮成一行，供迴圈層寫日誌（策略層不碰 IO）。
+
+        **這個方法存在的理由就是 D033 的教訓**：那次用半價把 344 USD 借出去，
+        事後翻日誌只有「掛出 344.30 USD，利率 0.000150」——**沒有任何一個數字
+        能讓人看出那是半價**。定價基準換成期望值之後，同樣的處境原封不動重現：
+        日誌看得到最後的價格，看不到它是怎麼被選出來的。
+
+        回傳 `None` 代表這一輪沒有評估過任何候選價位（例如餘額不足就先出局了）。
+        """
+        if not self.last_evaluation:
+            return None
+
+        chosen = max(self.last_evaluation, key=lambda item: item["effective"])
+        # 拿「最快成交的那個候選」當對照組：它就是舊策略會選的那一類價位，
+        # 兩者並列才看得出這一輪的取捨到底換到了什麼。
+        fastest = min(self.last_evaluation, key=lambda item: item["wait_hours"])
+        return (
+            f"期望值定價：{len(self.last_evaluation)} 個候選價位，"
+            f"選中年化 {self._annual(chosen['rate']):.2f}%"
+            f"（平均等待 {chosen['wait_hours']:.1f}h、窗內命中 {chosen['hits']} 次、"
+            f"實質年化 {self._annual(chosen['effective']):.2f}%）；"
+            f"對照最快成交的候選 年化 {self._annual(fastest['rate']):.2f}%"
+            f"（等待 {fastest['wait_hours']:.1f}h、實質年化 "
+            f"{self._annual(fastest['effective']):.2f}%）"
+        )
+
     # ------------------------------------------------------------------
     # 期望值計算
     # ------------------------------------------------------------------
@@ -191,33 +228,51 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         candles: Optional[List[Dict[str, Any]]] = None,
     ) -> List[OfferPlan]:
         """依餘額與 K 線的期望值定價產生掛單計畫。`frr` 與 `book` 只作記錄用途。"""
+        self.last_skip_reason = None
+
         if balance_usd < self.min_required_usd:
-            return []
+            return self._skip(
+                f"可用餘額 {balance_usd:.2f} USD 低於下限 {self.min_required_usd:.2f} USD"
+            )
 
         lendable_usd = self._apply_lend_limit(balance_usd)
         if lendable_usd < self.min_loan_size_usd:
-            return []
+            return self._skip(
+                f"風控上限套用後只剩 {lendable_usd:.2f} USD，"
+                f"低於單筆最小量 {self.min_loan_size_usd:.2f} USD"
+            )
 
         # 沒有 K 線就不掛。**刻意不退回排隊定價**：那正是 D035 認定選錯自變數的
         # 定價方式，拿它當備援等於「資料一缺就自動切換成一個已知會賣在底部的策略」，
         # 而且從日誌上看起來一切正常。同樣的理由 D030 已經對 FRR 講過一次。
         if not candles:
-            return []
+            return self._skip("拿不到利率 K 線，無法估算等待時間（刻意不退回排隊定價）")
 
         # 成交價下限仍然要有。K 線講的是「歷史上掃到多高」，
         # 成交紀錄講的是「借款人現在實際付多少」——後者才擋得住當下的異常（D033）。
         market_rate = self.market_rate(trades)
         if market_rate is None:
-            return []
+            return self._skip("近期成交樣本不足，算不出常態成交價，無法設定成交價下限")
 
         base_rate = self.choose_rate(candles)
         if base_rate is None:
-            return []
+            return self._skip(
+                f"K 線只有 {len(candles)} 根，或窗內沒有任何候選價位的命中次數達到 "
+                f"{self.ev_min_hits} 次，估不出可信的等待時間"
+            )
 
         # 兩道防線沿用 D033，語意不變：下限只往上拉，不往下壓。
-        base_rate = self._quantize(max(base_rate, market_rate * self.market_floor_pct))
-        if base_rate < self.minimum_rate:
-            return []
+        floored_rate = self._quantize(max(base_rate, market_rate * self.market_floor_pct))
+        if floored_rate < self.minimum_rate:
+            # **這一句是這次改動最重要的一行。** 在它之前，這個出口跟「錢包沒錢」
+            # 寫出來的日誌一模一樣，而兩者的處置完全相反：一個要等市場回來，
+            # 一個要去檢查資金為什麼不見了。
+            return self._skip(
+                f"期望值算出年化 {self._annual(base_rate):.2f}%、"
+                f"成交價下限拉到年化 {self._annual(floored_rate):.2f}%，"
+                f"仍低於地板年化 {self._annual(self.minimum_rate):.2f}%，本輪不賣"
+            )
+        base_rate = floored_rate
 
         count = self._resolve_spread_count(lendable_usd)
         amounts = self._split_amount(lendable_usd, count)

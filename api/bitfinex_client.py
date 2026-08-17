@@ -224,6 +224,66 @@ class BitfinexClient(ExchangeClient):
         trades.sort(key=lambda trade: trade["mts"])
         return trades
 
+    # 純讀取且冪等，可安全重試。
+    @with_retry()
+    def get_rate_candles(
+        self, currency: str, period: int = 2, timeframe: str = "1h", limit: int = 5_000
+    ) -> List[Dict[str, Any]]:
+        """取得放貸利率 K 線（公開端點，不需簽章），依時間升冪排序。
+
+        **這份資料回答的問題是「掛在某個利率，多久會遇到一次掃到那裡的需求」**，
+        而那正是排隊位置模型答不出來、也答錯了的問題（見 DECISIONS.md D035）。
+
+        每根 K 的 `high` 是那段時間內成交過的最高利率。這個市場的成交是**陣發掃單**
+        ——需求來的時候一口氣掃到 9~10%，沒來的時候簿子前端也不動。所以
+        「某根 K 的 `high` ≥ 我們的掛單利率」就等於「那段時間我們會被掃到」。
+
+        端點是 `/v2/candles/trade:{timeframe}:f{ccy}:p{period}/hist`。
+        **`p{period}` 這一段不能省**：不指定天期會把所有天期混在一起，
+        而 2 天期佔了 86% 的供給、價格結構與長天期不同（見 D030 的天期分析）。
+        """
+        exchange = self._public_exchange()
+        symbol = f"f{currency}"
+        try:
+            rows = exchange.public_get_candles_trade_timeframe_symbol_period_section(
+                {
+                    "timeframe": timeframe,
+                    "symbol": symbol,
+                    "period": f"p{int(period)}",
+                    "section": "hist",
+                    "limit": limit,
+                    "sort": -1,
+                }
+            )
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢 {symbol} 利率 K 線逾時或超過速率限制：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise RetryableError(f"查詢 {symbol} 利率 K 線時交易所回傳錯誤：{exc}") from exc
+
+        candles: List[Dict[str, Any]] = []
+        try:
+            for row in rows:
+                # [0]=MTS, [1]=OPEN, [2]=CLOSE, [3]=HIGH, [4]=LOW, [5]=VOLUME；
+                # **欄位可能是字串**（掛單簿與成交紀錄實測都是），一律自己轉型（D027）。
+                high = float(row[3])
+                if high <= 0:
+                    continue
+                candles.append(
+                    {
+                        "mts": int(row[0]),
+                        "open": float(row[1]),
+                        "close": float(row[2]),
+                        "high": high,
+                        "low": float(row[4]),
+                        "volume": abs(float(row[5])),
+                    }
+                )
+        except (IndexError, ValueError, TypeError) as exc:
+            raise RetryableError(f"無法解析 {symbol} 利率 K 線回應：{exc}") from exc
+
+        candles.sort(key=lambda candle: candle["mts"])
+        return candles
+
     @with_retry()
     def get_active_offers(self, currency: Optional[str] = None) -> List[Dict[str, Any]]:
         """查詢場上未成交的放貸掛單（唯讀，不取消任何東西）。"""

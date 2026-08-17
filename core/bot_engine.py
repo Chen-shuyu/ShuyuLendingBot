@@ -143,6 +143,7 @@ class BotEngine:
 
         book = self._fetch_book()
         trades = self._fetch_trades()
+        candles = self._fetch_candles()
         self._log_market_rate(trades)
 
         # 掛在場上的錢也是我們的錢。只看 `get_available_balance()` 的話，單子一掛出去
@@ -150,7 +151,7 @@ class BotEngine:
         # 有錢才算得出計畫」之間打轉，等於強迫自己每輪都重掛。
         committed_usd = sum(float(offer["amount"]) for offer in existing)
         disposable_usd = balance_usd + committed_usd
-        plans = self.strategy.build_offer_plan(disposable_usd, frr, book, trades)
+        plans = self.strategy.build_offer_plan(disposable_usd, frr, book, trades, candles)
 
         if not plans:
             if existing:
@@ -232,7 +233,7 @@ class BotEngine:
             # 那是估計值，而掛單金額只要多一分錢，交易所就會拒絕整筆（D025）。
             balance_usd = self.client.get_available_balance("USD")
             self.logger.info(f"取消後可用 USD 餘額：{balance_usd}")
-            plans = self.strategy.build_offer_plan(balance_usd, frr, book, trades)
+            plans = self.strategy.build_offer_plan(balance_usd, frr, book, trades, candles)
             if not plans:
                 self.repository.save_state(
                     last_frr=frr, last_action="取消後可放貸金額不足，本輪沒有重掛"
@@ -328,6 +329,20 @@ class BotEngine:
         if not book:
             self.logger.warning("市場深度查詢回傳空清單，本輪將沒有掛單計畫。")
         return book
+
+    def _fetch_candles(self):
+        """取得利率 K 線；策略用不到就不打這個端點（同 `_fetch_book()` 的理由）。"""
+        if not getattr(self.strategy, "requires_candles", False):
+            return None
+        candles = self.client.get_rate_candles(
+            "USD",
+            period=getattr(self.strategy, "offer_period", 2),
+            timeframe=getattr(self.strategy, "candle_timeframe", "1h"),
+            limit=getattr(self.strategy, "candle_limit", 240),
+        )
+        if not candles:
+            self.logger.warning("利率 K 線查詢回傳空清單，本輪將沒有掛單計畫。")
+        return candles
 
     def _fetch_trades(self):
         """取得近期成交紀錄；策略用不到就不打這個端點（同 `_fetch_book()` 的理由）。"""

@@ -30,13 +30,13 @@ class FrrPlusStrategy(Strategy):
         self.max_percent_to_lend = float(strategy_config.get("max_percent_to_lend", 0))
 
     def build_offer_plan(
-        self, balance_usd: float, frr: float, book=None, trades=None
+        self, balance_usd: float, frr: float, book=None, trades=None, candles=None
     ) -> List[OfferPlan]:
         """依據目前餘額與 FRR，產生一組掛單方案。
 
-        `book` 與 `trades` 一律忽略：這個策略的定價基準是 FRR，不看市場深度、
-        也不看實際成交（`requires_book` / `requires_trades` 都維持 False，
-        迴圈層根本不會去抓）。
+        `book`、`trades` 與 `candles` 一律忽略：這個策略的定價基準是 FRR，
+        不看市場深度、實際成交或 K 線（`requires_book` / `requires_trades` /
+        `requires_candles` 都維持 False，迴圈層根本不會去抓）。
         """
         if balance_usd < self.min_required_usd:
             return []

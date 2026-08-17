@@ -59,6 +59,11 @@ class StubClient:
     def get_recent_trades(self, currency, limit=1000):  # pragma: no cover - 同上
         return []
 
+    def get_rate_candles(
+        self, currency, period=2, timeframe="1h", limit=240
+    ):  # pragma: no cover - 同上
+        return []
+
     def create_loan_offer(self, currency, amount, rate, duration):  # pragma: no cover - 用不到
         raise AssertionError("這組測試的策略一律回傳空計畫，不該走到掛單")
 
@@ -68,11 +73,12 @@ class StubStrategy:
 
     requires_book = False
     requires_trades = False
+    requires_candles = False
 
     def __init__(self, config):
         pass
 
-    def build_offer_plan(self, balance, frr, book=None, trades=None):
+    def build_offer_plan(self, balance, frr, book=None, trades=None, candles=None):
         return []
 
 

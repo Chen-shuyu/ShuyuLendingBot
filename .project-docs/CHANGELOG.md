@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added（2026-08-17 深夜，分支 `fix/log-expected-value-reasoning`）
+- **定價決策寫進日誌**（TASKS.md A1）：`ExpectedValueStrategy.describe_decision()`
+  ＋ `BotEngine._log_pricing_rationale()`。輸出含候選價位數、選中的利率、平均等待、
+  窗內命中次數、實質年化，**並對照「最快成交的候選」**——後者正是舊策略會選的價位，
+  兩者並排才看得出取捨換到了什麼
+
+### Fixed（2026-08-17 深夜）
+- **「本輪不掛單」的理由不再寫死成「可放貸金額不足」**。策略有六個出口會回傳空計畫，
+  **其中五個跟金額無關**；最糟的是「價格低於年化 8% 地板」——帳上有 344 USD 卻寫
+  「可放貸金額不足（目前 344.3 USD）」，自相矛盾又把人指向錯的方向，
+  **而那正是市場走弱時最可能出現的情況**。這是 D026「靜默失效」的第三次現身
+- `Strategy` 基底新增 `last_skip_reason` 與 `_skip()`，**三個策略的每個出口都要交代理由**。
+  只修 `expected_value` 的話，之後切回 `orderbook_depth` 做對照就會踩回同一個坑。
+  策略答不出來時退回中性的「未提供原因」——講「不知道」遠比講一個具體但錯誤的原因好
+
 ### Changed（2026-08-17，分支 `fix/market-floor-goes-stale`）
 - **定價基準由「訂單簿排隊位置」改為「單位時間報酬的期望值」**（TASKS.md P1-5、D035）。
   `strategy.mode` 預設改為 `expected_value`。掃過候選價位，挑

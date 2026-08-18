@@ -290,3 +290,95 @@ class TestRegression:
         assert old == []  # 排隊定價算出 5.47%，被 8% 地板擋下
         assert len(new) == 1
         assert annual(new[0].rate) == pytest.approx(9.5, abs=0.05)
+
+
+class TestDecisionIsVisible:
+    """定價決策要看得見（TASKS.md A1）。
+
+    **這一組測試釘住的是 D033 的教訓**：那次用半價把 344 USD 借出去，
+    事後翻日誌只有「掛出 344.30 USD，利率 0.000150」——沒有任何數字能看出那是半價。
+    定價換成期望值之後，同樣的處境原封不動重現了一次。
+    """
+
+    def _candles(self, annual_pct=10.0, count=60):
+        return [candle(i, daily(annual_pct)) for i in range(count)]
+
+    def test_掛單時說得出這個價位是怎麼選出來的(self):
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        line = strategy.describe_decision()
+
+        assert line is not None
+        # 四個數字缺一不可：候選數、選中的價、等待、實質年化
+        for 必要欄位 in ("候選價位", "選中年化", "平均等待", "實質年化"):
+            assert 必要欄位 in line
+        assert "10.00%" in line
+
+    def test_沒評估過就不硬掰(self):
+        """餘額不足在評估之前就出局，這時沒有東西可以講。"""
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(
+            10.0, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.describe_decision() is None
+
+    def test_價格太低而不掛時_理由不可以說成沒錢(self):
+        """**這是這次改動最重要的一項。**
+
+        帳上有 344 USD、市場走弱到年化 8% 以下，舊版會寫
+        「可放貸金額不足（目前 344.3 USD）」——自相矛盾，而且把人指向
+        「錢為什麼不見了」這個完全錯誤的方向。
+        """
+        strategy = ExpectedValueStrategy(base_config())
+        plans = strategy.build_offer_plan(
+            344.3,
+            0.0002,
+            book=[],
+            trades=trades_at(daily(6.0)),
+            candles=self._candles(annual_pct=7.0),
+        )
+
+        assert plans == []
+        reason = strategy.last_skip_reason
+        assert reason is not None
+        assert "地板" in reason and "8.00%" in reason
+        # 絕對不能把「價格太低」講成「錢不夠」
+        assert "餘額" not in reason and "金額不足" not in reason
+
+    def test_每個不掛的出口都說得出自己的理由(self):
+        """六個出口逐一走一遍，確認沒有任何一個是沉默的。"""
+        strategy = ExpectedValueStrategy(base_config())
+        good_trades = trades_at(daily(10.0))
+        good_candles = self._candles()
+
+        情境 = [
+            ("低於下限", dict(balance_usd=10.0, trades=good_trades, candles=good_candles)),
+            ("拿不到利率 K 線", dict(balance_usd=344.3, trades=good_trades, candles=None)),
+            ("近期成交樣本不足", dict(balance_usd=344.3, trades=None, candles=good_candles)),
+            ("K 線只有", dict(balance_usd=344.3, trades=good_trades, candles=self._candles(count=10))),
+        ]
+        for 關鍵字, kwargs in 情境:
+            strategy.last_skip_reason = None
+            plans = strategy.build_offer_plan(
+                kwargs["balance_usd"], 0.0002, book=[],
+                trades=kwargs["trades"], candles=kwargs["candles"],
+            )
+            assert plans == [], f"{關鍵字}：預期不掛單"
+            assert strategy.last_skip_reason is not None, f"{關鍵字}：沒有留下原因"
+            assert 關鍵字 in strategy.last_skip_reason, (
+                f"預期理由含「{關鍵字}」，實際是「{strategy.last_skip_reason}」"
+            )
+
+    def test_掛得出去時不留下不掛的理由(self):
+        """成功那一輪要把上一輪的理由清掉，否則日誌會沿用過期的說法。"""
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(10.0, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles())
+        assert strategy.last_skip_reason is not None
+
+        plans = strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert len(plans) == 1
+        assert strategy.last_skip_reason is None

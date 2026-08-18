@@ -152,8 +152,10 @@ class BotEngine:
         committed_usd = sum(float(offer["amount"]) for offer in existing)
         disposable_usd = balance_usd + committed_usd
         plans = self.strategy.build_offer_plan(disposable_usd, frr, book, trades, candles)
+        self._log_pricing_rationale()
 
         if not plans:
+            skip_reason = self._strategy_skip_reason()
             if existing:
                 # 策略說「這個市場現在不值得掛」，但場上已經有單了。
                 # **不要撤**：那張單是用更早的（也就是更好的）市場條件掛出去的，
@@ -162,15 +164,18 @@ class BotEngine:
                     last_frr=frr, last_action=f"維持場上 {len(existing)} 筆既有掛單，本輪不重掛"
                 )
                 self.logger.info(
-                    f"本輪不產生新計畫，但場上已有 {len(existing)} 筆掛單，維持不動以保住排隊位置。"
+                    f"本輪不產生新計畫（{skip_reason}），"
+                    f"但場上已有 {len(existing)} 筆掛單，維持不動以保住排隊位置。"
                 )
                 raise SkipCycleError("本輪無新掛單計畫，維持場上既有掛單")
 
-            self.repository.save_state(last_frr=frr, last_action="可放貸金額不足，略過本輪")
-            self._note_offers_absent(
-                f"可放貸金額不足（目前 {balance_usd} USD），本輪沒有掛單", explained=filled
-            )
-            raise SkipCycleError("可放貸金額低於最低門檻或單筆最小量，跳過本輪")
+            # **不要再寫死「可放貸金額不足」**（TASKS.md A1）。策略有六個出口會回傳
+            # 空計畫，其中五個跟金額無關；最糟的是「價格低於年化 8% 地板」——
+            # 帳上有 344 USD 卻寫「可放貸金額不足（目前 344.3 USD）」，
+            # 自相矛盾，還把人指向「錢為什麼不見了」這個完全錯誤的方向。
+            self.repository.save_state(last_frr=frr, last_action=f"本輪未掛單：{skip_reason}")
+            self._note_offers_absent(f"本輪沒有掛單：{skip_reason}", explained=filled)
+            raise SkipCycleError(f"本輪不掛單：{skip_reason}")
 
         self._log_queue_position(book, plans)
         ahead_of_live = self._queue_ahead_of_live(book, existing)
@@ -354,6 +359,35 @@ class BotEngine:
         if not trades:
             self.logger.warning("近期成交查詢回傳空清單，本輪將沒有掛單計畫。")
         return trades
+
+    def _log_pricing_rationale(self) -> None:
+        """把「這個價位是怎麼選出來的」寫進日誌（TASKS.md A1）。
+
+        **這一行的存在理由，是 D033 的教訓在新定價鏈上原封不動重演了一次。**
+        當時用半價把 344 USD 借出去，事後翻日誌只有「掛出 344.30 USD，
+        利率 0.000150」——沒有任何數字能看出那是半價，於是補了 `_log_market_rate()`。
+        定價基準換成期望值（D035）之後，日誌又變成只看得到結果、看不到推導：
+        等待估計多久、窗內命中幾次、實質年化多少，一個都沒有。
+
+        策略沒有這個能力就靜靜跳過——`frr_plus` 與 `orderbook_depth` 都沒有
+        期望值評估，硬要它們回答只會多一個會爆的地方。
+        """
+        describe = getattr(self.strategy, "describe_decision", None)
+        if describe is None:
+            return
+        line = describe()
+        if line:
+            self.logger.info(line)
+
+    def _strategy_skip_reason(self) -> str:
+        """策略為什麼不掛單。策略沒說就退回一句中性的描述。
+
+        **退路刻意寫得中性**：舊版寫死「可放貸金額不足」，而那句話在六個出口
+        裡有五個是錯的。答不出來的時候，講「不知道」遠比講一個具體但錯誤的原因好
+        ——後者會讓人朝錯的方向查（D026 的同一族問題）。
+        """
+        reason = getattr(self.strategy, "last_skip_reason", None)
+        return reason or "策略未產生掛單計畫（未提供原因）"
 
     def _log_market_rate(self, trades) -> None:
         """把「借款人現在實際付多少」寫進日誌，與掛單利率對照。

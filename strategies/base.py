@@ -38,6 +38,22 @@ class Strategy(ABC):
     # 這個策略需不需要利率 K 線。同上，用不到就不打。
     requires_candles = False
 
+    # 最近一次回傳空計畫的原因（沒有就是 None）。迴圈層拿它寫日誌與落帳。
+    #
+    # **為什麼這是介面的一部分，而不是某個策略的私事**：`build_offer_plan()` 回傳
+    # 空清單有很多種原因——沒錢、資料不足、價格太低——而迴圈層看到的都是同一個
+    # `[]`。舊版因此寫死一句「可放貸金額不足」，在多數出口都是錯的；最糟的情況是
+    # 帳上有 344 USD 卻寫「可放貸金額不足（目前 344.3 USD）」，自相矛盾又把人
+    # 指向錯的方向（TASKS.md A1）。
+    #
+    # **策略層仍然不碰 IO**：這裡只是把已經知道的事實留下來，不主動輸出。
+    last_skip_reason: Optional[str] = None
+
+    def _skip(self, reason: str) -> List["OfferPlan"]:
+        """本輪不掛單，並把原因留給迴圈層。"""
+        self.last_skip_reason = reason
+        return []
+
     @abstractmethod
     def build_offer_plan(
         self,

@@ -88,9 +88,126 @@
       → 重掛 160.0。DB 裡 78 筆 `submitted`、`earnings_daily` 空的。
 - [x] **昨天寫的兩條對策，實測資料顯示兩條都不會成交** —— 見下方修正。
 
+## 🔍 程式／文件盤查結果（2026-08-17，PR #31 合併後）
+
+> 逐項都以**實跑真實市場資料**確認過，不是讀程式碼推測的。
+> 前三項是 PR #31 自己帶進來的、沒被任何測試蓋到的行為改變。
+
+### A. 程式行為與文件不符（三項，都與 D035 的改動有關）
+
+- [ ] **A1　期望值的計算過程完全沒有寫進日誌**（`last_evaluation` 是死碼）
+  - `strategies/expected_value.py` 的 `last_evaluation` 註解寫「供迴圈層寫日誌用」，
+    但**沒有任何地方讀它**（`grep` 只有策略自己與測試）。
+  - 後果：機器人掛出一個價位時，日誌看不出「為什麼是這個價」——
+    等待估計多久、窗內命中幾次、實質年化多少，一個都沒有。
+  - **這正是 D033 記過的教訓在新定價鏈上重演**：當時的結論是
+    「日誌裡沒有任何一個數字能讓人看出這個價位是半價」，於是補了 `_log_market_rate()`。
+    新的定價鏈又回到同一個狀態。
+- [ ] **A2　重掛守門檻（D034）已退化成「永遠擋下往下調價」**
+  - 實測：候選價位年化 9.96%，而**簿子可見的最高檔只有 7.21%**——
+    候選價位高過整個可見範圍，於是 `_queue_ahead()` 對任何價位都回傳同一個
+    截斷總額（5,381,114 USD）。
+  - 兩邊的等待估計因此完全相同，`利息 ÷ (等待 + 借出期間)` 的分母約掉，
+    判準退化成純粹比利率——**只要候選價位比場上那張低，就一定被擋**。
+  - 實跑確認：往下調價 10% → 擋下，訊息是
+    `前方 5,381,114 → 5,381,114 USD`（兩個數字一樣就是證據）。
+  - 後果：**場上那張單的利率永遠不會被往下調超過 2%**（2% 以內由
+    `_plans_match` 的容差吸收）。市場真的走弱時機器人不會跟著下來，會一直空掛。
+  - **這不是有人決定的行為，是 D035 的改動連帶造成的。** 要嘛改用策略的 K 線
+    等待估計，要嘛明講「新策略下不做往下重掛」並拿掉這段死邏輯。
+- [ ] **A3　排隊位置日誌現在是截斷值，不是量測值**
+  - `_log_queue_position()` 會寫「全天期前方 5,410,936 USD」，而那個數字**正好等於
+    簿子 250 檔的金額總計**——代表候選價位落在可見範圍之外，這行日誌講的是
+    「至少這麼多」，不是「就是這麼多」。
+  - 同一個根因：`get_funding_book()` 只抓 250 檔，而新策略的價位在那之上。
+  - 要嘛在越界時標示出來，要嘛承認這兩個數字對新策略沒有意義而拿掉。
+
+### B. 文件敘述已經過期（三項）
+
+- [ ] **B7　`README.md` 還寫著「現階段以 dry-run 為主」** —— 自 2026-08-15 起是真金運作。
+      這是專案的門面，也是唯一一份會被外人先看到的文件。
+- [ ] **B8　`ARCHITECTURE.md` 沒有 `expected_value.py` 與 `get_rate_candles()`**
+      —— 目錄樹與元件說明都還停在「`orderbook_depth` 是預設策略」（D030／D033）。
+- [ ] **B9　兩處註解與現況矛盾**
+  - `api/bitfinex_client.py:146`「250 檔對應約 500 萬 USD，**足以蓋過整個供給側**」
+    —— 實測可見的 250 檔最高只到年化 7.21%~8.33%，蓋不住（正是 A2／A3 的根因）。
+  - `strategies/orderbook_depth.py` 的模組 docstring 沒有標示它已被 D035 取代，
+    讀起來仍像是現行路線。
+
+### C. CI 基礎建設債（2026-08-17 由 PR #32 自己踩到）
+
+- [x] **C1　自架 runner 下載 `actions/checkout` 會被 GitHub CDN 限流（429）**
+      —— **2026-08-17 完成**，整合測試的 `runs-on` 改為 `ubuntu-latest`（做法 1）。
+  - **實際發生**：PR #32（純文件）的「整合/系統測試」紅燈，但**測試根本沒跑到**
+    ——job 死在 `Set up job`。Runner 診斷日誌：
+    `Fail to download archive 'https://codeload.github.com/actions/checkout/tar.gz/...'`
+    `HttpRequestException: 429 (Too Many Requests)`，三次重試全失敗。
+    同一份測試在本機直接跑是 **26 passed**。
+  - **🔴 成因已更正（2026-08-17 稍晚，使用者找到 githubstatus.com）**：
+    真正的原因是 **GitHub 的全域事故**，不是這台機器。
+    - 事故建立於 **2026-08-17T13:40:03Z**，影響元件含
+      `Webhooks / API Requests / Issues / **Pull Requests** / Actions / Pages / Copilot`，
+      公告明寫：**「Archive downloads and raw repository content downloads are
+      experiencing an approximate 50% error rate」**——
+      `codeload.github.com/.../tar.gz/...` 正是 archive download。
+    - 元件清單裡的 **Pull Requests** 同時解釋了另外兩個症狀：
+      「Merge status cannot be loaded」與 PR 頁面載不進去。**三個症狀同一個根因。**
+  - **⚠️ 原本寫的成因是錯的，留在這裡當教訓**：先前判定為
+    「這台機器有 2 個 runner 共用對外 IP、`_work/_actions` 沒快取」。
+    那是**從有限資料推出的合理故事，沒有直接證據**——與 D036 記錄的毛病完全相同，
+    而且是在寫下 D036 的隔天犯的。**「聽起來合理」不是證據。**
+  - **修正仍然成立，但理由不同**：自架 runner 要自己去公開的 codeload 下載 action，
+    GitHub 託管的 runner 不走那條路。所以每次 GitHub 的 archive download 出問題，
+    自架 CI 就會斷、託管的不會。實測 3 比 0（同一段劣化期間，ubuntu-latest 三次全成功、
+    自架兩次全滅）。**只是沒有原本以為的那麼緊急。**
+  - **⬜ 連帶未解的暴露面**：`deploy` job 仍在自架 runner，第一步就是 `actions/checkout`。
+    **GitHub 再出一次同樣的事故，部署就會斷。** 做法 2（自架的 job 改用
+    `git fetch` + `git checkout`，不碰 codeload）因此值得為 deploy 單獨做一次。
+  - **為什麼值得修而不是每次重跑**：這條路徑上，整合測試內部那個
+    「連不上 Bitfinex 就 skip」的保護**根本輪不到執行**，所以它偽裝成
+    「整合測試失敗」，但其實跟測試、跟這次的變更都無關。
+    **看到紅燈卻不是真的壞掉，是最會消耗信任的一種失敗。**
+  - **建議做法（成本由低到高）**：
+    1. **整合測試改回 `ubuntu-latest`** ——它只打 Bitfinex 公開唯讀端點，
+       不需要這台機器的任何東西。**只有 `deploy` job 真的需要自架 runner。**
+       改動最小，一行 `runs-on`。
+    2. 自架 runner 的 job 不用 `actions/checkout`，改直接 `git fetch` +
+       `git checkout`（機器上本來就有 repo，完全不碰 codeload）。要自己處理
+       PR 的 merge ref，比較囉嗦但一勞永逸。
+  - **與分支保護的關係**：若先開了「required status checks」再修這一項，
+    這種與內容無關的 flaky 會把純文件 PR 也卡死。**順序是先修 C1，再開保護。**
+  - **動手前的驗證（使用者要求「先確認是正確的解法，不要亂改」）**：
+    1. **CI 裡本來就有一個對照實驗**：同一次 workflow、同一個 commit、
+       同一個 `actions/checkout@v4`——跑在 `ubuntu-latest` 的 test job 兩次都成功，
+       跑在自架 runner 的 integration job 兩次都 429。**唯一的變數是 runner。**
+    2. **直接用 `curl` 從那台機器抓同一個檔案，三次全 429**，完全沒有 CI 參與。
+    3. **integration 的測試不需要那台機器**：`grep` 過沒有 systemd／podman／
+       本機路徑／金鑰的依賴；`conftest.py` 的隔離 fixture 用 `tmp_path_factory`，可攜。
+    4. **絕大部分測試早就在 `ubuntu-latest` 上跑了**：test job 的最後一步是
+       `pytest tests/integration -q -m "not live"`，一直是綠的。
+       自架那個 job 唯一多做的只有 6 個 `live` 測試。
+    5. **查過為什麼當初選自架**：從第一個 commit（`7ec9859`）起就寫死 self-hosted，
+       DECISIONS.md 裡**沒有任何一條解釋理由**，看起來只是跟 deploy job 設在一起。
+    6. **最壞情況不會變紅**：若 Bitfinex 擋雲端 IP，測試內部
+       `except (ccxt.NetworkError, ccxt.ExchangeError, OSError) → pytest.skip`，
+       job 仍是綠的。**但那會變成安靜的失敗**，所以一併加上 `-rs` 讓 skip 原因印出來。
+  - **⬜ 上線後要確認的一件事**：CI 輸出裡那 6 個 `live` 測試是**真的跑了**還是 skip。
+    若永遠 skip，代表 Bitfinex 擋掉 GitHub 的 IP，那就要改回自架 runner
+    並改用做法 2（不用 `actions/checkout`）——**別讓它安靜地 skip 下去**。
+
 ## 🎯 工作計畫（2026-08-16 規劃，依優先級）
 
-> 這一節是**權威的工作清單**；底下各段落是支撐它的詳細分析與歷史紀錄。
+> ⚠️ **2026-08-17：這五個優先級的「順序」已由 [PLAN.md](PLAN.md) 的分期路線圖取代**
+> （理由見 DECISIONS.md D036）。**各項目的內容仍然有效且權威**，
+> 底下的分析與歷史紀錄也全部保留——被取代的只是排序。對照表：
+>
+> | 路線圖 | 對應項目 |
+> |---|---|
+> | 第 0 期 | 本檔上方盤查結果 A1～A3、B7～B9 |
+> | 第 1 期 | **全新**（市場資料落地、回測工具、成效量測） |
+> | 第 2 期 | P1-5 剩餘（天期）、`ev_window_hours` 敏感度 |
+> | 第 3 期 | P2-2、P2-4 剩餘、P4-1（B6） |
+> | 第 4 期 | P3-1、P3-2、P4-2（B5）、P5-2 |
 
 ### 優先級 1：讓錢真的借得出去
 

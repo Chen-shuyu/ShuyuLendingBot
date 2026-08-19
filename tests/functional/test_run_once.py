@@ -53,6 +53,7 @@ class FakeClient:
         positions=None,
         book=None,
         trades=None,
+        candles=None,
         cancel_takes_effect=True,
     ):
         self.balance = balance
@@ -68,6 +69,7 @@ class FakeClient:
         self.position_calls = 0
         self.book = list(book) if book else []
         self.trades = list(trades) if trades else []
+        self.candles = list(candles) if candles else []
         # 取消是非同步的：交易所回應成功不代表單子已經離場（D011／D031）。
         # 設 False 就模擬「回應說取消了，但單子還在場上」——2026-08-16 19:31 的真實情況。
         self.cancel_takes_effect = cancel_takes_effect
@@ -96,6 +98,9 @@ class FakeClient:
 
     def get_recent_trades(self, currency, limit=1000):
         return list(self.trades)
+
+    def get_rate_candles(self, currency, period=2, timeframe="1h", limit=240):
+        return list(self.candles)
 
     def get_available_balance(self, currency):
         return self.balance
@@ -512,9 +517,24 @@ class TestTradeEventNotifications:
         assert "dry-run" in fake_notifier.sent[0]
 
 
-def live_offer(offer_id=1, amount=200.0, rate=0.0004, period=2):
-    """場上一筆掛單，欄位與 `client.get_active_offers()` 的回傳一致。"""
-    return {"id": offer_id, "symbol": "fUSD", "amount": amount, "rate": rate, "period": period}
+# 2026-08-19 05:03:24 +0800，取自那天場上唯一一張單的真實回應（見 D038）。
+OFFER_CREATED_MS = 1_787_087_004_000
+
+
+def live_offer(offer_id=1, amount=200.0, rate=0.0004, period=2, created_at_ms=OFFER_CREATED_MS):
+    """場上一筆掛單，欄位與 `client.get_active_offers()` 的回傳一致。
+
+    `created_at_ms` 預設帶真實值而不是 `None`：真實 API 一定給這個欄位，
+    替身比真的乾淨正是 D026 那個 bug 溜過去的原因。
+    """
+    return {
+        "id": offer_id,
+        "symbol": "fUSD",
+        "created_at_ms": created_at_ms,
+        "amount": amount,
+        "rate": rate,
+        "period": period,
+    }
 
 
 class TestKeepsQueuePosition:
@@ -1029,3 +1049,188 @@ class TestMarketDataReachesTheStrategy:
 
         _, _, rate, _ = client.offers[0]
         assert rate == pytest.approx(0.0002125, rel=1e-6)
+
+
+class TestIdleTimeMeasurement:
+    """閒置時間量測（D038）。
+
+    **這一組測的是「看得見」，不是「做決定」。** 2026-08-19 那張單掛了 18 小時
+    沒成交，而每一輪的日誌都只寫「維持不動以保住排隊位置」——閒置資金的年化是
+    0%，卻是整個系統裡唯一沒有任何一行日誌在計時的東西（D037 預警、隔天成真）。
+
+    要不要因為等太久而降價是策略問題，得先有這些數字才談得上（D036 的順序）。
+    """
+
+    @pytest.fixture
+    def frozen_now(self, monkeypatch):
+        """把時鐘釘在掛單後 18.1 小時，重現 2026-08-19 23:09 的現場。"""
+        from datetime import datetime, timedelta, timezone
+
+        moment = datetime(2026, 8, 19, 23, 9, 42, tzinfo=timezone(timedelta(hours=8)))
+        monkeypatch.setattr(bot_engine.clock, "now", lambda: moment)
+        return moment
+
+    def test_閒置時數與機會成本都寫進日誌(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep, frozen_now
+    ):
+        client = FakeClient(balance=0.0, active_offers=[live_offer(rate=0.000268, amount=344.36)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        idle_lines = [m for m in fake_logger.messages["info"] if "已閒置" in m]
+        assert len(idle_lines) == 1
+        # 05:03:24 → 23:09:42 是 18.1 小時
+        assert "18.1 小時" in idle_lines[0]
+        # 機會成本 = 344.36 × 0.000268 × 18.1 / 24 ≈ 0.0696 USD
+        assert "0.069" in idle_lines[0] or "0.070" in idle_lines[0]
+
+    def test_有當初的預估就拿來對照(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep, frozen_now
+    ):
+        """18.1 小時遠超過當初估的 6 小時——**日誌要講出這件事**，不能只報時數。"""
+        repository.record_wait_forecast(
+            1,
+            {
+                "rate": 0.000268,
+                "mean_hours": 6.0,
+                "median_hours": 3.5,
+                "p75_hours": 12.0,
+                "hits": 54,
+                "censored_ratio": 0.0,
+                "window_hours": 168,
+            },
+        )
+        client = FakeClient(balance=0.0, active_offers=[live_offer(rate=0.000268, amount=344.36)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        line = next(m for m in fake_logger.messages["info"] if "已閒置" in m)
+        assert "中位數 3.5h" in line
+        assert "四分之三在 12.0h 內" in line
+        assert "等待估計偏樂觀" in line
+
+    def test_還在預估之內就不要說偏樂觀(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep, frozen_now
+    ):
+        """**「偏樂觀」這句話要留給真的偏樂觀的時候**，否則它會變成雜訊而被忽略。"""
+        repository.record_wait_forecast(
+            1,
+            {
+                "rate": 0.000268,
+                "mean_hours": 30.0,
+                "median_hours": 24.0,
+                "p75_hours": 40.0,
+                "hits": 20,
+                "censored_ratio": 0.1,
+                "window_hours": 168,
+            },
+        )
+        client = FakeClient(balance=0.0, active_offers=[live_offer(rate=0.000268)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        line = next(m for m in fake_logger.messages["info"] if "已閒置" in m)
+        assert "仍在當初預估的中位數之內" in line
+        assert "偏樂觀" not in line
+
+    def test_沒有預估時明說沒有而不是留白(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep, frozen_now
+    ):
+        """這張表 2026-08-19 才加，在它之前掛出去的單本來就沒有預估。"""
+        client = FakeClient(balance=0.0, active_offers=[live_offer()])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        line = next(m for m in fake_logger.messages["info"] if "已閒置" in m)
+        assert "沒有留下當初的等待預估" in line
+
+    def test_拿不到建立時間就說不知道(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep, frozen_now
+    ):
+        """**不要用本輪時間硬湊一個看起來很小的閒置時數**——那會謊報成「剛掛上去」。"""
+        client = FakeClient(balance=0.0, active_offers=[live_offer(created_at_ms=None)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert any(
+            "沒有建立時間，無法計算已閒置多久" in m for m in fake_logger.messages["info"]
+        )
+        assert not any("已閒置" in m and "小時" in m for m in fake_logger.messages["info"])
+
+    def test_維持不動的那條路徑也要量到(
+        self, fake_logger, fake_notifier, repository, no_sleep, frozen_now, strategy_config
+    ):
+        """**這是最重要的一條**：單子閒置最久的輪次，走的正是「維持不動」這條提早
+        return 的路徑。量測放在它後面的話，就永遠只在重掛那一輪才量得到。
+        """
+        from strategies.frr_plus import FrrPlusStrategy
+
+        strategy = FrrPlusStrategy(strategy_config(spread_count=1, premium_rate=0.0002))
+        # 場上那張單與策略算出來的一致 → 走 `_plans_match` 的維持不動路徑
+        client = FakeClient(balance=0.0, active_offers=[live_offer(rate=0.0004, amount=200.0)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert any("維持不動" in m for m in fake_logger.messages["info"])
+        assert any("已閒置" in m for m in fake_logger.messages["info"])
+
+
+class TestWaitForecastIsPersisted:
+    """掛單當下的等待預估要落 DB（D038）。
+
+    **這是唯一「不存就永遠消失」的那一半資料**：實際等了多久事後算得出來，
+    但「掛出去那一刻我們以為要等多久」只存在於那一輪的記憶體。少了它，
+    事後只能拿今天的模型解釋昨天的決定——D036 記的正是這個病。
+    """
+
+    def forecasts_in_db(self, repository):
+        return [
+            dict(row)
+            for row in repository.connection.execute("SELECT * FROM offer_wait_forecasts")
+        ]
+
+    def test_期望值策略掛單後留下預估(
+        self, fake_logger, fake_notifier, repository, no_sleep, strategy_config
+    ):
+        from strategies.expected_value import ExpectedValueStrategy
+
+        strategy = ExpectedValueStrategy(
+            strategy_config(
+                spread_count=1,
+                minimum_rate=0.0001,
+                market_floor_pct=0.85,
+                ev_min_hits=5,
+                ev_min_candles=48,
+            )
+        )
+        highs = [0.00025 if i % 5 else 0.00030 for i in range(60)]
+        candles = [
+            {
+                "mts": 1_786_968_000_000 + i * 3_600_000,
+                "open": high,
+                "close": high,
+                "high": high,
+                "low": 0.0001,
+                "volume": 4_000_000.0,
+            }
+            for i, high in enumerate(highs)
+        ]
+        client = FakeClient(
+            balance=400.0,
+            book=[{"rate": 0.0002, "period": 2, "amount": 500_000.0}],
+            trades=market_trades(rate=0.00025),
+        )
+        client.candles = candles
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        saved = self.forecasts_in_db(repository)
+        assert len(saved) == 1
+        assert saved[0]["window_hours"] == 168
+        assert saved[0]["hits"] >= 5
+        # 三個統計量都要存下來，只留平均就等於把重尾那件事再丟一次
+        assert saved[0]["median_hours"] > 0
+        assert saved[0]["p75_hours"] >= saved[0]["median_hours"]
+
+    def test_沒有期望值能力的策略不會爆(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """`frr_plus` 不做期望值評估，硬要它回答只會多一個會爆的地方。"""
+        client = FakeClient(balance=400.0)
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert self.forecasts_in_db(repository) == []
+        assert offers_in_db(repository)  # 掛單本身照常完成

@@ -71,21 +71,26 @@ def trades_at(rate, count=10):
     ]
 
 
-class TestEstimateWaitHours:
-    """等待時間的估法。"""
+class TestEstimateWait:
+    """等待時間的估法（D038 起改為「從任意時刻進場」）。"""
 
     def test_每根都命中時平均等待是半根(self):
         strategy = ExpectedValueStrategy(base_config())
         highs = [daily(10.0)] * 60
-        wait, hits = strategy.estimate_wait_hours(highs, daily(9.0))
-        assert hits == 60
-        assert wait == pytest.approx(0.5)
+        estimate = strategy.estimate_wait(highs, daily(9.0))
+        assert estimate.hits == 60
+        assert estimate.mean_hours == pytest.approx(0.5)
+        assert estimate.median_hours == pytest.approx(0.5)
+        assert estimate.censored == 0
 
-    def test_陣發與均勻分佈算出來的等待不同(self):
-        """這正是不用「命中率取倒數」的理由。
+    def test_陣發與均勻的等待差距不是幾個百分點而是好幾倍(self):
+        """**這個測試就是 D038 的證據。**
 
-        兩組資料的命中率完全一樣（12/24），但一組是平均散開、一組是擠在一起。
-        倒數法會把兩者算成同一個數字，逐根走訪不會。
+        兩組資料的命中率完全一樣（12/24），一組平均散開、一組全擠在後半段。
+
+        舊算法（命中間隔取平均）分辨得出來，但只差 6%：1.417 vs 1.500。
+        那個差距小到在期望值計算裡幾乎不影響選擇——**看起來有處理陣發性，
+        實際上沒有**。從進場時刻起算的話差距是 3.75 倍，那才是掛單當下的真實處境。
         """
         strategy = ExpectedValueStrategy(base_config(ev_min_hits=3))
         hi, lo = daily(10.0), daily(5.0)
@@ -93,37 +98,70 @@ class TestEstimateWaitHours:
         均勻 = [hi if i % 2 == 0 else lo for i in range(24)]
         陣發 = [lo] * 12 + [hi] * 12
 
-        wait_均勻, hits_均勻 = strategy.estimate_wait_hours(均勻, daily(9.0))
-        wait_陣發, hits_陣發 = strategy.estimate_wait_hours(陣發, daily(9.0))
+        估_均勻 = strategy.estimate_wait(均勻, daily(9.0))
+        估_陣發 = strategy.estimate_wait(陣發, daily(9.0))
 
-        assert hits_均勻 == hits_陣發 == 12
-        # 均勻：第一根就中（0.5），之後每次都空一根（1.5）
-        assert wait_均勻 == pytest.approx((0.5 + 1.5 * 11) / 12)
-        # 陣發：先空 12 根才中（12.5），之後連中 11 次（0.5）
-        assert wait_陣發 == pytest.approx((12.5 + 0.5 * 11) / 12)
-        assert wait_陣發 > wait_均勻
+        assert 估_均勻.hits == 估_陣發.hits == 12
 
-    def test_尾端沒等到的那一段不計入(self):
-        """右設限資料當成「等了 N 根就成交」會系統性低估等待。"""
+        # 均勻：12 個偶數起點等 0.5、11 個奇數起點等 1.5，
+        # 最後一個起點（index 23）之後再也沒有命中，右設限計 1 根。
+        assert 估_均勻.mean_hours == pytest.approx((0.5 * 12 + 1.5 * 11 + 1.0) / 24)
+        assert 估_均勻.censored == 1
+        # 陣發：前 12 個起點分別等 12.5…1.5，後 12 個各等 0.5 → 平均 3.75
+        assert 估_陣發.mean_hours == pytest.approx((sum(12.5 - i for i in range(12)) + 0.5 * 12) / 24)
+        assert 估_陣發.mean_hours == pytest.approx(3.75)
+        assert 估_陣發.censored == 0
+
+        # **差距的量級才是重點**：舊算法在同一份資料上只差 6%（1.417 vs 1.500），
+        # 新算法差將近 4 倍。
+        assert 估_陣發.mean_hours / 估_均勻.mean_hours > 3.5
+
+        # 中位數同樣看得出形狀差異：一半的起點在均勻下 0.75 小時內就中，陣發下要 1.0
+        assert 估_均勻.median_hours == pytest.approx(0.75)
+        assert 估_陣發.median_hours == pytest.approx(1.0)
+
+    def test_右設限計入而不是丟棄(self):
+        """尾端「等到資料結束還沒等到」的起點要計入，否則最長的等待整批消失。
+
+        舊版把這些丟掉，於是 42 根裡只剩開頭兩次「等半根就中」，
+        算出平均 0.5 小時——**而實際上有 40 個起點是永遠等不到的**。
+        """
         strategy = ExpectedValueStrategy(base_config(ev_min_hits=2))
         hi, lo = daily(10.0), daily(5.0)
         highs = [hi, hi] + [lo] * 40  # 末尾 40 根一直沒等到
 
-        wait, hits = strategy.estimate_wait_hours(highs, daily(9.0))
-        assert hits == 2
-        assert wait == pytest.approx(0.5)  # 只有兩次「等半根就中」，尾巴不算
+        estimate = strategy.estimate_wait(highs, daily(9.0))
+        assert estimate.hits == 2
+        assert estimate.censored == 40
+        assert estimate.censored_ratio == pytest.approx(40 / 42)
+        # 起點 0 等 0.5、起點 1 等 0.5，其餘 40 個以「等到窗尾」計入
+        expected = (0.5 + 0.5 + sum(42 - s for s in range(2, 42))) / 42
+        assert estimate.mean_hours == pytest.approx(expected)
+        # 遠大於舊版算出的 0.5，這正是修正的重點
+        assert estimate.mean_hours > 10
 
     def test_命中次數不足回傳None(self):
         strategy = ExpectedValueStrategy(base_config(ev_min_hits=5))
         highs = [daily(10.0)] * 4 + [daily(5.0)] * 50
-        assert strategy.estimate_wait_hours(highs, daily(9.0)) is None
+        assert strategy.estimate_wait(highs, daily(9.0)) is None
 
     def test_candle_hours_會換算成小時(self):
         """K 線改成 4 小時一根時，等待也要跟著變成 4 倍。"""
         strategy = ExpectedValueStrategy(base_config(candle_hours=4.0))
         highs = [daily(10.0)] * 60
-        wait, _ = strategy.estimate_wait_hours(highs, daily(9.0))
-        assert wait == pytest.approx(2.0)  # 0.5 根 × 4 小時
+        estimate = strategy.estimate_wait(highs, daily(9.0))
+        assert estimate.mean_hours == pytest.approx(2.0)  # 0.5 根 × 4 小時
+
+    def test_p75_講的是壞情況而不是平均(self):
+        """重尾分佈下平均會被少數極長值拉高，三個數字要能各自說話。"""
+        strategy = ExpectedValueStrategy(base_config(ev_min_hits=3))
+        hi, lo = daily(10.0), daily(5.0)
+        # 前 4 根連續命中，之後 20 根乾旱，最後再命中一次
+        highs = [hi] * 4 + [lo] * 20 + [hi]
+
+        estimate = strategy.estimate_wait(highs, daily(9.0))
+        assert estimate.median_hours < estimate.mean_hours < estimate.p75_hours
+        assert estimate.censored == 0  # 最後一根命中，沒有右設限
 
 
 class TestChooseRate:
@@ -145,7 +183,12 @@ class TestChooseRate:
 
         assert chosen == pytest.approx(daily(9.5), rel=1e-3)
         評估 = {round(annual(e["rate"]), 1): e for e in strategy.last_evaluation}
-        assert 評估[12.0]["wait_hours"] == pytest.approx(47.7, abs=0.1)
+        # **命中規則時，進場等待反而比命中間隔短**（約為間隔的一半）：
+        # 間隔是 60 根，但隨機進場平均落在間隔中間。舊算法在這裡算出 47.7 小時，
+        # 新算法算出 29.9——**D038 的修正不是一律調高等待，是算對**。
+        # 陣發時會算出更長（見 `test_陣發與均勻的等待差距不是幾個百分點而是好幾倍`），
+        # 規則時會算出更短，兩邊都是同一條定義的結果。
+        assert 評估[12.0]["wait_hours"] == pytest.approx(29.9, abs=0.1)
         assert 評估[9.5]["effective"] > 評估[12.0]["effective"]
 
     def test_借出期間夠長時等待幾小時幾乎不影響選擇(self):
@@ -163,7 +206,8 @@ class TestChooseRate:
         chosen = strategy.choose_rate(candles)
 
         評估 = {round(annual(e["rate"]), 1): e for e in strategy.last_evaluation}
-        assert 評估[20.0]["wait_hours"] == pytest.approx(8.0)
+        # 每 10 根命中一次 → 隨機進場平均等約半個間隔（4.9），不是一個間隔（舊版算 8.0）
+        assert 評估[20.0]["wait_hours"] == pytest.approx(4.925)
         assert chosen == pytest.approx(daily(20.0), rel=1e-3)
 
     def test_等待很短時會往高價位走(self):
@@ -382,3 +426,37 @@ class TestDecisionIsVisible:
         )
         assert len(plans) == 1
         assert strategy.last_skip_reason is None
+
+
+class TestChosenForecast:
+    """掛出去那一刻的預估要交得出來，否則事後無法校準（D038）。"""
+
+    def test_回傳選中價位的三個統計量(self):
+        strategy = ExpectedValueStrategy(base_config(ev_min_hits=5, ev_window_hours=168))
+        highs = [daily(20.0) if i % 10 == 0 else daily(9.0) for i in range(60)]
+        candles = [candle(i, high) for i, high in enumerate(highs)]
+
+        chosen = strategy.choose_rate(candles)
+        forecast = strategy.chosen_forecast()
+
+        assert forecast["rate"] == pytest.approx(chosen)
+        assert forecast["window_hours"] == 168
+        assert forecast["mean_hours"] == pytest.approx(4.925)
+        # **三個都要在**：只留平均等於把「重尾」這件事再丟一次
+        assert "median_hours" in forecast and "p75_hours" in forecast
+        assert forecast["hits"] == 6
+
+    def test_沒評估過就回None(self):
+        strategy = ExpectedValueStrategy(base_config())
+        assert strategy.chosen_forecast() is None
+
+    def test_預估與日誌講的是同一個價位(self):
+        """日誌說 A、存進 DB 的是 B 的話，事後校準會校到錯的東西上。"""
+        strategy = ExpectedValueStrategy(base_config(ev_min_hits=5))
+        highs = [daily(20.0) if i % 10 == 0 else daily(9.0) for i in range(60)]
+        strategy.choose_rate([candle(i, high) for i, high in enumerate(highs)])
+
+        forecast = strategy.chosen_forecast()
+        line = strategy.describe_decision()
+        assert f"選中年化 {annual(forecast['rate']):.2f}%" in line
+        assert f"平均 {forecast['mean_hours']:.1f}h" in line

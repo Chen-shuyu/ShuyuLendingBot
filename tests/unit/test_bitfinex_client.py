@@ -20,7 +20,18 @@ from utils.exceptions import FatalError, RetryableError
 FUNDING_OFFER_FIELDS = 16
 
 
-def make_offer_array(offer_id=101, symbol="fUSD", amount=200.0, rate=0.0004, period=2):
+# 2026-08-19 05:03:24 +0800，取自那天場上唯一一張單的真實回應（見 D038）。
+OFFER_CREATED_MS = "1787087004000"
+
+
+def make_offer_array(
+    offer_id=101,
+    symbol="fUSD",
+    amount=200.0,
+    rate=0.0004,
+    period=2,
+    created_at_ms=OFFER_CREATED_MS,
+):
     """模擬 ccxt 回傳的 funding offer 陣列。
 
     **每個數值欄位都是字串**——實測 ccxt 對這個 implicit 端點回傳的就是
@@ -28,10 +39,15 @@ def make_offer_array(offer_id=101, symbol="fUSD", amount=200.0, rate=0.0004, per
     這個替身原本回傳原生型別，比真實 API「乾淨」，於是漏掉了「取消時 id 必須
     轉回整數」這個 bug：實單下每一輪都取消失敗（2026-08-15，見 DECISIONS.md D026）。
     替身要像真的，不然測試只是在驗證另一個世界。
+
+    `created_at_ms`（index 2 = MTS_CREATE）同樣以字串給，理由與上面完全一樣——
+    它是閒置時間量測的基準，用原生 int 會讓 `_optional_millis()` 的字串轉換
+    永遠測不到（D038）。
     """
     offer = [None] * FUNDING_OFFER_FIELDS
     offer[0] = str(offer_id)
     offer[1] = symbol
+    offer[2] = created_at_ms
     offer[4] = str(amount)
     offer[14] = str(rate)
     offer[15] = str(period)
@@ -289,10 +305,23 @@ class TestCancelActiveOffers:
         assert make_client(exchange).cancel_active_offers("USD")[0] == {
             "id": 7,
             "symbol": "fUSD",
+            "created_at_ms": 1787087004000,
             "amount": 150.5,
             "rate": 0.00042,
             "period": 30,
         }
+
+    def test_missing_or_broken_created_at_becomes_none(self, make_client):
+        """時間戳壞掉不能讓查詢掛單失敗，也不能默默變成 0（那會是 1970 年掛的單）。"""
+        exchange = FakeExchange(
+            private_post_auth_r_funding_offers_symbol=[
+                make_offer_array(7, created_at_ms=None),
+                make_offer_array(8, created_at_ms="not-a-number"),
+            ],
+            private_post_auth_w_funding_offer_cancel={},
+        )
+        parsed = make_client(exchange).cancel_active_offers("USD")
+        assert [offer["created_at_ms"] for offer in parsed] == [None, None]
 
     def test_no_open_offers_returns_empty(self, make_client):
         exchange = FakeExchange(private_post_auth_r_funding_offers_symbol=[])

@@ -94,6 +94,30 @@ INIT_BOT_STATE_ROW = """
 INSERT OR IGNORE INTO bot_state (id, consecutive_failures) VALUES (1, 0);
 """
 
+# 掛單當下對「要等多久」的預估。**一張掛單一列，不是每輪一列**。
+#
+# **為什麼一定要落地**：策略每輪都會重算等待估計，所以記憶體裡永遠只有「現在這一輪
+# 怎麼想」，而校準需要的是「掛出去那一刻怎麼想」。少了這張表，事後就只能拿今天的
+# 模型去解釋昨天的決定——D036 記的正是這個病：結論寫死進設定檔、原始資料丟掉，
+# 於是六個決策兩天內互相推翻，誰也拿不出證據。
+#
+# 實際等待不存在這裡，因為現有資料已經算得出來：掛單時間在 `loan_offers.created_at`
+# （交易所端的權威時間另由 offers 端點的 MTS_CREATE 提供），成交時間在
+# `funding_positions.opened_at`。**只有「當初的預估」是不存就永遠消失的那一半。**
+CREATE_OFFER_WAIT_FORECASTS = """
+CREATE TABLE IF NOT EXISTS offer_wait_forecasts (
+    offer_id       TEXT PRIMARY KEY,
+    rate           REAL    NOT NULL,
+    mean_hours     REAL    NOT NULL,
+    median_hours   REAL    NOT NULL,
+    p75_hours      REAL    NOT NULL,
+    hits           INTEGER NOT NULL,
+    censored_ratio REAL    NOT NULL,
+    window_hours   INTEGER NOT NULL,
+    created_at     TEXT    NOT NULL
+);
+"""
+
 ALL_STATEMENTS = (
     CREATE_LOAN_OFFERS,
     CREATE_LOAN_OFFERS_INDEX,
@@ -101,5 +125,6 @@ ALL_STATEMENTS = (
     CREATE_FUNDING_POSITIONS,
     CREATE_FUNDING_POSITIONS_INDEX,
     CREATE_BOT_STATE,
+    CREATE_OFFER_WAIT_FORECASTS,
     INIT_BOT_STATE_ROW,
 )

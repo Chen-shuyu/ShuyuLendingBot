@@ -36,11 +36,38 @@
 這個估計法**天生處理了陣發性**：用逐根走訪算連續落空的長度，而不是拿命中率取倒數
 ——後者會把「平均 3 小時一次」和「六小時空手、接著連中三次」算成同一件事。
 
-## 為什麼估計會偏樂觀，以及為什麼可以接受
+## 2026-08-19：等待估計換成「從進場時刻起算」（D038）
+
+上面那段「逐根走訪」的算法**沒有做到它自己宣稱的事**。它逐根走訪算出每一段
+命中間隔，最後卻用 `fmean()` 取平均——而「六小時空手接著連中三次」的間隔是
+`[6, 0, 0]`、平均 2，「平均兩小時一次」的間隔是 `[2, 2, 2]`、平均也是 2。
+**取平均這一步把它剛剛保留下來的陣發性又抹掉了。**
+
+正確的問題不是「命中間隔平均多長」，而是**「我在一個任意時刻掛單，要等多久」**。
+兩者在班次不規律時會差很多，因為隨機進場比較容易落進長的那一段空檔
+（統計上的等候悖論）。實測同一份 168 小時 K 線：
+
+| 掛單價 | 舊算法（間隔平均） | 新算法（進場等待） | 舊算實質年化 | 真實實質年化 |
+|---|---|---|---|---|
+| 9.12% | 1.6h | 4.3h | 8.82% | 8.37% |
+| 9.78% | 2.3h | 6.0h | 9.34% | 8.70% |
+| 9.96% | 3.2h | **10.8h** | 9.35% | **8.14%** |
+
+**低估 3~4 倍，而且越往高價低估越嚴重。** 2026-08-19 的實跑是第一個負向樣本：
+05:03 掛 9.78%（當輪估「平均等待 2.6h」），18 小時後仍未成交。
+
+這是**修正一個說謊的函式**，不是選擇新策略——與 D037 認定 `_queue_ahead()`
+越界時謊報「就是這麼多」屬於同一類（D026 靜默失效的第五次現身）。
+
+## 為什麼估計仍然偏樂觀，以及為什麼可以接受
 
 判定「high ≥ r 就會成交」假設我們那張單當時正躺在簿子上。實際上機器人每輪會
 重新評估，取消重掛的空窗期就接不到掃單。D034 已經把「往下調價的重掛」擋掉了，
 單子因此傾向留在場上，但空窗仍然存在。
+
+**右設限是第二個樂觀來源**：窗尾那些「等到資料結束還沒等到」的起點，真實等待
+只會比記下來的更長，這裡以「等到窗尾」計入（見 `estimate_wait()`）。所以輸出的
+等待是**下界**，`censored_ratio` 就是在講這個下界有多不可信。
 
 偏樂觀的方向是**高估成交速度**，也就是傾向掛得比最佳解略高一點、等久一點。
 在這個市場結構下那一側比較安全：實質年化曲線在 9%~10.5% 之間非常平
@@ -58,10 +85,41 @@
 """
 
 import statistics
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from strategies.base import OfferPlan
 from strategies.orderbook_depth import OrderBookDepthStrategy
+
+
+@dataclass(frozen=True)
+class WaitEstimate:
+    """掛在某個利率時的等待時間分佈（從任意時刻進場起算）。
+
+    **為什麼不只回傳一個平均值**：這個市場的等待是重尾的——平均會被少數極長的
+    乾旱期拉高，中位數才是「多數時候的體感」，而 `p75` 講的是壞情況。三個數字
+    並列，人才看得出「平均 6 小時」背後是不是藏著「四分之一的機率超過 12 小時」。
+
+    期望值計算本身用 `mean_hours`（期望值就該用期望值），其餘兩個是給日誌與
+    事後校準看的。
+    """
+
+    rate: float
+    mean_hours: float
+    median_hours: float
+    p75_hours: float
+    hits: int
+    censored: int
+    samples: int
+
+    @property
+    def censored_ratio(self) -> float:
+        """有多少比例的起點「等到資料結束還沒等到」。
+
+        這個比例越高，`mean_hours` 這個下界就越不可信——**它是誠實度的刻度，
+        不是可以忽略的統計細節**。
+        """
+        return self.censored / self.samples if self.samples else 0.0
 
 
 class ExpectedValueStrategy(OrderBookDepthStrategy):
@@ -136,47 +194,106 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 拿「最快成交的那個候選」當對照組：它就是舊策略會選的那一類價位，
         # 兩者並列才看得出這一輪的取捨到底換到了什麼。
         fastest = min(self.last_evaluation, key=lambda item: item["wait_hours"])
+        # **中位數與 p75 一定要跟平均並列**（D038）：等待是重尾的，只印平均會讓
+        # 「平均 6 小時」看起來像「大概 6 小時會成交」，而實際上可能是
+        # 「一半機率 3.5 小時內、四分之一機率超過 12 小時」。2026-08-19 掛了 18 小時
+        # 沒成交，就是落在那條尾巴裡——當輪日誌卻只寫了一句「平均等待 2.6h」。
+        censored_note = ""
+        if chosen["censored_ratio"] > 0:
+            censored_note = f"、{chosen['censored_ratio'] * 100:.0f}% 的起點在窗內沒等到「真實等待更長」"
         return (
             f"期望值定價：{len(self.last_evaluation)} 個候選價位，"
             f"選中年化 {self._annual(chosen['rate']):.2f}%"
-            f"（平均等待 {chosen['wait_hours']:.1f}h、窗內命中 {chosen['hits']} 次、"
-            f"實質年化 {self._annual(chosen['effective']):.2f}%）；"
+            f"（進場等待 平均 {chosen['wait_hours']:.1f}h／中位數 {chosen['median_hours']:.1f}h／"
+            f"四分之三在 {chosen['p75_hours']:.1f}h 內、窗內命中 {chosen['hits']} 次、"
+            f"實質年化 {self._annual(chosen['effective']):.2f}%{censored_note}）；"
             f"對照最快成交的候選 年化 {self._annual(fastest['rate']):.2f}%"
-            f"（等待 {fastest['wait_hours']:.1f}h、實質年化 "
+            f"（平均等待 {fastest['wait_hours']:.1f}h、實質年化 "
             f"{self._annual(fastest['effective']):.2f}%）"
         )
+
+    def chosen_forecast(self) -> Optional[Dict[str, Any]]:
+        """最近一輪選中的那個價位當下的等待預估，供迴圈層落 DB（D038）。
+
+        **這是唯一「不存下來就永遠消失」的那一半資料**：實際等了多久事後算得出來
+        （掛單時間與成交時間都已經在 DB 裡），但「掛出去那一刻我們以為要等多久」
+        只存在於這一輪的記憶體。少了它，事後就只能拿今天的模型解釋昨天的決定。
+
+        回傳 `None` 代表這一輪沒有評估過任何候選價位。
+        """
+        if not self.last_evaluation:
+            return None
+        chosen = max(self.last_evaluation, key=lambda item: item["effective"])
+        return {
+            "rate": chosen["rate"],
+            "mean_hours": chosen["wait_hours"],
+            "median_hours": chosen["median_hours"],
+            "p75_hours": chosen["p75_hours"],
+            "hits": chosen["hits"],
+            "censored_ratio": chosen["censored_ratio"],
+            "window_hours": self.ev_window_hours,
+        }
 
     # ------------------------------------------------------------------
     # 期望值計算
     # ------------------------------------------------------------------
 
-    def estimate_wait_hours(self, highs: List[float], rate: float) -> Optional[Tuple[float, int]]:
-        """掛在 `rate`，平均要等幾小時才遇到一次掃到這裡的需求。
+    def estimate_wait(self, highs: List[float], rate: float) -> Optional[WaitEstimate]:
+        """掛在 `rate`，從任意時刻進場要等多久才遇到一次掃到這裡的需求。
 
-        回傳 `(平均等待小時, 命中次數)`；命中次數不足時回傳 `None`。
+        回傳等待時間的分佈；命中次數不足 `ev_min_hits` 時回傳 `None`。
 
-        **逐根走訪，不用「命中率取倒數」**：後者假設命中是均勻分佈的，
-        而這個市場的成交是陣發的。「六小時空手、接著連中三次」與
-        「平均兩小時一次」在倒數法下完全一樣，實際的等待體驗差很多。
+        **問的是「我現在進場要等多久」，不是「命中間隔平均多長」**（D038）。
+        舊版逐根走訪算出間隔後取平均，而 `[6, 0, 0]` 與 `[2, 2, 2]` 的平均都是 2
+        ——取平均那一步把剛保留下來的陣發性又抹掉了。改成從**每一個小時**出發各算
+        一次等待，長空檔就會依它實際佔掉的時間長度加權，這才是掛單當下面對的分佈。
 
-        命中的那一根算等 0.5 根：掃單發生在該根之內，平均落在中點。
-        **尾端沒等到的那一段不計入**——它是右設限資料，當成「等了 N 根就成交」
-        會系統性低估等待時間。
+        **命中的那一根算等 0.5 根**：掃單發生在該根之內，平均落在中點。
+
+        **右設限（等到窗尾還沒等到）以「等到窗尾」計入，不丟棄**：丟棄會把最長的
+        那些等待整批刪掉，正是舊版低估的來源之一。這樣算出來的是**下界**，
+        真實等待只會更長，所以一併回傳 `censored` 讓上層看得見這個下界有多虛。
+
+        實作是 O(n)：先由後往前記下「每個位置之後的第一次命中在哪」，
+        再讓每個起點 O(1) 查表。naive 的雙迴圈在 168 根 × 上百個候選價位下
+        要跑上百萬次比較，而這是每輪巡檢都要做的事。
         """
-        waits: List[float] = []
-        misses = 0
-        hits = 0
-        for high in highs:
-            if high >= rate:
-                waits.append((misses + 0.5) * self.candle_hours)
-                hits += 1
-                misses = 0
-            else:
-                misses += 1
+        total = len(highs)
+        if total == 0:
+            return None
 
+        next_hit: List[Optional[int]] = [None] * total
+        upcoming: Optional[int] = None
+        for index in range(total - 1, -1, -1):
+            if highs[index] >= rate:
+                upcoming = index
+            next_hit[index] = upcoming
+
+        hits = sum(1 for high in highs if high >= rate)
         if hits < self.ev_min_hits:
             return None
-        return statistics.fmean(waits), hits
+
+        waits: List[float] = []
+        censored = 0
+        for start in range(total):
+            target = next_hit[start]
+            if target is None:
+                # 右設限：至少等到窗尾，實際更長。
+                waits.append((total - start) * self.candle_hours)
+                censored += 1
+            else:
+                waits.append((target - start + 0.5) * self.candle_hours)
+
+        ordered = sorted(waits)
+        return WaitEstimate(
+            rate=rate,
+            mean_hours=statistics.fmean(waits),
+            median_hours=statistics.median(ordered),
+            p75_hours=ordered[min(int(len(ordered) * 0.75), len(ordered) - 1)],
+            hits=hits,
+            censored=censored,
+            samples=total,
+        )
 
     def choose_rate(self, candles: List[Dict[str, Any]]) -> Optional[float]:
         """掃過所有候選價位，回傳實質年化最高的那一個。
@@ -200,15 +317,22 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         for rate in sorted({self._quantize(high) for high in highs}):
             if rate <= 0:
                 continue
-            estimate = self.estimate_wait_hours(highs, rate)
+            estimate = self.estimate_wait(highs, rate)
             if estimate is None:
                 continue
-            wait_hours, hits = estimate
             # D034 的算式：單位時間報酬。等待期間的年化是 0%，所以利息要攤在
             # 「等待 ＋ 借出」的總時間上，而不是只攤在借出期間。
-            effective = rate * hold_hours / (wait_hours + hold_hours)
+            effective = rate * hold_hours / (estimate.mean_hours + hold_hours)
             self.last_evaluation.append(
-                {"rate": rate, "wait_hours": wait_hours, "hits": hits, "effective": effective}
+                {
+                    "rate": rate,
+                    "wait_hours": estimate.mean_hours,
+                    "median_hours": estimate.median_hours,
+                    "p75_hours": estimate.p75_hours,
+                    "hits": estimate.hits,
+                    "censored_ratio": estimate.censored_ratio,
+                    "effective": effective,
+                }
             )
             if effective > best_effective:
                 best_rate, best_effective = rate, effective

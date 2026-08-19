@@ -441,3 +441,52 @@ class TestSyncPositions:
         # 查 EUR 時不該把 USD 的部位判成「消失了」
         assert changes["closed"] == []
         assert len(repository.open_positions("USD")) == 1
+
+
+class TestWaitForecasts:
+    """掛單當下的等待預估（D038）。"""
+
+    def forecast(self, **overrides):
+        base = {
+            "rate": 0.000268,
+            "mean_hours": 6.0,
+            "median_hours": 3.5,
+            "p75_hours": 12.0,
+            "hits": 54,
+            "censored_ratio": 0.0,
+            "window_hours": 168,
+        }
+        base.update(overrides)
+        return base
+
+    def test_存進去再取出來(self, repository):
+        repository.record_wait_forecast("5084375241", self.forecast())
+        saved = repository.get_wait_forecast("5084375241")
+        assert saved["mean_hours"] == 6.0
+        assert saved["median_hours"] == 3.5
+        assert saved["p75_hours"] == 12.0
+        assert saved["hits"] == 54
+        assert saved["window_hours"] == 168
+
+    def test_offer_id_數字與字串是同一張單(self, repository):
+        """交易所回的 id 有時是整數、有時是字串，兩邊要對得起來才校準得了。"""
+        repository.record_wait_forecast(5084375241, self.forecast())
+        assert repository.get_wait_forecast("5084375241") is not None
+
+    def test_沒有預估時回None而不是空dict(self, repository):
+        """回 `None` 是正常情況：這張表 2026-08-19 才加，之前的單本來就沒有。"""
+        assert repository.get_wait_forecast("不存在") is None
+        assert repository.get_wait_forecast(None) is None
+
+    def test_沒有offer_id就不落帳(self, repository):
+        """dry-run 或交易所沒回 id 時對不起來，落一列只會讓校準資料變髒。"""
+        repository.record_wait_forecast(None, self.forecast())
+        rows = repository.connection.execute("SELECT COUNT(*) FROM offer_wait_forecasts").fetchone()
+        assert rows[0] == 0
+
+    def test_同一個id再寫一次以新的為準(self, repository):
+        repository.record_wait_forecast("7", self.forecast(mean_hours=6.0))
+        repository.record_wait_forecast("7", self.forecast(mean_hours=20.0))
+        assert repository.get_wait_forecast("7")["mean_hours"] == 20.0
+        rows = repository.connection.execute("SELECT COUNT(*) FROM offer_wait_forecasts").fetchone()
+        assert rows[0] == 1

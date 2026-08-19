@@ -20,6 +20,22 @@ except ModuleNotFoundError:  # pragma: no cover - environment fallback
     ccxt = None
 
 
+def _optional_millis(value) -> Optional[int]:
+    """把 Bitfinex 回傳的毫秒時間戳轉成整數，轉不動就回 `None`。
+
+    Bitfinex 的 funding 端點把時間戳當字串回傳（`'1787087004000'`），
+    而且偶爾會是 `None`。這裡吞掉轉換錯誤而不是拋例外：時間戳是輔助資訊，
+    值不出來就讓上層看到 `None` 並自己說「不知道」——**比讓一輪巡檢失敗好，
+    也比默默填一個 0 好**（填 0 會變成「1970 年掛的單」，然後閒置時間爆表）。
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class BitfinexClient(ExchangeClient):
     """最小可用的交易所封裝，供第一版流程使用。"""
 
@@ -313,7 +329,17 @@ class BitfinexClient(ExchangeClient):
         """把 funding offer 陣列轉成統一的 dict。
 
         欄位索引以 2026-08-16 對正式帳號實打的回應核對過（21 欄，全部是字串）：
-        0=ID, 1=SYMBOL, 4=AMOUNT(剩餘), 5=AMOUNT_ORIG, 10=STATUS, 14=RATE, 15=PERIOD。
+        0=ID, 1=SYMBOL, **2=MTS_CREATE**, 3=MTS_UPDATE, 4=AMOUNT(剩餘),
+        5=AMOUNT_ORIG, 10=STATUS, 14=RATE, 15=PERIOD。
+
+        **`created_at_ms` 於 2026-08-19 補上並實打驗證**（D038）：那天場上唯一一張單
+        回傳 `'1787087004000'`，換算 `2026-08-19 05:03:24 +0800`，與掛單當輪的日誌
+        完全一致；同一次回應的 MTS_UPDATE 是同一個值，等於證明那張單 18 小時
+        沒被動過。**這個欄位是閒置時間量測的基準**——用交易所的時間而不是自己記，
+        重啟、重新部署都不會把它弄丟。
+
+        欄位名帶 `_ms` 後綴是刻意的：`loan_offers.created_at` 是 ISO 字串，
+        這裡是毫秒整數，兩個都叫 `created_at` 遲早有人拿去相減。
         """
         parsed: List[Dict[str, Any]] = []
         for offer in offers:
@@ -323,6 +349,9 @@ class BitfinexClient(ExchangeClient):
                     # （2026-08-15 實單踩過，見 DECISIONS.md D026）。
                     "id": int(offer[0]),
                     "symbol": offer[1],
+                    # 取不到就是 None：閒置時間是輔助資訊，為了它讓一輪巡檢失敗
+                    # 並不划算（與 `_parse_positions` 對 opened_at 的處置一致）。
+                    "created_at_ms": _optional_millis(offer[2] if len(offer) > 2 else None),
                     "amount": float(offer[4]),
                     "rate": float(offer[14]),
                     "period": int(offer[15]),

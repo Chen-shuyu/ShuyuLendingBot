@@ -18,9 +18,11 @@
 """
 
 import time
+from datetime import datetime
 from typing import Optional
 
 from notify import messages
+from utils import clock
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
 # 離開碼語意
@@ -178,6 +180,10 @@ class BotEngine:
             raise SkipCycleError(f"本輪不掛單：{skip_reason}")
 
         self._log_queue_position(book, plans)
+        # **在任何「要不要動這張單」的判斷之前先量測。** 閒置時間是這些判斷的輸入，
+        # 放在後面的話，凡是提早 return 的路徑（維持不動、重掛不划算）就永遠量不到
+        # ——而那正好是單子閒置最久的那些輪次（D038）。
+        self._log_idle_time(existing)
         ahead_of_live = self._queue_ahead_of_live(book, existing)
         if ahead_of_live is not None:
             self.logger.info(f"場上掛單排隊位置：前方 {ahead_of_live:,.0f} USD")
@@ -277,6 +283,7 @@ class BotEngine:
             if isinstance(result, dict) and result.get("status") == "dry_run":
                 dry_run = True
             self.repository.record_offer(plan, result)
+            self._record_wait_forecast(result)
 
         self._note_offers_placed(plans, dry_run)
         total_amount = round(sum(plan.amount for plan in plans), 2)
@@ -378,6 +385,78 @@ class BotEngine:
         line = describe()
         if line:
             self.logger.info(line)
+
+    def _log_idle_time(self, existing) -> None:
+        """把「場上這張單已經掛了多久」寫進日誌，並與掛單當初的預估對照（D038）。
+
+        **為什麼需要這一行**：2026-08-19 那張單掛了 18 小時沒成交，而這段期間
+        每一輪的日誌都長得一模一樣——「維持不動以保住排隊位置」。閒置資金的年化是
+        **0%**，這是唯一一種「什麼都沒發生但確定在虧」的狀態，卻是整個系統裡
+        唯一沒有任何一行日誌在計時的東西（D037 已預警，隔天就成真）。
+
+        **這裡只量測，不做任何決策**：要不要因為等太久而降價是策略問題，
+        得先有這些數字才談得上（D036 的順序）。直接拍一個「超過 N 小時就降價」
+        的常數，就是 `target_queue_usd` 的死法。
+        """
+        for offer in existing:
+            created_ms = offer.get("created_at_ms")
+            if created_ms is None:
+                # 講「不知道」，不要用本輪時間硬湊一個看起來很小的閒置時數。
+                self.logger.info(
+                    f"場上掛單 #{offer.get('id')} 沒有建立時間，無法計算已閒置多久。"
+                )
+                continue
+
+            created_at = datetime.fromtimestamp(created_ms / 1000, tz=clock.get_timezone())
+            idle_hours = (clock.now() - created_at).total_seconds() / 3600
+            # 閒置成本用金額講，不然「18 小時」對人來說沒有重量。
+            # 這段時間若已借出去、以這張單自己的利率計，本來會賺到的利息。
+            forgone = offer["amount"] * offer["rate"] * idle_hours / 24
+
+            forecast = self.repository.get_wait_forecast(offer.get("id"))
+            if not forecast:
+                self.logger.info(
+                    f"場上掛單已閒置 {idle_hours:.1f} 小時"
+                    f"（機會成本約 {forgone:.4f} USD），沒有留下當初的等待預估。"
+                )
+                continue
+
+            if idle_hours > forecast["p75_hours"]:
+                verdict = "已超出當初預估的四分之三分位，等待估計偏樂觀"
+            elif idle_hours > forecast["median_hours"]:
+                verdict = "已超過當初預估的中位數"
+            else:
+                verdict = "仍在當初預估的中位數之內"
+
+            self.logger.info(
+                f"場上掛單已閒置 {idle_hours:.1f} 小時（機會成本約 {forgone:.4f} USD）；"
+                f"掛單當下預估 平均 {forecast['mean_hours']:.1f}h／"
+                f"中位數 {forecast['median_hours']:.1f}h／"
+                f"四分之三在 {forecast['p75_hours']:.1f}h 內 → {verdict}。"
+            )
+
+    def _record_wait_forecast(self, result) -> None:
+        """把掛單當下的等待預估落 DB，供事後校準（D038）。
+
+        策略沒有這個能力就靜靜跳過——`frr_plus` 與 `orderbook_depth` 不做期望值評估，
+        硬要它們回答只會多一個會爆的地方（與 `_log_pricing_rationale()` 同一個判斷）。
+
+        **落帳失敗不能拖垮掛單**：錢已經掛出去了，這裡只是校準資料。
+        寫不進去就記一行警告，讓它變成看得見的缺口而不是靜默的空白。
+        """
+        forecast_of = getattr(self.strategy, "chosen_forecast", None)
+        if forecast_of is None or not isinstance(result, dict):
+            return
+        offer_id = result.get("id")
+        if offer_id is None:
+            return
+        forecast = forecast_of()
+        if not forecast:
+            return
+        try:
+            self.repository.record_wait_forecast(offer_id, forecast)
+        except Exception as exc:  # noqa: BLE001 - 校準資料不值得讓一輪巡檢失敗
+            self.logger.warning(f"掛單 #{offer_id} 的等待預估寫入失敗，事後無法校準：{exc}")
 
     def _strategy_skip_reason(self) -> str:
         """策略為什麼不掛單。策略沒說就退回一句中性的描述。

@@ -149,6 +149,51 @@ class Repository:
                 ),
             )
 
+    def record_wait_forecast(self, offer_id, forecast: Dict[str, Any]) -> None:
+        """記下一張掛單在送出當下對「要等多久」的預估（D038）。
+
+        `offer_id` 取不到（dry-run、或交易所沒回 id）就直接跳過：這張表的用途是
+        事後把預估與實際等待對起來，而對不起來的列只會讓校準資料變髒。
+
+        重掛同一個價位會拿到新的 offer_id，所以主鍵衝突理論上不會發生；
+        真的撞到就以新的為準（`INSERT OR REPLACE`），因為同一個 id 在場上只有一張單。
+        """
+        if offer_id is None:
+            return
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO offer_wait_forecasts
+                    (offer_id, rate, mean_hours, median_hours, p75_hours,
+                     hits, censored_ratio, window_hours, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(offer_id),
+                    float(forecast["rate"]),
+                    float(forecast["mean_hours"]),
+                    float(forecast["median_hours"]),
+                    float(forecast["p75_hours"]),
+                    int(forecast["hits"]),
+                    float(forecast["censored_ratio"]),
+                    int(forecast["window_hours"]),
+                    now_iso(),
+                ),
+            )
+
+    def get_wait_forecast(self, offer_id) -> Optional[Dict[str, Any]]:
+        """取回某張掛單當初的等待預估；沒有就回 `None`。
+
+        回 `None` 是正常情況而不是錯誤：這張表 2026-08-19 才加，在它之前掛出去的單
+        本來就沒有預估，機器人要能照常運作並在日誌裡說「沒有留下當初的預估」。
+        """
+        if offer_id is None:
+            return None
+        row = self.connection.execute(
+            "SELECT * FROM offer_wait_forecasts WHERE offer_id = ?", (str(offer_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
     def upsert_daily_earning(
         self,
         date: str,

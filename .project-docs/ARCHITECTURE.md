@@ -57,7 +57,9 @@ ShuyuLendingBot/
 │                                # FailureTracker、離開碼常數（M4 由 main.py 移入）
 ├── db/
 │   ├── models.py               # loan_offers / earnings_daily / funding_positions /
-│   │                            # bot_state 的 DDL（funding_positions 為 D030 新增）
+│   │                            # bot_state / offer_wait_forecasts 的 DDL
+│   │                            # （funding_positions 為 D030、
+│   │                            #   offer_wait_forecasts 為 D038 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── notify/
 │   └── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
@@ -144,6 +146,10 @@ ShuyuLendingBot/
   檔案位置由 `resolve_db_path()` 決定：`BFX_DB_PATH` 優先，相對路徑一律相對於專案根目錄
   ——**必須與 `scripts/healthcheck.py` 的同名函式算出相同結果**，兩邊分家的症狀是健康檢查
   永遠回報「尚未寫入任何心跳」而機器人其實是好的（D019）。
+  `offer_wait_forecasts` 存的是**掛單當下對「要等多久」的預估**，一張單一列（D038）：
+  實際等待事後算得出來（掛單時間在 `loan_offers`、成交時間在 `funding_positions`），
+  **「當初以為要等多久」才是不存就永遠消失的那一半**——策略每輪重算，
+  記憶體裡永遠只有「現在這一輪怎麼想」。少了它就只能拿今天的模型解釋昨天的決定（D036）。
   尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
 - `notify/line_messaging.py`：LINE Messaging API push（`POST /v2/bot/message/push`）。
   `send()` 永遠不拋例外——它在致命錯誤的退出路徑上被呼叫，拋例外會蓋掉原始錯誤與離開碼。

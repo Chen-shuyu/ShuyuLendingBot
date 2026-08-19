@@ -27,7 +27,7 @@ systemd 放棄重啟）——免費方案每月 200 則，每輪推一則兩天�
 [core/bot_engine.py]  ──主迴圈狀態機──┐
         │                            │
         ├─ api/bitfinex_client.py ───┤（交易所讀寫、Rate Limit 重試）
-        ├─ strategies/orderbook_depth.py ┤（純函式：依排隊位置算利率/金額/天期）
+        ├─ strategies/expected_value.py ─┤（純函式：以單位時間報酬期望值算利率/金額/天期）
         ├─ db/repository.py ─────────┤（SQLite WAL：掛單/收益/狀態）
         └─ notify/line_messaging.py ─┘（LINE Messaging API push）
 ```
@@ -48,9 +48,12 @@ ShuyuLendingBot/
 │   └── rate_limiter.py         # RetrySettings + with_retry 指數退避（M3 新增）
 ├── strategies/                 # 策略層（純函式，易測試）
 │   ├── base.py                 # Strategy 介面與 OfferPlan 資料結構（M4 新增）
+│   ├── expected_value.py       # ExpectedValueStrategy：以單位時間報酬的期望值選價，
+│   │                            # 等待時間每輪從 1 小時 K 線重估
+│   │                            # （2026-08-17 起的預設策略，見 D035／D038）
 │   ├── orderbook_depth.py      # OrderBookDepthStrategy：依訂單簿排隊位置定價，
-│   │                            # 並以近期成交價為下限
-│   │                            # （2026-08-16 起的預設策略，見 D030／D033）
+│   │                            # 已被 D035 取代，仍是 expected_value 的父類別
+│   │                            # （金額拆分、風控上限、成交價下限、利率量化共用）
 │   └── frr_plus.py             # FrrPlusStrategy：舊的 FRR 加減碼，保留供對照
 ├── core/
 │   └── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
@@ -95,10 +98,16 @@ ShuyuLendingBot/
   決策全錯（見 D021）。
 - `api/bitfinex_client.py`：封裝 `ccxt.bitfinex`，實作上述介面，提供
   `test_connection`、`get_available_balance`、`get_frr`、`get_funding_book`、
-  `get_recent_trades`、`get_active_offers`、`get_active_positions`、
-  `cancel_active_offers`、`create_loan_offer`。**`get_funding_book()` 與
-  `get_recent_trades()` 回答的是不同問題**：前者是「別人開價多少、我排第幾位」，
-  後者是「借款人實際付了多少」——只看前者會被一筆低價大單牽著走（D033）。
+  `get_recent_trades`、`get_rate_candles`、`get_active_offers`、`get_active_positions`、
+  `cancel_active_offers`、`create_loan_offer`。**三個市場端點回答的是不同問題**：
+  `get_funding_book()` 是「別人開價多少、我排第幾位」，`get_recent_trades()` 是
+  「借款人實際付了多少」，`get_rate_candles()`（D035 新增，讀
+  `/v2/candles/trade:1h:fUSD:p2/hist`）是「過去每小時的需求掃到多高」。
+  只看第一個會被一筆低價大單牽著走（D033）；只看前兩個會把一個時間切片誤當成常態，
+  而這個市場在每小時之內的振幅動輒 5 個百分點（D035）。
+  K 線一次可取 5000 根（涵蓋 7 個月），而 `/v2/trades` 一次只涵蓋約 4 小時
+  ——**樣本窗太短正是 D035 第一個錯誤結論的成因**。
+  `get_active_offers()` 的回傳帶 `created_at_ms`（MTS_CREATE），是閒置時間量測的基準（D038）。
   兩者都走公開端點，dry-run 下也拿得到，所以離線也驗得了定價。四者皆已修正為呼叫 ccxt 的 raw/implicit API（`public_get_ticker_symbol`／
   `private_post_auth_r_funding_offers_symbol`／`private_post_auth_w_funding_offer_cancel`／
   `private_post_auth_w_funding_offer_submit`），詳細盤點見
@@ -110,7 +119,34 @@ ShuyuLendingBot/
   `FatalError` 直接往外拋（見 D013）。
 - `strategies/base.py`：`Strategy` 介面與 `OfferPlan` 資料結構——策略層與迴圈層之間的契約。
   `OfferPlan` 是**計畫值不是成交值**，落帳一律以交易所回報為準。
-- `strategies/orderbook_depth.py`：`OrderBookDepthStrategy`，**2026-08-16 起的預設策略**
+- `strategies/expected_value.py`：`ExpectedValueStrategy`，**2026-08-17 起的預設策略**
+  （見 D035、D038）。**繼承 `OrderBookDepthStrategy`，只換掉「怎麼決定 base_rate」這一步**
+  ——金額拆分、風控上限、成交價下限、利率量化、排隊位置描述全部共用，
+  兩個策略的差異因此是一個可以單獨檢視的方法，不是兩份平行演化的程式碼。
+
+  定價的主張只有一句：**掛在哪個價位，由「利率 × 借出期間 ÷ (等待 + 借出期間)」
+  最大的那一個決定**（D034 已驗證的單位時間報酬），而等待時間每輪從 1 小時 K 線重估：
+
+  1. **候選價位**取自窗內出現過的 `high`——沒有掃到過的價位不該成為候選，
+     這同時是天然的上限，不必另設「最高不准超過多少」的旋鈕。
+  2. **等待估計**（`estimate_wait()`）問的是**「我在任意時刻進場要等多久」**，
+     不是「命中間隔平均多長」（D038）。從窗內每個小時各出發一次算等待，
+     長空檔會依它實際佔掉的時間長度被加權。回傳平均／中位數／p75／命中數／右設限數。
+     **舊版逐根走訪算出間隔後取平均，把剛保留下來的陣發性又抹掉了**——
+     `[6,0,0]` 與 `[2,2,2]` 的平均都是 2。
+  3. **右設限**（等到窗尾還沒等到）**計入而非丟棄**：丟掉的正是最長的那些等待。
+     算出來的是下界，所以 `censored_ratio` 一併輸出，當作這個下界有多不可信的刻度。
+  4. **`ev_min_hits`** 擋尾端：窗內最高的那一兩根 K 永遠「命中 1 次」，
+     不擋的話期望值會一路爬到一個只發生過一次、等不到的價位。
+
+  `describe_decision()` 把整段推導濃縮成一行給迴圈層寫日誌，
+  `chosen_forecast()` 交出掛單當下的預估供落 DB（策略層仍然不碰 IO）。
+  D033 與 D030 的兩道防線（成交價下限、`minimum_rate` 絕對地板）**原封不動沿用**。
+- `strategies/orderbook_depth.py`：`OrderBookDepthStrategy`，2026-08-16 至 08-17 的預設策略，
+  **已由 `ExpectedValueStrategy` 取代（D035），但仍是它的父類別**——
+  上面列的共用邏輯都住在這裡，所以它不是死碼。
+  被取代的原因是**模型的自變數選錯了**：排隊位置模型假設需求穩定地從簿子前端吃過來，
+  而這個市場的成交是陣發掃單——**站在最前面不會更快成交，只保證用最低價成交**。
   （見 D030、D033）。輸入餘額、市場深度與近期成交，輸出 `OfferPlan` 清單。
   定價是一句話加兩道下限：
   1. **排隊規則**：在「排在我們前面的錢不超過 `target_queue_usd`」的前提下挑利率最高的一檔。

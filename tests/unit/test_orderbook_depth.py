@@ -261,6 +261,69 @@ class TestDescribeQueue:
         assert make_strategy().describe_queue(book, 0.000250)["same_period"] == 500_000
 
 
+class TestDescribeQueueTellsWhenItIsOnlyALowerBound:
+    """越界要標示出來（TASKS.md A3）：那個數字的語意是「至少」，不是「就是」。
+
+    2026-08-19 的現場：250 檔可見最高只有年化 9.04%，而我們掛 9.78%——
+    日誌照樣印「前方 2,289,677 USD」，而那正好等於整本可見簿子的總額。
+    2026-08-20 更完整：整整 30 輪的守門檻都拿同一個截斷值兩邊比（A2 的根因）。
+    """
+
+    def test_rate_inside_the_visible_range_is_a_measurement(self, make_strategy):
+        book = [level(0.000240, 500_000), level(0.000260, 300_000)]
+
+        queue = make_strategy().describe_queue(book, 0.000250)
+
+        assert queue["truncated"] is False
+        assert queue["visible_top_rate"] == 0.000260
+        assert queue["all_periods"] == 500_000
+
+    def test_rate_above_the_visible_top_is_only_a_lower_bound(self, make_strategy):
+        """這裡的 800,000 意思是「至少 800,000」——簿子之上還有多少錢，看不到。"""
+        book = [level(0.000240, 500_000), level(0.000260, 300_000)]
+
+        queue = make_strategy().describe_queue(book, 0.000268)
+
+        assert queue["truncated"] is True
+        assert queue["visible_top_rate"] == 0.000260
+        assert queue["all_periods"] == 800_000  # 整本可見簿子＝下界
+
+    def test_two_different_rates_above_the_top_get_the_same_number(self, make_strategy):
+        """**這就是 A2 的根因**：越界之後，兩個不同價位的排隊金額完全相同。
+
+        沒有 `truncated`，上層拿這兩個數字去比快慢，分母約掉、判準退化成純比利率
+        ——`_cheaper_repost_is_not_worth_it()` 因此永遠回答「划不來」。
+        """
+        book = [level(0.000240, 500_000), level(0.000260, 300_000)]
+        strategy = make_strategy()
+
+        live = strategy.describe_queue(book, 0.000268)
+        candidate = strategy.describe_queue(book, 0.00026027)
+
+        assert live["all_periods"] == candidate["all_periods"]
+        assert live["truncated"] and candidate["truncated"]
+
+    def test_a_period_missing_from_the_visible_range_is_still_a_measurement(self, make_strategy):
+        """同天期那一桶是 0、而價位在可見範圍內——那個 0 是真的。
+
+        簿子是「利率由低往高的前 250 檔」，可見範圍內完整：真有更便宜的 2 天期供給，
+        它一定看得見。所以旗標是**整本簿子的性質**，不必分桶各給一個。
+        """
+        book = [level(0.000240, 500_000, period=30), level(0.000260, 300_000, period=30)]
+
+        queue = make_strategy().describe_queue(book, 0.000250, period=2)
+
+        assert queue["same_period"] == 0
+        assert queue["truncated"] is False
+
+    def test_empty_book_is_not_an_empty_queue(self, make_strategy):
+        """一個數字都沒有的時候，「前方 0 USD」同樣是編出來的。"""
+        queue = make_strategy().describe_queue([], 0.000250)
+
+        assert queue["truncated"] is True
+        assert queue["visible_top_rate"] is None
+
+
 class TestMarketRate:
     """常態成交價：借款人實際付了多少。訂單簿答不出這件事（D033）。"""
 

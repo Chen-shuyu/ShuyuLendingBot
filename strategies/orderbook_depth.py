@@ -1,6 +1,17 @@
 # -*- coding: utf-8 -*-
 """訂單簿深度策略：以「排隊位置」定價，而不是以某個指標加減碼。
 
+> ## ⚠️ 這個策略已於 2026-08-17 被 `ExpectedValueStrategy` 取代（DECISIONS.md D035）
+>
+> 現行定價路線是 `strategies/expected_value.py`（`config.yaml` 的
+> `strategy.mode: expected_value`）。下面「排隊位置」那一套的前提——需求會穩定地
+> 從簿子前端一路吃過來——已被實測否定：這個市場是**陣發掃單**，
+> **站在隊伍最前面不會讓你更快成交，只會保證你用最低價成交。**
+>
+> **但這個檔案不是死碼**：它是 `ExpectedValueStrategy` 的父類別，
+> 金額拆分、風控上限、成交價下限、利率量化、`describe_queue()` 都住在這裡。
+> 讀下面的內容時請記得它描述的是**已被取代的定價方式**，不是現行行為。
+
 ## 為什麼不再用 FRR
 
 `FrrPlusStrategy` 的算式是 `FRR + premium`。2026-08-16 的實測證實這條路走不通：
@@ -264,8 +275,13 @@ class OrderBookDepthStrategy(Strategy):
         book: List[Dict[str, Any]],
         rate: float,
         period: Optional[int] = None,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """回報「掛在 `rate` 時，前面排了多少錢」——同天期與全天期各算一份。
+
+        **`truncated` 才是這個回傳值最重要的欄位**（2026-08-20 補上，TASKS.md A3）：
+        它為 True 時，兩個金額的語意是**「至少這麼多」**，不是「就是這麼多」。
+        呼叫端要嘛照這個語意講話（日誌寫「至少」），要嘛就不要用（見
+        `BotEngine._queue_ahead()`）——**不可以當成量測值直接拿去比較**。
 
         `period` 不給就採設定檔的 `offer_period`。**要問「場上那張單排在哪」時
         一定要明確傳它**：那張單的天期是掛出去當下決定的，不保證等於設定檔現在的值
@@ -284,6 +300,24 @@ class OrderBookDepthStrategy(Strategy):
 
         已知的小誤差：我們自己那張掛單若已經在場上，也會落在這一檔而被算成「前面」。
         以目前的金額量級（數百 USD vs 數萬起跳的門檻）不影響判斷，而且方向偏保守。
+
+        ## 越界（`truncated`）是怎麼判的，為什麼一個旗標就夠
+
+        簿子是「利率由低往高的前 250 檔」，所以**可見範圍內是完整的**：低於
+        `visible_top_rate` 的每一檔都在 `book` 裡。由此得到兩件事：
+
+        - `rate <= visible_top_rate` → 兩個金額都是**量測值**（同天期那一桶即使是 0
+          也是真的 0——真有更便宜的同天期供給，它一定看得見）
+        - `rate > visible_top_rate` → 兩個金額都只是**下界**，中間有多少錢看不到
+
+        所以旗標是**整本簿子的性質**，不必分桶各給一個。簿子若剛好沒被 250 檔截斷，
+        這裡會把「其實是準的」誤報成越界——方向偏保守（回報「不知道」），
+        而 D037 定的處置是「不知道就棄權、不擋事」，所以誤報的代價只是少一次判斷。
+
+        2026-08-19 的現場：可見最高只有年化 9.04%，而我們掛 9.78%——
+        舊版就是在這個狀態下把「前方 2,289,677 USD」以量測值的形式印出去（A3），
+        而 `_cheaper_repost_is_not_worth_it()` 拿兩個一樣的截斷值去比，
+        判準因此退化成「永遠擋下往下調價」（A2）。**同一個謊，兩處受害。**
         """
         target_period = self.offer_period if period is None else int(period)
         same_period = sum(
@@ -292,7 +326,14 @@ class OrderBookDepthStrategy(Strategy):
             if level["rate"] <= rate and level["period"] == target_period
         )
         all_periods = sum(level["amount"] for level in book if level["rate"] <= rate)
-        return {"same_period": same_period, "all_periods": all_periods}
+        visible_top_rate = max((level["rate"] for level in book), default=None)
+        return {
+            "same_period": same_period,
+            "all_periods": all_periods,
+            # 空簿子也算越界：一個數字都沒有的時候「前方 0 USD」同樣是編出來的。
+            "truncated": visible_top_rate is None or rate > visible_top_rate,
+            "visible_top_rate": visible_top_rate,
+        }
 
     def _apply_lend_limit(self, balance_usd: float) -> float:
         """套用 maxtolend / maxpercenttolend 上限，回傳本輪實際可掛出的總金額。"""

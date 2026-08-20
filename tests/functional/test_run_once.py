@@ -796,6 +796,157 @@ class TestCheaperRepostMustPayForItself:
 
         assert client.cancel_calls == 1
 
+    def test_no_abstention_noise_from_a_strategy_without_queues(self, fake_logger, fake_notifier,
+                                                                strategy, repository, no_sleep):
+        """沒有 `describe_queue()` 不是資料缺口，是模型裡本來就沒有隊伍。
+
+        每輪印一句「無法判斷」只會變成噪音——棄權的日誌只在**有這個概念但答不出來**
+        時才有意義。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)])
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert not any("棄權" in line for line in fake_logger.messages["info"])
+
+
+class TestGateAbstainsWhenItCannotSee:
+    """越界時棄權，不是偷偷否決（TASKS.md A2-a、DECISIONS.md D037）。
+
+    2026-08-20 的實測形狀：候選價位與場上那張單**雙雙高過可見簿子**，於是
+    `describe_queue()` 對兩者回同一個截斷值，`利息 ÷ (等待 + 借出期間)` 的分母約掉，
+    判準退化成純比利率——而前置條件已經保證候選比較便宜，**答案因此恆定為「划不來」**。
+    當天 30 輪的日誌全是 `前方 3,535,093 → 3,535,093 USD`，兩個數字一樣就是自白。
+
+    **一個永遠給同一個答案的判斷式，等於沒有判斷式**——差別只在它看起來像有。
+    """
+
+    # **一定要用 `ExpectedValueStrategy`**：候選價位取自 K 線的 high，
+    # 所以它算得出「簿子上根本看不到」的價位——而 `OrderBookDepthStrategy` 的候選
+    # 永遠是簿子上存在的某一檔，越界在它身上不可能發生。這個 bug 只存在於現行策略。
+    @staticmethod
+    def make_strategy(strategy_config, **overrides):
+        from strategies.expected_value import ExpectedValueStrategy
+
+        config = dict(spread_count=1, minimum_rate=0.0001, market_floor_pct=0.85,
+                      ev_min_hits=5, ev_min_candles=48)
+        config.update(overrides)
+        return ExpectedValueStrategy(strategy_config(**config))
+
+    # 整本簿子都在我們兩個價位之下——這正是 08-19／08-20 的真實形狀：
+    # 可見最高只有年化 9.04%（這裡 0.00022 ≈ 年化 8.03%），
+    # 而場上那張單掛 0.000268（年化 9.78%）、候選價位 0.00026（年化 9.49%）。
+    BELOW_US = [
+        {"rate": 0.00020, "period": 2, "amount": 1_500_000.0},
+        {"rate": 0.00022, "period": 2, "amount": 2_000_000.0},
+    ]
+    # 可見範圍蓋得住兩個價位的對照組。
+    COVERS_US = [
+        {"rate": 0.00020, "period": 2, "amount": 1_500_000.0},
+        {"rate": 0.00030, "period": 2, "amount": 2_000_000.0},
+    ]
+
+    @staticmethod
+    def candles(high=0.00026, spike=0.00027, count=60):
+        """多數小時掃到 `high`、每 10 根一次掃到 `spike`。
+
+        期望值因此選中 `high`（年化 9.49%）：`spike` 雖然更高，但平均要多等 5 小時，
+        在 48 小時的天期面前換不回來。選出來的價位比場上那張 0.000268 低 3.08%
+        ——**剛好越過 2% 容差**，於是這一輪真的會走到守門檻那段程式碼。
+        這組數字取自 2026-08-20：場上 9.78%、候選 9.50%、可見簿子最高 9.04%。
+        """
+        return [
+            {
+                "mts": 1_786_968_000_000 + index * 3_600_000,
+                "open": high,
+                "close": high,
+                "high": spike if index % 10 == 0 else high,
+                "low": 0.0001,
+                "volume": 4_000_000.0,
+            }
+            for index in range(count)
+        ]
+
+    def make_client(self, **overrides):
+        settings = dict(balance=0.0, frr=0.0002,
+                        active_offers=[live_offer(rate=0.000268)],
+                        book=self.BELOW_US, trades=market_trades(rate=0.00022))
+        settings.update(overrides)
+        client = FakeClient(**settings)
+        client.candles = self.candles()
+        return client
+
+    def test_out_of_range_does_not_veto_the_repost(self, fake_logger, fake_notifier,
+                                                   repository, no_sleep, strategy_config):
+        """比不出來就不擋——重掛照常發生。
+
+        **這一條會鬆開目前唯一擋著往下調價的東西**（D037 自己記過這個風險）：
+        修好之後，這段期間的行為由 `_plans_match()` 的 2% 容差與策略自己決定，
+        真正的重掛政策是 A2-b，要等 M1／M2 的回測工具。
+        """
+        client = self.make_client()
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.cancel_calls == 1
+        assert len(client.offers) == 1
+
+    def test_the_candidate_really_is_cheaper(self, fake_logger, fake_notifier,
+                                             repository, no_sleep, strategy_config):
+        """先證明測到的是**往下調價**那條路，不是「條件沒變」或「整輪不掛」。
+
+        少了這一條，上面那個測試可能什麼都沒驗證到。
+        """
+        strategy = self.make_strategy(strategy_config)
+        plans = strategy.build_offer_plan(200.0, 0.0002, self.BELOW_US,
+                                          market_trades(rate=0.00022), self.candles())
+
+        assert plans, "策略本輪確實有算出計畫"
+        assert plans[0].rate < 0.000268, "而且比場上那張便宜"
+        engine = make_engine(fake_logger, fake_notifier, strategy, FakeClient(), repository)
+        assert not engine._plans_match([live_offer(rate=0.000268)], plans), "2% 容差擋不住"
+
+    def test_abstention_is_logged(self, fake_logger, fake_notifier, repository, no_sleep,
+                                  strategy_config):
+        """棄權也要出聲，否則只是把「偷偷否決」換成「偷偷放行」（D026）。"""
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                 self.make_client(), repository)
+
+        assert any("棄權" in line for line in fake_logger.messages["info"])
+        assert not any("補不回" in line for line in fake_logger.messages["info"])
+
+    def test_queue_logs_say_at_least_when_out_of_range(self, fake_logger, fake_notifier,
+                                                       repository, no_sleep, strategy_config):
+        """A3：兩行排隊位置日誌都要改口說「至少」，並點出超出可見簿子。"""
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                 self.make_client(), repository)
+
+        live_line = next(line for line in fake_logger.messages["info"]
+                         if "場上掛單排隊位置" in line)
+        candidate_line = next(line for line in fake_logger.messages["info"]
+                              if "掛單排隊位置估計" in line)
+
+        assert "至少" in live_line and "超出可見簿子" in live_line
+        assert "至少" in candidate_line and "超出可見簿子" in candidate_line
+
+    def test_in_range_numbers_are_still_reported_as_measurements(self, fake_logger, fake_notifier,
+                                                                 repository, no_sleep,
+                                                                 strategy_config):
+        """**對照組：只有簿子的可見範圍不同，兩個價位一模一樣。**
+
+        場上仍是 0.000268、候選仍是 0.00026，改的只有簿子蓋不蓋得住它們。
+        蓋得住的時候排隊金額是真的量測值，守門檻**照樣否決**——
+        A2-a 修的是「算不出來時偷偷否決」，不是把這條判準拿掉。
+        """
+        client = self.make_client(book=self.COVERS_US)
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.cancel_calls == 0, "比得出來，而且這個方向不划算 → 維持不動"
+        assert any("補不回" in line for line in fake_logger.messages["info"])
+        assert not any("至少" in line for line in fake_logger.messages["info"])
+        assert not any("棄權" in line for line in fake_logger.messages["info"])
+
 
 class TestCancelActuallyTookEffect:
     """取消送出之後，要問「單子真的離場了嗎」，不能用餘額回推（D031）。

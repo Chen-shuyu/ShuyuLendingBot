@@ -19,7 +19,7 @@
 
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from notify import messages
 from utils import clock
@@ -184,9 +184,7 @@ class BotEngine:
         # 放在後面的話，凡是提早 return 的路徑（維持不動、重掛不划算）就永遠量不到
         # ——而那正好是單子閒置最久的那些輪次（D038）。
         self._log_idle_time(existing)
-        ahead_of_live = self._queue_ahead_of_live(book, existing)
-        if ahead_of_live is not None:
-            self.logger.info(f"場上掛單排隊位置：前方 {ahead_of_live:,.0f} USD")
+        self._log_live_queue_position(book, existing)
 
         if existing and self._plans_match(existing, plans):
             # **這一輪什麼都不做才是對的。** 同利率下是時間優先（先掛先成交），
@@ -484,21 +482,46 @@ class BotEngine:
             return
         self.logger.info(f"市場常態成交價：{rate:.8f}/日（年化 {rate * 365 * 100:.2f}%）")
 
-    def _queue_ahead(self, book, rate, period) -> Optional[float]:
-        """掛在 `rate`／`period` 時前面排著多少錢。拿不到就回 `None`。
+    def _describe_queue(self, book, rate, period=None) -> Optional[Dict[str, Any]]:
+        """向策略問排隊位置的原始回覆；策略沒有這個概念、或簿子是空的就回 `None`。
 
-        `same_period` 與 `all_periods` 取**小的那個**（也就是同天期）。
-        兩個數字誰才對還沒有定論（見 `describe_queue`），而這裡只拿它做**比較**，
-        兩邊用同一把尺，偏差會抵銷掉大半。
+        與 `_queue_ahead()` 的分工：這裡**原封不動**把 `truncated` 一起交出去，
+        給要「照實描述」的地方用（日誌）；`_queue_ahead()` 則是給要「拿來比較」
+        的地方用，越界時直接不給數字。同一份資料，兩種責任分開。
         """
         describe = getattr(self.strategy, "describe_queue", None)
         if describe is None or not book:
             return None
-        queue = describe(book, float(rate), int(period))
+        if period is None:
+            return describe(book, float(rate))
+        return describe(book, float(rate), int(period))
+
+    def _queue_ahead(self, book, rate, period) -> Optional[float]:
+        """掛在 `rate`／`period` 時前面排著多少錢。**答不出來就回 `None`。**
+
+        `same_period` 與 `all_periods` 取**小的那個**（也就是同天期）。
+        兩個數字誰才對還沒有定論（見 `describe_queue`），而這裡只拿它做**比較**，
+        兩邊用同一把尺，偏差會抵銷掉大半。
+
+        **越界時回 `None`，這是 A2-a 的全部內容**（TASKS.md A2-a、DECISIONS.md D037）。
+        `describe_queue()` 在候選價位高過可見簿子時給的是「至少這麼多」，而這個函式的
+        契約是「前面排著多少錢」——把下界當量測值交出去，就是拿一個永遠相同的數字
+        餵給比較式：分母約掉、判準退化成純比利率，於是
+        `_cheaper_repost_is_not_worth_it()` 的答案恆定為「划不來」。
+
+        2026-08-20 的實測是這件事最完整的證據：整整 30 輪的日誌都印
+        `前方 3,535,093 → 3,535,093 USD`——**兩個數字一樣就是自白**。
+
+        回 `None` 的意思是**「這一項我判斷不出來」**，不是「我判斷結果是不要」。
+        上層據此棄權，不由這一項擋事（D037：講「不知道」遠比講一個具體但錯誤的原因好）。
+        """
+        queue = self._describe_queue(book, rate, period)
+        if queue is None or queue.get("truncated"):
+            return None
         return min(float(queue["same_period"]), float(queue["all_periods"]))
 
-    def _queue_ahead_of_live(self, book, existing) -> Optional[float]:
-        """**場上那張單**前面還排著多少錢——不是本輪候選價位的，是已經在排隊的那張。
+    def _log_live_queue_position(self, book, existing) -> None:
+        """把**場上那張單**前面排了多少錢寫進日誌——不是本輪候選價位的，是已經在排隊的那張。
 
         這個區別是 D031 的核心。`_log_queue_position()` 描述的一直是**候選價位**
         （`plans[0].rate`），而「我們快成交了嗎」是**場上那張單**的性質，兩者在
@@ -506,11 +529,31 @@ class BotEngine:
         而場上那張既有的單反而變成隊伍最前面最快成交的一張。
 
         取**多筆掛單裡利率最低的那筆**：利率越低排得越前面，最先成交的一定是它。
+
+        **越界時講「至少」而不是閉嘴**（A3）：這裡只是描述，下界照樣有資訊
+        （它至少告訴你隊伍不比這個短），會騙人的是把它講成量測值的那個語氣。
+        要「拿去比較」的地方走的是 `_queue_ahead()`，那邊比不了就不給數字——
+        同一份資料，描述與判斷兩種責任分開。
+
+        （原本這裡先經過一個 `_queue_ahead_of_live()` 取數字再印，
+        A3 讓它只剩這一個呼叫端，於是併回來，不留一個沒人用的函式。）
         """
         if not existing:
-            return None
+            return
         front = min(existing, key=lambda offer: float(offer["rate"]))
-        return self._queue_ahead(book, float(front["rate"]), int(front["period"]))
+        queue = self._describe_queue(book, float(front["rate"]), int(front["period"]))
+        if queue is None:
+            return
+        truncated = bool(queue.get("truncated"))
+        ahead = min(float(queue["same_period"]), float(queue["all_periods"]))
+        line = f"場上掛單排隊位置：前方 {self._format_queue_amount(ahead, truncated)}"
+        top = queue.get("visible_top_rate")
+        if truncated and top is not None:
+            line += (
+                f"——這張單的年化 {float(front['rate']) * 365 * 100:.2f}% 已超出可見簿子"
+                f"（可見最高年化 {top * 365 * 100:.2f}%），這是下界"
+            )
+        self.logger.info(line)
 
     def _cheaper_repost_is_not_worth_it(self, book, existing, plans) -> Optional[str]:
         """**把價格往下調**的重掛划不划算：划不來就回傳一句說明，否則回 `None`。
@@ -567,6 +610,9 @@ class BotEngine:
         ahead_live = self._queue_ahead(book, live_rate, int(live["period"]))
         ahead_candidate = self._queue_ahead(book, candidate.rate, candidate.duration)
         if ahead_live is None or ahead_candidate is None or self.queue_clear_usd_per_hour <= 0:
+            # **棄權也要出聲。** 把「偷偷否決」換成「偷偷放行」的話，A2-a 只是把
+            # 靜默失效換了個方向——日誌上同樣看不出這一項有沒有介入（D026）。
+            self._log_repost_gate_abstained(book, live_rate, live, candidate)
             return None
 
         def daily_yield(rate, ahead, period):
@@ -584,29 +630,70 @@ class BotEngine:
             f"單位時間報酬 {live_yield:.10f} → {candidate_yield:.10f}"
         )
 
+    def _log_repost_gate_abstained(self, book, live_rate, live, candidate) -> None:
+        """守門檻答不出來時，明說它棄權了、以及為什麼。
+
+        只在**策略本來就有排隊位置這個概念**時才印：`FrrPlusStrategy` 沒有
+        `describe_queue()`，那不是資料缺口，是它的模型裡本來就沒有隊伍，
+        每輪印一句「無法判斷」只會變成噪音。
+        """
+        if getattr(self.strategy, "describe_queue", None) is None:
+            return
+        queue = self._describe_queue(book, candidate.rate, candidate.duration)
+        top = None if queue is None else queue.get("visible_top_rate")
+        if top is None:
+            detail = "簿子取不到可見範圍"
+        else:
+            detail = (
+                f"候選價位年化 {candidate.rate * 365 * 100:.2f}% 已超出可見簿子"
+                f"（可見最高年化 {top * 365 * 100:.2f}%）"
+            )
+        self.logger.info(
+            f"往下重掛的守門檻棄權（{detail}）：排隊金額只知道下界、比不出快慢，"
+            f"這一項不擋事，改由利率容差與策略決定"
+            f"（利率 {live_rate:.8f} → {candidate.rate:.8f}）。"
+        )
+
+    def _format_queue_amount(self, amount: float, truncated: bool) -> str:
+        """越界時一律加上「至少」——`describe_queue()` 的語意差別要看得見（A3）。"""
+        return f"至少 {amount:,.0f} USD" if truncated else f"{amount:,.0f} USD"
+
     def _log_queue_position(self, book, plans) -> None:
         """把「**本輪候選價位**掛下去時前面排了多少錢」寫進日誌，同天期與全天期各一份。
 
         **主詞是候選價位，不是場上那張單。** 這兩個數字在 2026-08-16 19:31 被讀成
         後者，於是「前方 0 USD」被當成「我們排到第一位了」——實際上它講的是
         「新算出來的價位落在簿子最低檔」，而當時舊版用 `<` 比較，最低檔自己那筆
-        沒被算進去才會顯示 0。場上那張單的排隊位置請看 `_queue_ahead_of_live()`。
+        沒被算進去才會顯示 0。場上那張單的排隊位置請看 `_log_live_queue_position()`。
 
         兩個數字都留，是為了**讓第一筆真實成交來裁決一個還沒驗證的假設**：
         不同天期的掛單到底有沒有在同一個隊伍裡排。策略目前採保守解讀（全天期一起算），
         若實際成交速度明顯快過這個估計，就代表同天期那個數字才是對的。
         沒有這兩行，事後只會看到「成交了」，什麼都學不到。
+
+        **越界時要講「至少」**（A3）：2026-08-19 這行印的「前方 2,289,677 USD」
+        其實正好等於整本可見簿子的總額——那是下界，不是量測值。
+        數字照印是刻意的：下界仍然有資訊（它至少告訴你隊伍不比這個短），
+        會騙人的是把它講成量測值的那個語氣。
         """
         if not book or not plans:
             return
-        describe = getattr(self.strategy, "describe_queue", None)
-        if describe is None:
+        queue = self._describe_queue(book, plans[0].rate)
+        if queue is None:
             return
-        queue = describe(book, plans[0].rate)
-        self.logger.info(
-            f"掛單排隊位置估計：同天期前方 {queue['same_period']:,.0f} USD、"
-            f"全天期前方 {queue['all_periods']:,.0f} USD"
+        truncated = bool(queue.get("truncated"))
+        line = (
+            f"掛單排隊位置估計：同天期前方 "
+            f"{self._format_queue_amount(queue['same_period'], truncated)}、"
+            f"全天期前方 {self._format_queue_amount(queue['all_periods'], truncated)}"
         )
+        top = queue.get("visible_top_rate")
+        if truncated and top is not None:
+            line += (
+                f"——候選價位年化 {plans[0].rate * 365 * 100:.2f}% 已超出可見簿子"
+                f"（可見最高年化 {top * 365 * 100:.2f}%），以上是下界"
+            )
+        self.logger.info(line)
 
     def _plans_match(self, existing, plans) -> bool:
         """場上現有掛單與本輪計畫是否「實質相同」（相同就不必重掛）。

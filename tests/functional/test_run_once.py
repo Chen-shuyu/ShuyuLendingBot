@@ -915,6 +915,68 @@ class TestGateAbstainsWhenItCannotSee:
         assert any("棄權" in line for line in fake_logger.messages["info"])
         assert not any("補不回" in line for line in fake_logger.messages["info"])
 
+    def abstain_line(self, fake_logger):
+        return next(line for line in fake_logger.messages["info"] if "棄權" in line)
+
+    def test_it_says_both_when_both_are_out_of_range(self, fake_logger, fake_notifier,
+                                                     repository, no_sleep, strategy_config):
+        """兩個都越界（08-19／08-20 的常態）就兩個都點名。"""
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                 self.make_client(), repository)
+
+        line = self.abstain_line(fake_logger)
+        assert "場上那張單（年化 9.78%）" in line
+        assert "候選價位（年化 9.49%）" in line
+
+    def test_it_blames_the_live_offer_when_only_the_live_offer_is_out_of_range(
+        self, fake_logger, fake_notifier, repository, no_sleep, strategy_config
+    ):
+        """**這一條就是 D4 那個 bug 的形狀。**
+
+        可見上限落在舊價與新價之間——場上那張 9.78% 越界、候選 9.49% 看得清清楚楚。
+        舊版會寫「候選價位年化 9.49% 已超出可見簿子（可見最高年化 9.67%）」，
+        **那句話裡的兩個數字自己就矛盾**（9.49 < 9.67）。
+
+        市場走弱時這是最常見的形狀，不是角落案例。
+        """
+        between = [
+            {"rate": 0.00020, "period": 2, "amount": 1_000_000.0},
+            {"rate": 0.000265, "period": 2, "amount": 500_000.0},  # 9.67%，夾在兩個價位中間
+        ]
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                 self.make_client(book=between), repository)
+
+        line = self.abstain_line(fake_logger)
+        assert "場上那張單（年化 9.78%）超出可見簿子" in line
+        assert "候選價位" not in line, "候選價位看得到，不可以被點名"
+
+    def test_it_names_the_setting_when_the_conversion_is_disabled(
+        self, fake_logger, fake_notifier, repository, no_sleep, strategy_config
+    ):
+        """第三個成因：兩個價位都看得到，是換算速率被關掉了。
+
+        舊版連這種情況都寫「候選價位已超出可見簿子」——而當下根本沒有任何東西越界。
+        """
+        engine = make_engine(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                             self.make_client(book=self.COVERS_US), repository,
+                             queue_clear_usd_per_hour=0)
+        engine.run_once()
+
+        line = self.abstain_line(fake_logger)
+        assert "queue_clear_usd_per_hour 設為 0" in line
+        assert "超出可見簿子" not in line, "沒有任何東西越界，不可以這樣寫"
+
+    def test_it_says_it_cannot_see_the_book_at_all(self, fake_logger, fake_notifier,
+                                                   repository, no_sleep, strategy_config):
+        """拿不到簿子就說拿不到——不要編一個「可見最高年化」出來。"""
+        engine = make_engine(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                             self.make_client(book=[]), repository)
+        engine.run_once()
+
+        line = self.abstain_line(fake_logger)
+        assert "拿不到訂單簿" in line
+        assert "可見最高年化" not in line
+
     def test_queue_logs_say_at_least_when_out_of_range(self, fake_logger, fake_notifier,
                                                        repository, no_sleep, strategy_config):
         """A3：兩行排隊位置日誌都要改口說「至少」，並點出超出可見簿子。"""

@@ -592,7 +592,11 @@ class BotEngine:
         金額變多時一律不否決：那代表錢包裡有新的錢要投入，而 `spread_count=1` 時
         重掛是唯一的投入手段，少賺的價差遠小於讓那筆錢繼續空轉。
         """
-        if not existing or not plans or not book:
+        # **這裡刻意不擋 `not book`。** 沒有場上的單、沒有計畫，代表「根本沒有這個問題」，
+        # 安靜返回是對的；但**拿不到簿子是有問題卻答不出來**，那是棄權，要出聲。
+        # 原本 `not book` 混在這一行裡，於是簿子抓不到時整條判斷靜悄悄地跳過
+        # ——`_queue_ahead()` 本來就會在沒有簿子時回 `None`，交給下面的棄權路徑講出來。
+        if not existing or not plans:
             return None
 
         live = min(existing, key=lambda offer: float(offer["rate"]))
@@ -612,7 +616,9 @@ class BotEngine:
         if ahead_live is None or ahead_candidate is None or self.queue_clear_usd_per_hour <= 0:
             # **棄權也要出聲。** 把「偷偷否決」換成「偷偷放行」的話，A2-a 只是把
             # 靜默失效換了個方向——日誌上同樣看不出這一項有沒有介入（D026）。
-            self._log_repost_gate_abstained(book, live_rate, live, candidate)
+            # 兩個 `ahead_*` 一起傳進去：**是哪一個答不出來**只有這裡知道，
+            # 讓下游自己猜的結果就是 D039 第一版那句自相矛盾的理由（TASKS.md D4）。
+            self._log_repost_gate_abstained(book, live, candidate, ahead_live, ahead_candidate)
             return None
 
         def daily_yield(rate, ahead, period):
@@ -630,28 +636,57 @@ class BotEngine:
             f"單位時間報酬 {live_yield:.10f} → {candidate_yield:.10f}"
         )
 
-    def _log_repost_gate_abstained(self, book, live_rate, live, candidate) -> None:
-        """守門檻答不出來時，明說它棄權了、以及為什麼。
+    def _log_repost_gate_abstained(self, book, live, candidate, ahead_live,
+                                   ahead_candidate) -> None:
+        """守門檻答不出來時，明說它棄權了、以及**是哪一件事**答不出來。
 
         只在**策略本來就有排隊位置這個概念**時才印：`FrrPlusStrategy` 沒有
         `describe_queue()`，那不是資料缺口，是它的模型裡本來就沒有隊伍，
         每輪印一句「無法判斷」只會變成噪音。
+
+        ## 為什麼三個成因一定要分開講（2026-08-21 修正，TASKS.md D4）
+
+        棄權有三個成因：**場上那張單**越界、**候選價位**越界、換算速率被設成 0。
+        D039 的第一版只看了候選價位，於是「場上那張單越界」會被寫成
+        「候選價位已超出可見簿子」——**那句話裡的兩個數字自己就矛盾**
+        （日誌實錄：候選 9.49%「超出」可見最高 9.67%）。
+
+        而「可見上限落在舊價與新價之間」正是市場走弱時最常見的形狀，
+        所以那不是一個理論上的角落，是每天都會走到的路。
+
+        **決策從頭到尾都是對的，錯的只有理由**——與 A1 修過的病同一種
+        （D026 靜默失效的家族：這次是「決定不做，但講錯是哪裡不知道」）。
+        講「不知道」遠比講一個具體但錯誤的原因好，所以拿不到簿子時就說拿不到。
         """
         if getattr(self.strategy, "describe_queue", None) is None:
             return
+
+        # `visible_top_rate` 是整本簿子的性質，問誰都一樣（見 `describe_queue`）。
         queue = self._describe_queue(book, candidate.rate, candidate.duration)
         top = None if queue is None else queue.get("visible_top_rate")
-        if top is None:
-            detail = "簿子取不到可見範圍"
-        else:
-            detail = (
-                f"候選價位年化 {candidate.rate * 365 * 100:.2f}% 已超出可見簿子"
-                f"（可見最高年化 {top * 365 * 100:.2f}%）"
+
+        out_of_range = []
+        if ahead_live is None:
+            out_of_range.append(f"場上那張單（年化 {float(live['rate']) * 365 * 100:.2f}%）")
+        if ahead_candidate is None:
+            out_of_range.append(f"候選價位（年化 {candidate.rate * 365 * 100:.2f}%）")
+
+        if out_of_range and top is None:
+            reason = "拿不到訂單簿，排隊金額無從算起"
+        elif out_of_range:
+            reason = (
+                f"{'與'.join(out_of_range)}超出可見簿子"
+                f"（可見最高年化 {top * 365 * 100:.2f}%），排隊金額只知道下界、比不出快慢"
             )
+        else:
+            reason = (
+                f"queue_clear_usd_per_hour 設為 {self.queue_clear_usd_per_hour:g}，"
+                f"排隊金額換算不成等待時間"
+            )
+
         self.logger.info(
-            f"往下重掛的守門檻棄權（{detail}）：排隊金額只知道下界、比不出快慢，"
-            f"這一項不擋事，改由利率容差與策略決定"
-            f"（利率 {live_rate:.8f} → {candidate.rate:.8f}）。"
+            f"往下重掛的守門檻棄權：{reason}。這一項不擋事，改由利率容差與策略決定"
+            f"（利率 {float(live['rate']):.8f} → {candidate.rate:.8f}）。"
         )
 
     def _format_queue_amount(self, amount: float, truncated: bool) -> str:

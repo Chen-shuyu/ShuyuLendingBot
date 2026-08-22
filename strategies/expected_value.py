@@ -310,6 +310,15 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         if len(highs) < self.ev_min_candles:
             return None
 
+        # **這個假設已知與現實不符，刻意先不改**（TASKS.md D1、DECISIONS.md D040）。
+        # 借款人可以隨時還款，所以 `offer_period` 是上限而不是實際持有時間：
+        # 2026-08-22 的量測是六筆裡五筆提前還款、平均只用掉預定天期的 32%。
+        # 分子被高估時，等待成本在下面那道算式裡的權重被壓縮，選出的價位會偏高。
+        #
+        # 為什麼還不動它：要換成什麼值本身就是策略問題（用中位數？依利率分層？
+        # 直接改成期望持有時間？），而那要在 M2 回測工具上跑過才知道。
+        # 先改參數再建量測正是 D036 記下的錯誤——現在至少量得到它錯多少：
+        # `python3 scripts/hold_report.py`。
         hold_hours = self.offer_period * 24.0
         best_rate: Optional[float] = None
         best_effective = 0.0

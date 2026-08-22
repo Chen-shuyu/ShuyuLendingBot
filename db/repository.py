@@ -282,6 +282,11 @@ class Repository:
                     "UPDATE funding_positions SET closed_at = ? WHERE position_id = ?",
                     (timestamp, row["position_id"]),
                 )
+                # 回傳的 dict 是 UPDATE **之前**查出來的，`closed_at` 還留著 None。
+                # 不補這一行，呼叫端拿到的「剛收回的部位」看起來會跟「還開著」
+                # 一模一樣——`core/hold_time.py` 會據此把它判成右設限樣本，
+                # 於是每一筆還款的當下都被講成「至少借了 N 小時（仍在生息中）」。
+                row["closed_at"] = timestamp
 
         return {"opened": opened, "closed": closed}
 
@@ -291,6 +296,22 @@ class Repository:
             dict(row)
             for row in self.connection.execute(
                 "SELECT * FROM funding_positions WHERE closed_at IS NULL AND currency = ?",
+                (currency,),
+            )
+        ]
+
+    def all_positions(self, currency: str) -> list:
+        """全部部位（含已結束），供持有時間量測使用（見 `core/hold_time.py`）。
+
+        **刻意不在 SQL 裡過濾掉 `closed_at IS NULL`**：仍在借出中的部位是右設限
+        樣本，量測需要知道它們存在才能算出「這份統計蓋掉了多少」。在這一層就
+        濾掉，上層永遠不會發現自己只看到活得夠短的那些部位。
+        """
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM funding_positions WHERE currency = ? "
+                "ORDER BY COALESCE(opened_at, first_seen_at)",
                 (currency,),
             )
         ]

@@ -1447,3 +1447,70 @@ class TestWaitForecastIsPersisted:
 
         assert self.forecasts_in_db(repository) == []
         assert offers_in_db(repository)  # 掛單本身照常完成
+
+
+class TestHoldTimeIsLogged:
+    """部位收回時，日誌要講出「實際借了多久」（見 DECISIONS.md D040）。
+
+    `strategies/expected_value.py` 假設每筆都借滿天期（`hold_hours = period × 24`），
+    而實測多數部位被提前還款。這一行是把那個落差變成「每次還款都看得見」的東西
+    ——不必等有人想到去翻資料庫，才發現模型跟現實對不上。
+    """
+
+    @staticmethod
+    def position(position_id="1", amount=344.41, rate=0.00026027, period=2,
+                 opened_at=1_787_063_460_000):
+        return {"id": position_id, "amount": amount, "rate": rate, "period": period,
+                "kind": "credit", "opened_at": opened_at}
+
+    def _close_one(self, fake_logger, fake_notifier, strategy, repository, **kwargs):
+        client = FakeClient(balance=600.0, frr=0.0002, positions=[self.position(**kwargs)])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+        client.positions = []
+        engine.run_once()
+        return fake_logger.messages["info"]
+
+    def test_收回時講出實際持有時間(self, fake_logger, fake_notifier, strategy, repository,
+                                    no_sleep):
+        messages = self._close_one(fake_logger, fake_notifier, strategy, repository)
+
+        assert any("實際借出" in message and "小時" in message for message in messages)
+
+    def test_收回時講出佔預定天期多少(self, fake_logger, fake_notifier, strategy, repository,
+                                      no_sleep):
+        """完成率才是對照模型假設的那個數字——48 小時的預定實際上用掉幾成。"""
+        messages = self._close_one(fake_logger, fake_notifier, strategy, repository)
+
+        assert any("佔預定 48 小時的" in message for message in messages)
+
+    def test_剛收回的部位不可以被講成仍在生息中(self, fake_logger, fake_notifier, strategy,
+                                                repository, no_sleep):
+        """反向斷言，釘住 `sync_positions()` 回傳值要帶著 `closed_at`。
+
+        回傳的 dict 是 UPDATE 之前查出來的，少補那一行的話「剛收回」與「還開著」
+        長得一模一樣，於是還款的當下會被講成「至少借了 N 小時（仍在生息中）」。
+        """
+        messages = self._close_one(fake_logger, fake_notifier, strategy, repository)
+        hold_lines = [message for message in messages if "佔預定" in message]
+
+        assert hold_lines
+        assert not any("仍在生息中" in message for message in hold_lines)
+        assert not any("至少" in message for message in hold_lines)
+
+    def test_起算時間壞掉時安靜跳過不影響巡檢(self, fake_logger, fake_notifier, strategy,
+                                                repository, no_sleep):
+        """量測是輔助資訊，不能因為它算不出來就讓一輪巡檢失敗。"""
+        messages = self._close_one(fake_logger, fake_notifier, strategy, repository,
+                                   opened_at=None)
+
+        # 收回本身照講，只是少了持有時間那一行。
+        assert any("資金已回到融資錢包" in message for message in messages)
+
+    def test_沒有部位收回時不會憑空多出持有時間那一行(self, fake_logger, fake_notifier,
+                                                      strategy, repository, no_sleep):
+        client = FakeClient(balance=600.0, frr=0.0002, positions=[self.position()])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        assert not any("佔預定" in message for message in fake_logger.messages["info"])

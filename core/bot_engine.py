@@ -21,6 +21,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from core import hold_time
 from notify import messages
 from utils import clock
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
@@ -324,9 +325,27 @@ class BotEngine:
             self.logger.info(
                 f"已借出部位收回 {len(closed)} 筆，合計 {total:.2f} USD——資金已回到融資錢包。"
             )
+            self._log_hold_times(closed)
             self._push_trade_event(messages.positions_closed(closed))
 
         return bool(opened)
+
+    def _log_hold_times(self, closed) -> None:
+        """把剛收回的每一筆「實際借了多久」寫進日誌（見 DECISIONS.md D040）。
+
+        **為什麼要在收回的當下講**：`strategies/expected_value.py` 假設每筆都借滿
+        天期（`hold_hours = offer_period * 24`），而實測是多數部位被提前還款。
+        這一行是把那個落差變成「每次還款都看得見」的東西——不必等有人想到
+        去翻資料庫才發現模型和現實對不上。
+
+        量測失敗不能拖垮巡檢：這是輔助資訊，起算時間壞掉時安靜跳過那一筆，
+        `scripts/hold_report.py` 的彙總仍會把「有幾筆算不出來」報出來。
+        """
+        for row in closed:
+            record = hold_time.build_record(row)
+            if record is None:
+                continue
+            self.logger.info(hold_time.describe_record(record))
 
     def _fetch_book(self):
         """取得市場深度；策略用不到就不打這個端點。

@@ -490,3 +490,65 @@ class TestWaitForecasts:
         assert repository.get_wait_forecast("7")["mean_hours"] == 20.0
         rows = repository.connection.execute("SELECT COUNT(*) FROM offer_wait_forecasts").fetchone()
         assert rows[0] == 1
+
+
+class Test持有時間量測要用的部位查詢:
+    """`all_positions()` 與 `sync_positions()` 回傳值的 `closed_at`（見 D040）。"""
+
+    def position(self, position_id="464242253", rate=0.00026027, amount=344.41):
+        return {
+            "id": position_id,
+            "amount": amount,
+            "rate": rate,
+            "period": 2,
+            "kind": "credit",
+            "opened_at": 1_787_063_460_000,
+        }
+
+    def test_剛收回的部位在回傳值裡就帶著closed_at(self, repository):
+        """**這是量測的前提**：回傳的 dict 是 UPDATE 之前查出來的。
+
+        不補上 `closed_at`，呼叫端拿到的「剛收回的部位」看起來會跟「還開著」
+        一模一樣，`core/hold_time.py` 會把它判成右設限樣本，於是每一筆還款的
+        當下都被講成「至少借了 N 小時（仍在生息中）」——**講的是還款，
+        話卻說成還在生息**。
+        """
+        repository.sync_positions("USD", [self.position()])
+        changes = repository.sync_positions("USD", [])
+
+        assert len(changes["closed"]) == 1
+        assert changes["closed"][0]["closed_at"] is not None
+
+    def test_回傳的closed_at與寫進DB的是同一個值(self, repository):
+        repository.sync_positions("USD", [self.position()])
+        changes = repository.sync_positions("USD", [])
+
+        stored = repository.connection.execute(
+            "SELECT closed_at FROM funding_positions WHERE position_id = ?",
+            ("464242253",),
+        ).fetchone()
+        assert changes["closed"][0]["closed_at"] == stored["closed_at"]
+
+    def test_all_positions含已結束的部位(self, repository):
+        """**刻意不在 SQL 裡濾掉還開著的**：右設限樣本要看得見才算得出蓋掉多少。"""
+        repository.sync_positions("USD", [self.position("a"), self.position("b")])
+        repository.sync_positions("USD", [self.position("b")])
+
+        rows = repository.all_positions("USD")
+
+        assert len(rows) == 2
+        assert sum(1 for row in rows if row["closed_at"] is not None) == 1
+        assert sum(1 for row in rows if row["closed_at"] is None) == 1
+
+    def test_all_positions只回該幣別(self, repository):
+        repository.sync_positions("USD", [self.position("usd-1")])
+        repository.sync_positions("UST", [self.position("ust-1")])
+
+        assert [row["position_id"] for row in repository.all_positions("USD")] == ["usd-1"]
+
+    def test_open_positions仍然只回還開著的(self, repository):
+        """改動不能波及既有呼叫端：總曝險計算靠的就是這個只回未結束的行為。"""
+        repository.sync_positions("USD", [self.position("a"), self.position("b")])
+        repository.sync_positions("USD", [self.position("b")])
+
+        assert [row["position_id"] for row in repository.open_positions("USD")] == ["b"]

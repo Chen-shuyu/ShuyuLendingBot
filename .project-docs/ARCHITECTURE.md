@@ -28,6 +28,7 @@ systemd 放棄重啟）——免費方案每月 200 則，每輪推一則兩天�
         │                            │
         ├─ api/bitfinex_client.py ───┤（交易所讀寫、Rate Limit 重試）
         ├─ strategies/expected_value.py ─┤（純函式：以單位時間報酬期望值算利率/金額/天期）
+        ├─ core/hold_time.py ────────┤（純函式：實際持有時間量測，只量測不決策）
         ├─ db/repository.py ─────────┤（SQLite WAL：掛單/收益/狀態）
         └─ notify/line_messaging.py ─┘（LINE Messaging API push）
 ```
@@ -56,8 +57,10 @@ ShuyuLendingBot/
 │   │                            # （金額拆分、風控上限、成交價下限、利率量化共用）
 │   └── frr_plus.py             # FrrPlusStrategy：舊的 FRR 加減碼，保留供對照
 ├── core/
-│   └── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
-│                                # FailureTracker、離開碼常數（M4 由 main.py 移入）
+│   ├── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
+│   │                            # FailureTracker、離開碼常數（M4 由 main.py 移入）
+│   └── hold_time.py            # 實際持有時間量測：右設限分開報、完成率取代
+│                                # 「借滿」二分類、小樣本不報中位數（D040 新增）
 ├── db/
 │   ├── models.py               # loan_offers / earnings_daily / funding_positions /
 │   │                            # bot_state / offer_wait_forecasts 的 DDL
@@ -71,12 +74,13 @@ ShuyuLendingBot/
 │   └── exceptions.py           # RetryableError / FatalError / SkipCycleError
 ├── scripts/                    # 維運腳本，皆不在主程式執行路徑上、皆只用標準函式庫
 │   ├── healthcheck.py          # 容器內：唯讀讀 bot_state 心跳（M4 新增，見 D016）
+│   ├── hold_report.py          # 實際持有時間報告：唯讀開 DB，隨時可跑（D040 新增）
 │   └── notify_failure.py       # 主機端：systemd 失效告警（M4 新增，見 D020）
 ├── systemd/
 │   ├── shuyu-lending-bot.container        # 正式部署的 Quadlet 單元（D017、D020）
 │   ├── shuyu-lending-bot-alert.service    # OnFailure= 觸發的告警單元（D020）
 │   └── bfx-lending-bot.service            # 本機測試用，非正式部署路線
-├── tests/                      # 三層測試 312 項（M4 新增，見 DECISIONS.md D015、D016）
+├── tests/                      # 三層測試 575 項（M4 新增，見 DECISIONS.md D015、D016）
 │   ├── conftest.py             # 共用 fixture 與測試替身（FakeLogger／FakeNotifier／repository）
 │   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端、告警腳本
 │   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重、離開碼與退出路徑
@@ -193,6 +197,18 @@ ShuyuLendingBot/
 - `main.py`：只做 bootstrap——載入 secrets 與 `config.yaml`、建好 logger／notifier／策略／
   交易所客戶端／`Repository`，組成 `BotEngine` 後把它回傳的離開碼交給作業系統。
   這裡不該再出現任何巡檢邏輯。
+- `core/hold_time.py`：**實際持有時間量測，只量測不做決策**（D040）。把
+  `funding_positions` 的 `opened_at` / `closed_at` 換算成「借出去的錢待了多久」，
+  對照 `expected_value.py` 那個「每筆都借滿天期」的假設（實測平均完成率 32.1%）。
+  三個誠實度來源跟數字並排而不收進腳註：**仍在借出中的部位是右設限樣本**
+  （只貢獻 `censored` 計數，不進平均，敘述改口說「至少」——同 D039 對排隊位置的語氣）、
+  **`closed_at` 是偵測時間不是實際還款時間**（每筆被高估 0～一個巡檢間隔）、
+  **`opened_at` 可能為 None 而退用 `first_seen_at`**（近似值，筆數單獨報）。
+  「借滿」不做二分類，回報**完成率**並把門檻一起印出來；
+  **樣本少於 3 筆就不報中位數，直接攤開原始值**——偶數筆的中位數會插值，
+  插出來的是資料裡不存在的數（D040 決定五）。
+- `scripts/hold_report.py`：`core/hold_time.py` 的彙總報告，唯讀開 DB（同 healthcheck
+  的原則：報告不該有副作用）。`python3 scripts/hold_report.py` 隨時可跑。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
 - `scripts/healthcheck.py`：容器 healthcheck 的執行檔，唯讀開啟 SQLite 讀 `bot_state.last_run_at`，
   心跳超過「巡檢間隔 × 3 + 60 秒」（可由 `engine.health_max_silence_seconds` 覆寫）就以

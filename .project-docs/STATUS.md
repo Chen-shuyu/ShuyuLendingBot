@@ -5,7 +5,7 @@
 >
 > **硬上限 120 行。** 超過就代表有東西該往下層搬，不是把上限調大。
 >
-> 最後更新：**2026-08-23 15:10**（main `5a16240`）
+> 最後更新：**2026-08-23 15:35**（main `d3b643c` ＋ 文件重整 PR-B）
 
 ## 一句話
 
@@ -27,8 +27,9 @@
 
 - **策略 `expected_value`**（D035／D038）：掛在哪個價位由「利率 × 借出期間 ÷
   (等待 + 借出期間)」最大的那一個決定，等待時間每輪從 1 小時 K 線重估
-- **部署**：Podman ＋ systemd Quadlet，巡檢間隔 600 秒。容器自 **08-23 12:20:44**
-  起 `healthy`、`NRestarts=0`
+- **部署**：Podman ＋ systemd Quadlet，巡檢間隔 600 秒。
+  **健康狀態不寫在這裡**（寫下來的當下就開始過期）——隨時可查：
+  `podman ps` 或 `python3 scripts/healthcheck.py`
 - **測試 587 項**（單元＋功能 561、整合 26）
 - **已知限制**（都是刻意的，不是疏漏）：公式假設借滿 48h 但實測完成率只有 32.1%
   （D040，要等 M2 才改）、天期寫死 2 天、市場資料尚未落地所以無法回測
@@ -61,7 +62,8 @@
 |---|---|---|
 | **L1 現在** | **本檔** ＋ [TASKS.md](TASKS.md) | **每次對話開場只讀這兩份** |
 | **L2 為什麼** | [DECISIONS.md](DECISIONS.md)（含索引表）、[ARCHITECTURE.md](ARCHITECTURE.md)、[PLAN.md](PLAN.md) | 要改動、要查某個決策的理由時 |
-| **L3 當時發生什麼** | [PROGRESS.md](PROGRESS.md)、[CHANGELOG.md](CHANGELOG.md)、[archive/](archive/) | 明確要查歷史時。**入口是 [archive/README.md](archive/README.md)** |
+| **L3 當時發生什麼** | [PROGRESS.md](PROGRESS.md)（最近 7 個工作日 ＋ 全期索引）、[CHANGELOG.md](CHANGELOG.md)（上線後） | 想知道某天發生什麼 |
+| | **[archive/](archive/)** | 更早的歷史。**入口是 [archive/README.md](archive/README.md)**，那裡有完整的「想查什麼→去哪裡」對照表 |
 
 **程式碼註解裡的 `見 D0xx` 一律指向 [DECISIONS.md](DECISIONS.md)**（共 141 處）。
 

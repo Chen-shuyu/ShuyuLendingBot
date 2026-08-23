@@ -460,3 +460,99 @@ class TestChosenForecast:
         line = strategy.describe_decision()
         assert f"選中年化 {annual(forecast['rate']):.2f}%" in line
         assert f"平均 {forecast['mean_hours']:.1f}h" in line
+
+
+class TestEvaluationDoesNotLeakAcrossRounds:
+    """本輪沒評估過，就不可以拿上一輪的決策充數（D041）。
+
+    **既有的 `test_沒評估過就不硬掰` 抓不到這件事**，因為它從一個全新的策略物件
+    出發——而全新物件的 `last_evaluation` 本來就是空的。真實運作裡策略物件活得
+    跟行程一樣久，一輪一輪重複用，**bug 只在第二次呼叫才現形**。
+    這正是 D027 那句「測試看到的世界比真實世界乾淨」的又一次現身。
+
+    現場代價：2026-08-21 22:34 資金借出、餘額掉到門檻以下之後，日誌連續 21 小時、
+    87 輪以上印出位元組完全相同的一行「期望值定價：113 個候選價位，選中年化
+    9.50%……」，而同一輪的鄰行寫著「可用餘額 0.01 USD 低於下限 150.00 USD」。
+    **兩行互相矛盾，而錯的是前面那行。** 08-22 19:22 容器重啟後那行整個消失
+    （新行程的清單是空的），反過來證明了先前那些全是舊資料。
+    """
+
+    def _candles(self, annual_pct=10.0, count=60):
+        return [candle(i, daily(annual_pct)) for i in range(count)]
+
+    def _evaluated_once(self, **overrides):
+        """先跑一輪會真的評估的巡檢，讓策略手上留著一份決策。"""
+        strategy = ExpectedValueStrategy(base_config(**overrides))
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.describe_decision() is not None, "前置條件：這一輪要真的評估過"
+        return strategy
+
+    def test_餘額掉到門檻以下的下一輪不再重播上一輪的決策(self):
+        """真實情境：資金借出去了，餘額只剩零頭。"""
+        strategy = self._evaluated_once()
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+
+        assert strategy.describe_decision() is None
+
+    def test_落DB的那一半也不可以重播(self):
+        """`chosen_forecast()` 與 `describe_decision()` 共用同一個清單。
+
+        今天只有掛單成功那條路會呼叫它，所以 `offer_wait_forecasts` 沒被汙染過
+        ——但那是呼叫順序的巧合，不是設計上的保證。校準資料一旦混進上一輪的預估，
+        「預估 vs 實際」就再也對不起來，而那正是 D038 建起來的東西。
+        """
+        strategy = self._evaluated_once()
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+
+        assert strategy.chosen_forecast() is None
+
+    def test_拿不到K線的那一輪也不重播(self):
+        """另一個在 `choose_rate()` 之前就出局的出口。"""
+        strategy = self._evaluated_once()
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=[]
+        )
+
+        assert strategy.describe_decision() is None
+
+    def test_成交樣本不足的那一輪也不重播(self):
+        """第三個出口：算不出常態成交價。"""
+        strategy = self._evaluated_once()
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=[], candles=self._candles()
+        )
+
+        assert strategy.describe_decision() is None
+
+    def test_反向斷言_不可以印出上一輪那一行的內容(self):
+        """釘住的是「不重播」，不只是「回傳 None」。
+
+        只斷言 `is None` 的話，把整個方法改成永遠回傳 `None` 也會過——
+        那是把「偷偷講錯」換成「偷偷不講」。
+        """
+        strategy = self._evaluated_once()
+        上一輪 = strategy.describe_decision()
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+
+        assert strategy.describe_decision() != 上一輪
+
+    def test_下一輪重新評估後又講得出話來(self):
+        """對照組：**不是把這個能力關掉**，只是不准跨輪沿用。"""
+        strategy = self._evaluated_once()
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.describe_decision() is None
+
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.describe_decision() is not None

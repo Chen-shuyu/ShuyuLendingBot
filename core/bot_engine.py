@@ -119,6 +119,13 @@ class BotEngine:
         # 一天 144 則、不到兩天就把每月 200 則的額度燒光（見 D024）。
         # 狀態只放記憶體、不落 DB：重啟後回到 None，下一次掛單成功會推一則
         # 「啟動後首輪」——那正是部署完最想確認的事，不算浪費額度。
+        #
+        # **這個值必須跟著「看到的」走，不能只跟著「我們做了什麼」走**（D041）。
+        # 原本只有掛單成功／掛單消失兩條路會更新它，而新策略下最常走的是
+        # 「維持不動」——那條路提早 return，於是場上明明躺著我們的單，這個值
+        # 卻一直留在 None。後果是啟動後第一次真的掛單會被講成「啟動後首輪」，
+        # 半夜看到會誤以為機器人重啟過（TASKS.md D2）。
+        # `existing` 每輪都從交易所抓回來，真相一直在手上，只是沒有人去用它。
         self._offers_live = None
 
     def run_once(self) -> None:
@@ -141,7 +148,13 @@ class BotEngine:
         if frr is None or frr <= 0:
             # 略過也要寫狀態：機器人是活著且判斷正確的，心跳不該因此中斷。
             self.repository.save_state(last_action="FRR 無效，略過本輪")
-            self._note_offers_absent("FRR 無效，本輪沒有掛單", explained=filled)
+            # **FRR 讀不到，跟「我們的單不見了」是兩件事**（D041）。原本這裡無條件
+            # 當成後者，於是場上明明還掛著單，卻會推一則「掛單已不在場上」出去
+            # ——半夜看到只會以為單被吃了或被撤了，而真相是一次讀值失敗。
+            if existing:
+                self._note_offers_unchanged(existing)
+            else:
+                self._note_offers_absent("FRR 無效，本輪沒有掛單", explained=filled)
             raise SkipCycleError("FRR 無效（None 或非正值），跳過本輪，避免用錯誤利率掛單")
 
         book = self._fetch_book()
@@ -170,6 +183,7 @@ class BotEngine:
                     f"本輪不產生新計畫（{skip_reason}），"
                     f"但場上已有 {len(existing)} 筆掛單，維持不動以保住排隊位置。"
                 )
+                self._note_offers_unchanged(existing)
                 raise SkipCycleError("本輪無新掛單計畫，維持場上既有掛單")
 
             # **不要再寫死「可放貸金額不足」**（TASKS.md A1）。策略有六個出口會回傳
@@ -199,6 +213,7 @@ class BotEngine:
                 f"掛單條件與場上 {len(existing)} 筆一致（利率容差 {self.rate_tolerance_pct}%），"
                 "維持不動以保住排隊位置。"
             )
+            self._note_offers_unchanged(existing)
             return
 
         # **用確定的利息去換估出來的速度，要先證明划得來。** 這是 2026-08-16 19:31 的
@@ -214,6 +229,7 @@ class BotEngine:
                 f"候選價位比場上那張單低，而排隊位置的改善補不回少收的利息"
                 f"（{not_worth_it}），維持不動。"
             )
+            self._note_offers_unchanged(existing)
             return
 
         cancelled = self.client.cancel_active_offers("USD")
@@ -237,6 +253,7 @@ class BotEngine:
                     f"已送出取消，但場上仍有 {len(still_live)} 筆掛單（可能尚未生效，"
                     "也可能已經成交）。本輪不重掛，等下一輪重新判斷。"
                 )
+                self._note_offers_unchanged(still_live)
                 raise SkipCycleError("取消尚未生效，場上仍有掛單，本輪不重掛")
 
             # 取消後一定要用**真實餘額**重算，不能沿用 `disposable_usd`：
@@ -814,6 +831,23 @@ class BotEngine:
         if self._offers_live is True and not explained:
             self._push_trade_event(messages.offers_gone(reason))
         self._offers_live = False
+
+    def _note_offers_unchanged(self, existing) -> None:
+        """本輪沒有動場上的單：把**觀察到的**狀態記下來，不推任何通知（D041）。
+
+        與另外兩個 `_note_*` 的差別是它**不描述一個轉換**，只是把交易所回來的
+        事實登記進來。所以這裡不推播——什麼都沒發生，推了就是製造雜訊，而每月
+        只有 200 則（D024）。
+
+        **為什麼需要它**：`_note_offers_placed()` / `_note_offers_absent()` 記的是
+        「我們做了什麼」，而新策略下最常走的路是**什麼都不做**（2026-08-21 那 36
+        小時裡 123 輪選中的價位一次都沒變）。那條路上場上狀態沒人登記，於是
+        `_offers_live` 留在 `None`，下一次真的掛單就被講成「啟動後首輪」。
+
+        傳進來的是本輪實際看到的掛單清單，空清單也照實記——**這個方法的職責是
+        誠實轉錄，不是挑好消息記**。
+        """
+        self._offers_live = bool(existing)
 
     def run_forever(self) -> int:
         """啟動檢查後進入常駐主迴圈，回傳離開碼。"""

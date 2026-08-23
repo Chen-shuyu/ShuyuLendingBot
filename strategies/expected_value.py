@@ -163,8 +163,12 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 要換算成小時才能跟借出期間相加。
         self.candle_hours = float(strategy_config.get("candle_hours", 1.0))
 
-        # 最近一次 `choose_rate()` 的完整評估結果，供迴圈層寫日誌用。
+        # **本輪** `choose_rate()` 的完整評估結果，供迴圈層寫日誌用。
         # **策略層仍然不碰 IO**：這裡只是把算過的東西留下來，不主動輸出。
+        #
+        # 「本輪」三個字是 D041 的重點：這個清單一旦跨輪留著，就會被下一輪
+        # 當成自己的決策報出去。重置點在 `build_offer_plan()` 的開頭，
+        # 與 `last_skip_reason` 並排——那裡才是「新的一輪開始了」。
         self.last_evaluation: List[Dict[str, float]] = []
 
 
@@ -178,7 +182,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         return daily_rate * 365 * 100
 
     def describe_decision(self) -> Optional[str]:
-        """把最近一次定價決策濃縮成一行，供迴圈層寫日誌（策略層不碰 IO）。
+        """把**本輪**的定價決策濃縮成一行，供迴圈層寫日誌（策略層不碰 IO）。
 
         **這個方法存在的理由就是 D033 的教訓**：那次用半價把 344 USD 借出去，
         事後翻日誌只有「掛出 344.30 USD，利率 0.000150」——**沒有任何一個數字
@@ -186,6 +190,11 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         日誌看得到最後的價格，看不到它是怎麼被選出來的。
 
         回傳 `None` 代表這一輪沒有評估過任何候選價位（例如餘額不足就先出局了）。
+        **這個契約一度是假的**：`last_evaluation` 只在 `choose_rate()` 內重置，
+        而餘額守門檻在那之前就 return，於是資金一借出，這裡就把上一輪的決策
+        當成本輪的報出去——2026-08-21 22:34 起連續 21 小時、87 輪以上，
+        每一輪都印出位元組完全相同的一行，而鄰行寫著「可用餘額 0.01 USD
+        低於下限 150.00 USD」。修正見 D041。
         """
         if not self.last_evaluation:
             return None
@@ -219,7 +228,10 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         （掛單時間與成交時間都已經在 DB 裡），但「掛出去那一刻我們以為要等多久」
         只存在於這一輪的記憶體。少了它，事後就只能拿今天的模型解釋昨天的決定。
 
-        回傳 `None` 代表這一輪沒有評估過任何候選價位。
+        回傳 `None` 代表這一輪沒有評估過任何候選價位。**與
+        `describe_decision()` 共用同一個清單，所以也共用 D041 那個陳舊問題**
+        ——落 DB 這條路今天沒被汙染純屬呼叫順序的巧合（只在掛單成功後才呼叫，
+        而那條路必定剛評估過），不是設計上的保證。
         """
         if not self.last_evaluation:
             return None
@@ -362,6 +374,14 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
     ) -> List[OfferPlan]:
         """依餘額與 K 線的期望值定價產生掛單計畫。`frr` 與 `book` 只作記錄用途。"""
         self.last_skip_reason = None
+        # **這一行是 D041 的修正本體。** 底下有六個出口會在 `choose_rate()` 之前
+        # 就 return，而評估結果原本只在 `choose_rate()` 內重置——走那六條路的輪次
+        # 因此繼承了上一輪的評估，並被 `describe_decision()` 當成本輪的決策報出去。
+        #
+        # 重置點放在這裡而不是那六個出口各補一次，是因為「新的一輪開始了」只有
+        # 一個位置，而在每個出口補一次的作法，正是這個 bug 當初的成因：
+        # 漏掉任何一條就再犯一次，而且漏掉的那條不會有人發現。
+        self.last_evaluation = []
 
         if balance_usd < self.min_required_usd:
             return self._skip(

@@ -466,7 +466,14 @@ class TestTradeEventNotifications:
     def test_invalid_frr_also_counts_as_offers_gone(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep
     ):
-        """FRR 抓不到同樣代表這一輪場上沒有我們的單——單已經在流程開頭被取消了。"""
+        """場上**本來就沒有**我們的單時，FRR 抓不到仍然要說一聲。
+
+        原本這句 docstring 寫的是「單已經在流程開頭被取消了」，而那是**錯的**
+        ——真實流程裡取消發生在 FRR 檢查之後。這條測試之所以一直綠燈，是因為
+        `FakeClient` 從不把掛出去的單放回場上（D027），於是「場上還有單」
+        這個情境在替身世界裡根本不存在。對照組見
+        `TestOnFieldStateFollowsWhatWeSaw`（D041）。
+        """
         client = FakeClient(balance=600.0)
         engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
         engine.run_once()
@@ -1514,3 +1521,134 @@ class TestHoldTimeIsLogged:
         engine.run_once()
 
         assert not any("佔預定" in message for message in fake_logger.messages["info"])
+
+
+class TestOnFieldStateFollowsWhatWeSaw:
+    """場上有沒有我們的單，要以**看到的**為準，不是以「我們做了什麼」推論（D041）。
+
+    `_offers_live` 原本只有兩條路會更新：掛單成功、掛單消失。而新策略下最常走的
+    是第三條——**什麼都不做**（2026-08-21 那 36 小時裡 123 輪選中的價位一次都沒
+    變過）。那條路提早 return，場上狀態沒人登記，於是這個值一直留在 `None`。
+
+    兩個後果，都是「不是沒講，是講錯」（D026 家族）：
+
+    1. 啟動後第一次真的掛單被講成「啟動後首輪」——半夜看到會以為機器人重啟過
+       （TASKS.md D2）
+    2. FRR 讀不到時無條件當成「單不見了」，但那一刻單還好端端掛在場上
+
+    `existing` 每輪都從交易所抓回來，真相一直在手上，只是沒有人去用它。
+    """
+
+    @staticmethod
+    def _maintain_then_repost(fake_logger, fake_notifier, strategy, repository):
+        """先走一輪「維持不動」，再走一輪**重掛**——D2 現形的那個順序。
+
+        重掛而不是成交，是這個情境的關鍵：`_note_offers_absent()` 無論如何都會把
+        狀態寫成 `False`，所以中間只要夾一輪「場上沒單」，後面就正常了。
+        真正漏掉的是**維持不動 → 重掛**這條沒有經過任何 `_note_*` 的路
+        ——2026-08-20 15:15 那則推播就是這樣來的，而容器已經跑了 15 小時。
+
+        場上那張單掛得比新計畫**低**，所以重掛是往上調價，不會被 D034 的閘門擋下。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004)])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+
+        engine.run_once()                      # 第一輪：條件沒變，維持不動
+        assert fake_notifier.sent == [], "維持不動的輪次不該推任何東西"
+
+        client.active_offers = [live_offer(rate=0.0003)]   # 場上這張變得比計畫便宜
+        engine.run_once()                      # 第二輪：往上重掛
+        assert client.offers, "這一輪應該真的掛出新單，否則這個測試沒測到東西"
+        return engine
+
+    def test_維持不動之後的重掛不推播(self, fake_logger, fake_notifier,
+                                      strategy, repository, no_sleep):
+        """D2 的原始情境：容器啟動後第一個動作就是「維持不動」。
+
+        真實日誌裡這是最常見的開局——部署挑在資金借出、場上有單的時候做，
+        重啟後第一輪必然走「條件沒變，維持不動」。
+
+        **修好之後那則訊息不是換句話說，而是根本不該送。** 通知推的是狀態轉換
+        （D029）：場上本來有我們的單，重掛之後場上還是有我們的單，**沒有轉換**。
+        修正前這裡會送出一則「啟動後首輪掛單已送出」——訊息是假的，額度是真的，
+        而每月只有 200 則（D024）。
+        """
+        self._maintain_then_repost(fake_logger, fake_notifier, strategy, repository)
+
+        assert fake_notifier.sent == []
+
+    def test_反向斷言_那則通知不再說啟動後首輪(self, fake_logger, fake_notifier, strategy,
+                                                repository, no_sleep):
+        """釘住的是**語氣**，不只是「有推一則」。
+
+        修正前這裡會是「啟動後首輪掛單已送出」，而容器其實已經跑了一輪以上。
+        """
+        self._maintain_then_repost(fake_logger, fake_notifier, strategy, repository)
+
+        assert not any("啟動後首輪" in message for message in fake_notifier.sent)
+
+    def test_FRR讀不到時場上還有單就不可以說單不見了(self, fake_logger, fake_notifier,
+                                                     strategy, repository, no_sleep):
+        """FRR 讀不到，跟「我們的單不見了」是兩件事。
+
+        原本這裡無條件推「掛單已不在場上」。真實流程裡取消發生在 FRR 檢查**之後**，
+        所以那一刻單根本還在場上——推出去的是一則假消息。
+        """
+        # 第一輪真的掛出去，讓「場上有我們的單」這件事先成立——否則 `_offers_live`
+        # 停在 `None`，這個測試會因為根本沒推東西而假性通過。
+        client = FakeClient(balance=600.0, frr=0.0002)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+        assert engine._offers_live is True
+
+        # 替身不會自動把掛出去的單放回場上（D027：替身比真實世界乾淨），手動補上
+        client.active_offers = [live_offer()]
+        client.balance = 0.0
+        client.frr = None
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert not any("掛單已不在場上" in message for message in fake_notifier.sent)
+
+    def test_FRR讀不到而場上真的沒單時仍然要說(self, fake_logger, fake_notifier, strategy,
+                                               repository, no_sleep):
+        """上一條的對照組：**不是把這個出口整個關掉**，只是讓它先看一眼場上。"""
+        client = FakeClient(balance=600.0, frr=0.0002)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+
+        client.frr = None
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert "掛單已不在場上" in fake_notifier.sent[1]
+        assert "FRR 無效" in fake_notifier.sent[1]
+
+    def test_取消未生效時場上仍有單要照實記(self, fake_logger, fake_notifier, strategy,
+                                            repository, no_sleep):
+        """2026-08-16 19:31 那一輪的形狀：回應說取消了，單其實還在場上。
+
+        那一輪之後場上是**有**單的，所以下一輪掛上去要說「重新上線」；
+        若這裡漏記，同樣會退化成「啟動後首輪」。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)],
+                            cancel_takes_effect=False)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert engine._offers_live is True
+
+    def test_策略無新計畫但場上有單要記成有單(self, fake_logger, fake_notifier, strategy,
+                                             repository, no_sleep):
+        """「這個市場現在不值得掛，但場上那張單留著」——也是什麼都沒動的一條路。"""
+        # 場上那張單金額很小，可動用的錢因此低於單筆最小量——策略給不出計畫，
+        # 但那張單還躺在場上。
+        client = FakeClient(balance=0.0, frr=0.0002, active_offers=[live_offer(amount=1.0)])
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        with pytest.raises(SkipCycleError):
+            engine.run_once()
+
+        assert engine._offers_live is True

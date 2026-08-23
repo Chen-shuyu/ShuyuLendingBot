@@ -194,6 +194,145 @@ class Repository:
         ).fetchone()
         return dict(row) if row else None
 
+    def record_market_snapshot(
+        self,
+        currency: str,
+        frr: Optional[float],
+        book: Optional[Dict[str, Any]] = None,
+        trades: Optional[Dict[str, Any]] = None,
+        candles: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """記下這一輪市場長什麼樣（M1）。三份摘要由 `core.market_snapshot` 產生。
+
+        **三份摘要都可以是 `None`**：策略用不到的端點根本不會去打
+        （`requires_book` / `requires_trades` / `requires_candles`），
+        而抓回來是空清單也是一種真實情況。那些欄位就留 NULL——
+        **「沒觀測到」跟「觀測到 0」是兩件事**，用 0 填會讓事後分析
+        把一段沒有資料的期間讀成一段市場死掉的期間。
+
+        **三份全都是 `None`、而且連 FRR 都沒有，才不寫列。** 一列除了時間什麼都沒有的
+        紀錄對 M2 沒有用處，只會讓「這段期間有幾筆觀測」這個數字說謊；
+        但只有 FRR 的一列仍然值得存——`bot_state.last_frr` 是單列表，每輪覆蓋，
+        **FRR 的歷史除了這裡沒有第二個地方留得下來**。
+        """
+        if book is None and trades is None and candles is None and frr is None:
+            return
+
+        book = book or {}
+        trades = trades or {}
+        candles = candles or {}
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO market_snapshots
+                    (captured_at, currency, frr,
+                     book_levels, book_lowest_rate, book_highest_rate, book_truncated,
+                     book_total_amount, book_curve_json, book_period_totals_json,
+                     trade_count, trade_span_minutes, trade_latest_mts, trade_volume,
+                     trade_rate_min, trade_rate_median, trade_rate_weighted_median,
+                     trade_rate_max, trade_period_rates_json, trade_period_counts_json,
+                     candle_count, candle_latest_mts, candle_high_median,
+                     candle_high_p75, candle_high_max, candle_close_latest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso(),
+                    currency,
+                    None if frr is None else float(frr),
+                    book.get("levels"),
+                    book.get("lowest_rate"),
+                    book.get("highest_rate"),
+                    # SQLite 沒有布林型別；存 0/1 而不是 'true'/'false'，
+                    # 這樣 `WHERE book_truncated = 1` 這種查詢才不必記得引號。
+                    None if book.get("truncated") is None else int(bool(book["truncated"])),
+                    book.get("total_amount"),
+                    book.get("curve_json"),
+                    book.get("period_totals_json"),
+                    trades.get("count"),
+                    trades.get("span_minutes"),
+                    trades.get("latest_mts"),
+                    trades.get("volume"),
+                    trades.get("rate_min"),
+                    trades.get("rate_median"),
+                    trades.get("rate_weighted_median"),
+                    trades.get("rate_max"),
+                    trades.get("period_rates_json"),
+                    trades.get("period_counts_json"),
+                    candles.get("count"),
+                    candles.get("latest_mts"),
+                    candles.get("high_median"),
+                    candles.get("high_p75"),
+                    candles.get("high_max"),
+                    candles.get("close_latest"),
+                ),
+            )
+
+    def record_candles(self, currency: str, period: int, timeframe: str, candles) -> int:
+        """把 K 線一根一列寫進 `market_candles`，回傳這一次實際寫了幾根。
+
+        **只寫「已存最新那根以後」的部分**：巡檢 600 秒一輪、K 線一小時一根，
+        整個窗每輪重寫一次等於一天三萬多次 UPSERT 去講 24 根 K 的事。
+        第一次會把整個窗都存下來（那是想要的），之後每輪通常只有 1～2 根。
+
+        **邊界要含「等於」，不能只寫更新的**：已存的最新那根當時可能還在成形中，
+        它的 high／close／volume 之後還會變大。少了這個等號，每根 K 都會被凍結在
+        它剛出生那一刻的樣子——而 `high` 正是這個策略唯一在意的欄位（D035）。
+        """
+        if not candles:
+            return 0
+
+        row = self.connection.execute(
+            """
+            SELECT MAX(mts) AS latest FROM market_candles
+            WHERE currency = ? AND period = ? AND timeframe = ?
+            """,
+            (currency, int(period), timeframe),
+        ).fetchone()
+        latest = row["latest"] if row and row["latest"] is not None else None
+
+        pending = [
+            candle
+            for candle in candles
+            if latest is None or int(candle["mts"]) >= latest
+        ]
+        if not pending:
+            return 0
+
+        stamp = now_iso()
+        with self.connection:
+            self.connection.executemany(
+                """
+                INSERT INTO market_candles
+                    (currency, period, timeframe, mts, open, close, high, low,
+                     volume, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(currency, period, timeframe, mts) DO UPDATE SET
+                    open       = excluded.open,
+                    close      = excluded.close,
+                    high       = excluded.high,
+                    low        = excluded.low,
+                    volume     = excluded.volume,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        currency,
+                        int(period),
+                        timeframe,
+                        int(candle["mts"]),
+                        float(candle["open"]),
+                        float(candle["close"]),
+                        float(candle["high"]),
+                        float(candle["low"]),
+                        float(candle["volume"]),
+                        stamp,
+                    )
+                    for candle in pending
+                ],
+            )
+        return len(pending)
+
     def upsert_daily_earning(
         self,
         date: str,

@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """資料表結構定義（DDL）。
 
-三張表對應 archive/SHUYU_PROJECT_PLAN.md 第 4.2 節：
+最初三張表對應 archive/SHUYU_PROJECT_PLAN.md 第 4.2 節，之後陸續長到七張：
 
 - `loan_offers`：掛單流水，每一筆掛單嘗試（成功或失敗）都留一列。
 - `earnings_daily`：每日收益彙總。目前只建表與介面，尚未接上資料來源
-  （需另走 Bitfinex ledger 端點查利息入帳，見 TASKS.md）。
+  （需另走 Bitfinex ledger 端點查利息入帳，見 TASKS.md P2-2）。
 - `bot_state`：單列狀態表，供崩潰後恢復與外部健康檢查讀取。
+- `funding_positions`：已借出部位，成交偵測與持有時間量測的依據。
+- `offer_wait_forecasts`：掛單當下對「要等多久」的預估，供事後校準（D038）。
+- `market_snapshots`：每輪一列的市場快照（M1）。
+- `market_candles`：利率 K 線，一根一列（M1）。
 
-時間一律以 UTC 的 ISO 8601 字串存放，避免容器與主機時區不一致造成誤判。
+時間一律以帶時區偏移的 ISO 8601 字串存放（見 `repository.now_iso()`），
+避免容器與主機時區不一致造成誤判；交易所給的毫秒時間戳則原樣留在 `*_mts` 欄位，
+**不轉換**——那是對帳時唯一不會因為時區設定而跑掉的欄位。
 """
 
 # 掛單流水。
@@ -118,6 +124,86 @@ CREATE TABLE IF NOT EXISTS offer_wait_forecasts (
 );
 """
 
+# 每輪一列的市場快照（M1 市場資料落地）。
+#
+# **為什麼一定要落地**：在這張表之前，DB 有掛單、部位、收益、狀態、等待預估五張表，
+# **沒有任何一張存過市場長什麼樣**。每次分析都得重抓即時資料，用完就丟，
+# 而歷史再也回不去——D3（「一根 K 滾出 168 小時窗，價格目標就自己跳一階」）
+# 到現在無法證實，正是因為當時的簿子與候選集都沒有存下來。
+#
+# **這張表只存觀測，不存決策。** 每個欄位都算自本輪剛抓回來的原始資料，
+# 不碰策略物件的任何跨輪狀態（理由見 `core/market_snapshot.py` 的模組說明）。
+# 本輪選中的價位與候選集屬於 M1-b，等 D041 在正式環境驗收過再進來。
+#
+# 曲線與天期分佈用 JSON 存在單一欄位：它們是「一起讀才有意義」的一組數字，
+# 拆成欄位會變成二十幾個 `curve_05` / `curve_10`，而且點數一改就要動 schema。
+#
+# **成本是實測的，不是估的**（2026-08-23 拿真實回應量過）：一列約 1.2 KB，
+# 加上 K 線每輪 1～2 根，巡檢 600 秒一輪等於一天約 190 KB、一年約 68 MB。
+# TASKS.md 原本寫「每輪幾百位元組」，那是還沒把簿子曲線算進去時的估計。
+CREATE_MARKET_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at               TEXT    NOT NULL,
+    currency                  TEXT    NOT NULL,
+    frr                       REAL,
+    book_levels               INTEGER,
+    book_lowest_rate          REAL,
+    book_highest_rate         REAL,
+    book_truncated            INTEGER,
+    book_total_amount         REAL,
+    book_curve_json           TEXT,
+    book_period_totals_json   TEXT,
+    trade_count               INTEGER,
+    trade_span_minutes        REAL,
+    trade_latest_mts          INTEGER,
+    trade_volume              REAL,
+    trade_rate_min            REAL,
+    trade_rate_median         REAL,
+    trade_rate_weighted_median REAL,
+    trade_rate_max            REAL,
+    trade_period_rates_json   TEXT,
+    trade_period_counts_json  TEXT,
+    candle_count              INTEGER,
+    candle_latest_mts         INTEGER,
+    candle_high_median        REAL,
+    candle_high_p75           REAL,
+    candle_high_max           REAL,
+    candle_close_latest       REAL
+);
+"""
+
+CREATE_MARKET_SNAPSHOTS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_captured_at
+    ON market_snapshots (captured_at);
+"""
+
+# 利率 K 線，**一根一列**，主鍵天然去重。
+#
+# 為什麼不塞進 `market_snapshots`：K 線每小時才換一根，而巡檢 600 秒一輪。
+# 每輪存一份 240 根的窗，等於一天寫三萬多列去講 24 根 K 的事。
+#
+# **UPSERT 而不是 INSERT OR IGNORE**：最新那一根還在成形中，
+# 它的 high／close／volume 每一輪都可能變大。舊的 K 已經定案，重寫是同值覆蓋。
+#
+# 附帶好處：時間一久，這張表存的 K 線歷史會長得比 API 一次取得到的還長，
+# 而那正是 M2 回測工具需要的東西。
+CREATE_MARKET_CANDLES = """
+CREATE TABLE IF NOT EXISTS market_candles (
+    currency   TEXT    NOT NULL,
+    period     INTEGER NOT NULL,
+    timeframe  TEXT    NOT NULL,
+    mts        INTEGER NOT NULL,
+    open       REAL    NOT NULL,
+    close      REAL    NOT NULL,
+    high       REAL    NOT NULL,
+    low        REAL    NOT NULL,
+    volume     REAL    NOT NULL,
+    updated_at TEXT    NOT NULL,
+    PRIMARY KEY (currency, period, timeframe, mts)
+);
+"""
+
 ALL_STATEMENTS = (
     CREATE_LOAN_OFFERS,
     CREATE_LOAN_OFFERS_INDEX,
@@ -126,5 +212,8 @@ ALL_STATEMENTS = (
     CREATE_FUNDING_POSITIONS_INDEX,
     CREATE_BOT_STATE,
     CREATE_OFFER_WAIT_FORECASTS,
+    CREATE_MARKET_SNAPSHOTS,
+    CREATE_MARKET_SNAPSHOTS_INDEX,
+    CREATE_MARKET_CANDLES,
     INIT_BOT_STATE_ROW,
 )

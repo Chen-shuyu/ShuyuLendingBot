@@ -1652,3 +1652,161 @@ class TestOnFieldStateFollowsWhatWeSaw:
             engine.run_once()
 
         assert engine._offers_live is True
+
+
+def snapshots_in_db(repository):
+    return [
+        dict(row)
+        for row in repository.connection.execute(
+            "SELECT * FROM market_snapshots ORDER BY id"
+        )
+    ]
+
+
+def candles_in_db(repository):
+    return [
+        dict(row)
+        for row in repository.connection.execute(
+            "SELECT * FROM market_candles ORDER BY mts"
+        )
+    ]
+
+
+class TestMarketSnapshotLands:
+    """市場快照每輪都要落地（M1 市場資料落地）。
+
+    **這一組測試的重點是「哪些輪次也要留下紀錄」，不是欄位算得對不對**
+    （那在 `tests/unit/test_market_snapshot.py`）。
+
+    落地點放在所有提早 `raise SkipCycleError` 的出口之前，是因為那些出口
+    正好是「市場走弱、單子空掛」的輪次——也就是最需要留下市場長相的輪次。
+    這是 D038 的同一課：閒置量測原本擺在提早 return 之後，於是永遠量不到
+    閒置最久的那些輪；差別在於日誌漏印還看得出來，**DB 漏一列事後完全無感**。
+    """
+
+    @staticmethod
+    def make_strategy(strategy_config, **overrides):
+        from strategies.expected_value import ExpectedValueStrategy
+
+        config = dict(spread_count=1, minimum_rate=0.0001, market_floor_pct=0.85,
+                      ev_min_hits=5, ev_min_candles=48)
+        config.update(overrides)
+        return ExpectedValueStrategy(strategy_config(**config))
+
+    @staticmethod
+    def candles(count=60, high=0.00026):
+        return [
+            {
+                "mts": 1_786_968_000_000 + index * 3_600_000,
+                "open": high,
+                "close": high,
+                "high": high,
+                "low": 0.0001,
+                "volume": 4_000_000.0,
+            }
+            for index in range(count)
+        ]
+
+    def make_client(self, **overrides):
+        settings = dict(
+            balance=600.0,
+            frr=0.0002,
+            book=[
+                {"rate": 0.00020, "period": 2, "amount": 1_500_000.0},
+                {"rate": 0.00030, "period": 2, "amount": 2_000_000.0},
+            ],
+            trades=market_trades(rate=0.00022),
+        )
+        settings.update(overrides)
+        client = FakeClient(**settings)
+        client.candles = self.candles()
+        return client
+
+    def test_掛單成功的一輪有留下市場長相(self, fake_logger, fake_notifier, repository,
+                                          no_sleep, strategy_config):
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        rows = snapshots_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["book_levels"] == 2
+        assert rows[0]["book_highest_rate"] == 0.00030
+        assert rows[0]["candle_count"] == 60
+        assert rows[0]["frr"] == 0.0002
+
+    def test_策略不掛單的一輪照樣留下(self, fake_logger, fake_notifier, repository,
+                                      no_sleep, strategy_config):
+        """**這是這組測試存在的理由。** 餘額不足會在掛單之前就
+        `raise SkipCycleError`——而「錢還沒回來、市場在漲」正是事後最想回頭看的期間。
+        """
+        client = self.make_client(balance=0.17)
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                     client, repository)
+
+        rows = snapshots_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["book_levels"] == 2
+
+    def test_維持場上既有掛單的一輪照樣留下(self, fake_logger, fake_notifier, repository,
+                                            no_sleep, strategy_config):
+        """場上有單、策略無新計畫 → 維持不動並提早離開。
+        單子空掛最久的那些輪次全部走這一條。"""
+        # 場上那筆刻意壓到 100 USD：加上餘額仍低於 `min_required_usd`，
+        # 策略因此回空計畫，而場上又有單 → 走「維持不動」那條提早離開的路。
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(amount=100.0, rate=0.00026)]
+        )
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                     client, repository)
+
+        assert len(snapshots_in_db(repository)) == 1
+
+    def test_FRR無效的一輪沒有市場資料可存(self, fake_logger, fake_notifier, repository,
+                                           no_sleep, strategy_config):
+        """FRR 無效會在抓市場資料**之前**就離開，所以這一輪確實什麼都沒觀測到。
+        **寫一列空的比不寫更糟**：那會讓「這段期間有幾筆觀測」這個數字說謊。"""
+        client = self.make_client(frr=0.0)
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                     client, repository)
+
+        assert snapshots_in_db(repository) == []
+
+    def test_K線一根一列而不是每輪一份窗(self, fake_logger, fake_notifier, repository,
+                                          no_sleep, strategy_config):
+        """跑三輪，K 線列數不該跟著輪數長——這正是拆成兩張表的全部理由。"""
+        strategy = self.make_strategy(strategy_config)
+        client = self.make_client()
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+
+        for _ in range(3):
+            try:
+                engine.run_once()
+            except SkipCycleError:
+                pass
+
+        assert len(candles_in_db(repository)) == 60
+        assert len(snapshots_in_db(repository)) == 3
+
+    def test_落地失敗不能拖垮巡檢(self, fake_logger, fake_notifier, repository,
+                                  no_sleep, strategy_config, monkeypatch):
+        """錢已經掛出去了，觀測資料寫不進去只該留一行警告
+        ——**讓它變成看得見的缺口，而不是靜默的空白**。"""
+        def boom(*args, **kwargs):
+            raise RuntimeError("磁碟滿了")
+
+        monkeypatch.setattr(repository, "record_market_snapshot", boom)
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert len(client.offers) == 1
+        assert any("市場快照寫入失敗" in text for text in fake_logger.messages["warning"])

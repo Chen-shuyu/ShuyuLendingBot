@@ -140,13 +140,23 @@ jobs:
           echo "--- 這次變更的檔案（基準 $BASE）---"
           printf '%s\n' "$CHANGED"
 
-          # 有任何一行不是 .project-docs/ 開頭，就代表這次不只動文件
-          if printf '%s\n' "$CHANGED" | grep -qv '^\.project-docs/'; then
+          # 純文件的判斷範圍：.project-docs/ 底下全部，再加上根目錄這幾份文件。
+          #
+          # **白名單是踩出來的，不是想出來的**（TASKS.md C2）：原本只認
+          # `^\.project-docs/`，於是 2026-08-19 與 08-23 兩次「只改文件」的推送
+          # 都因為同時動到根目錄的 README.md 而觸發部署、重啟了容器。
+          # 兩次都有對照組佐證（同一批推送裡只動 .project-docs/ 的那次沒有重啟），
+          # 所以要修的是涵蓋範圍，不是規則本身。
+          #
+          # **維持 fail-open**：上面每一條算不出來的路徑都是 docs_only=false。
+          # 多部署一次只是白重啟；少部署一次卻是程式改了但機器人還跑舊版而沒人發現。
+          DOC_PATHS='^(\.project-docs/|README\.md$|LICENSE$|\.gitignore$|\.gitattributes$)'
+          if printf '%s\n' "$CHANGED" | grep -qvE "$DOC_PATHS"; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "有 .project-docs/ 以外的變更，照常部署"
+            echo "有文件以外的變更，照常部署"
           else
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::這次只動了 .project-docs/，跳過部署——不重啟機器人，掛單維持原樣"
+            echo "::notice::這次只動了文件，跳過部署——不重啟機器人，掛單維持原樣"
           fi
 
   deploy:

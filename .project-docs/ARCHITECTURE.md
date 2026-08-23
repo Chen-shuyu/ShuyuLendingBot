@@ -59,13 +59,17 @@ ShuyuLendingBot/
 ├── core/
 │   ├── bot_engine.py           # BotEngine：run_once / run_forever 主迴圈狀態機、
 │   │                            # FailureTracker、離開碼常數（M4 由 main.py 移入）
-│   └── hold_time.py            # 實際持有時間量測：右設限分開報、完成率取代
-│                                # 「借滿」二分類、小樣本不報中位數（D040 新增）
+│   ├── hold_time.py            # 實際持有時間量測：右設限分開報、完成率取代
+│   │                            # 「借滿」二分類、小樣本不報中位數（D040 新增）
+│   └── market_snapshot.py      # 市場原始資料 → 可長期存放的摘要。**刻意不認識
+│                                # 任何策略物件**：只存觀測、不存決策（D042 新增）
 ├── db/
 │   ├── models.py               # loan_offers / earnings_daily / funding_positions /
-│   │                            # bot_state / offer_wait_forecasts 的 DDL
+│   │                            # bot_state / offer_wait_forecasts /
+│   │                            # market_snapshots / market_candles 的 DDL
 │   │                            # （funding_positions 為 D030、
-│   │                            #   offer_wait_forecasts 為 D038 新增）
+│   │                            #   offer_wait_forecasts 為 D038、
+│   │                            #   後兩張為 D042 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── notify/
 │   ├── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
@@ -194,7 +198,15 @@ ShuyuLendingBot/
   實際等待事後算得出來（掛單時間在 `loan_offers`、成交時間在 `funding_positions`），
   **「當初以為要等多久」才是不存就永遠消失的那一半**——策略每輪重算，
   記憶體裡永遠只有「現在這一輪怎麼想」。少了它就只能拿今天的模型解釋昨天的決定（D036）。
-  尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
+  `market_snapshots` / `market_candles` 是**市場長相的落地**（D042）：前者每輪一列，
+  後者一根 K 一列、主鍵天然去重——K 線每小時才換一根而巡檢 600 秒一輪，
+  塞進同一張表等於一天寫三萬多列去講 24 根 K 的事。寫入點在三個 `_fetch_*` 之後、
+  **所有提早 `raise SkipCycleError` 的出口之前**，因為那些出口正好是
+  「市場走弱、單子空掛」的輪次（D038 的同一課；日誌漏印看得出來，DB 漏一列看不出來）。
+  摘要有損的地方都有欄位承認：`book_truncated`、`trade_span_minutes`、
+  沒觀測到的欄位留 NULL 而不是 0（D039 從日誌延伸到資料表）。
+  尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）；
+  `market_snapshots` 目前只存觀測，**本輪選中的價位與候選集（M1-b）等 D041 驗收後才進來**。
 - `notify/line_messaging.py`：LINE Messaging API push（`POST /v2/bot/message/push`）。
   `send()` 永遠不拋例外——它在致命錯誤的退出路徑上被呼叫，拋例外會蓋掉原始錯誤與離開碼。
   **只送事件、不送例行**：免費方案每月 200 則，每輪巡檢推一則會在兩天內用光（見 D024）。
@@ -209,6 +221,13 @@ ShuyuLendingBot/
 - `main.py`：只做 bootstrap——載入 secrets 與 `config.yaml`、建好 logger／notifier／策略／
   交易所客戶端／`Repository`，組成 `BotEngine` 後把它回傳的離開碼交給作業系統。
   這裡不該再出現任何巡檢邏輯。
+- `core/market_snapshot.py`：把一輪抓到的簿子／成交／K 線壓成可長期存放的摘要（D042）。
+  **刻意不認識任何策略物件**：每個回傳的數字都只算自本輪剛抓回來的原始資料，
+  不讀 `last_evaluation`。這條界線寫進模組說明而不是只寫在文件裡——D041 的病是
+  跨輪殘留的狀態被當成本輪的事實報出去，而**日誌印錯還有鄰行可以拆穿，
+  DB 裡多一列假資料沒有鄰行會反駁**，何況 M2 回測工具會拿它當事實。
+  簿子存 20 點的累積曲線而不是 250 檔原始資料（一年 68 MB vs 500 MB），
+  解析度的限制寫在模組說明裡。
 - `core/hold_time.py`：**實際持有時間量測，只量測不做決策**（D040）。把
   `funding_positions` 的 `opened_at` / `closed_at` 換算成「借出去的錢待了多久」，
   對照 `expected_value.py` 那個「每筆都借滿天期」的假設（實測平均完成率 32.1%）。

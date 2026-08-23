@@ -552,3 +552,122 @@ class Test持有時間量測要用的部位查詢:
         repository.sync_positions("USD", [self.position("b")])
 
         assert [row["position_id"] for row in repository.open_positions("USD")] == ["b"]
+
+
+def make_candle(mts, high=0.0003, close=0.00029, low=0.0001, open_=0.0002, volume=1000.0):
+    return {"mts": mts, "open": open_, "close": close, "high": high, "low": low,
+            "volume": volume}
+
+
+class TestMarketSnapshot:
+    """`market_snapshots` 的寫入（M1 市場資料落地）。
+
+    這張表的資料**存下去就回不去**，而 M2 回測工具會拿它當事實。
+    所以這裡驗的是「沒觀測到的東西有沒有留成 NULL」——用 0 填會讓一段
+    沒有資料的期間被讀成一段市場死掉的期間，而那種錯誤沒有鄰行可以拆穿。
+    """
+
+    @staticmethod
+    def rows(repository):
+        return repository.connection.execute(
+            "SELECT * FROM market_snapshots ORDER BY id"
+        ).fetchall()
+
+    def test_什麼都沒觀測到就不寫列(self, repository):
+        repository.record_market_snapshot("USD", None)
+
+        assert self.rows(repository) == []
+
+    def test_只有FRR也要留下(self, repository):
+        """`bot_state.last_frr` 是單列表、每輪覆蓋，
+        **FRR 的歷史除了這裡沒有第二個地方留得下來**。"""
+        repository.record_market_snapshot("USD", 0.00031)
+
+        rows = self.rows(repository)
+        assert len(rows) == 1
+        assert rows[0]["frr"] == 0.00031
+
+    def test_沒觀測到的欄位是NULL不是零(self, repository):
+        repository.record_market_snapshot("USD", 0.0002, book={"levels": 3})
+
+        row = self.rows(repository)[0]
+        assert row["book_levels"] == 3
+        assert row["trade_count"] is None
+        assert row["candle_count"] is None
+
+    def test_截斷旗標存成整數(self, repository):
+        """存 0/1 而不是 'true'/'false'，這樣 `WHERE book_truncated = 1`
+        這種查詢才不必記得引號。"""
+        repository.record_market_snapshot("USD", 0.0002, book={"truncated": True})
+        repository.record_market_snapshot("USD", 0.0002, book={"truncated": False})
+
+        assert [row["book_truncated"] for row in self.rows(repository)] == [1, 0]
+
+    def test_每輪各留一列(self, repository):
+        for _ in range(3):
+            repository.record_market_snapshot("USD", 0.0002, trades={"count": 5})
+
+        assert len(self.rows(repository)) == 3
+
+
+class TestMarketCandles:
+    """`market_candles` 的 UPSERT（M1）。
+
+    K 線每小時才換一根、巡檢 600 秒一輪，所以這裡驗的是**寫入量**：
+    整個窗每輪重寫一次等於一天三萬多次 UPSERT 去講 24 根 K 的事。
+    """
+
+    @staticmethod
+    def stored(repository):
+        return repository.connection.execute(
+            "SELECT * FROM market_candles ORDER BY mts"
+        ).fetchall()
+
+    def test_第一次把整個窗都存下來(self, repository):
+        candles = [make_candle(index * 3_600_000) for index in range(5)]
+
+        assert repository.record_candles("USD", 2, "1h", candles) == 5
+        assert len(self.stored(repository)) == 5
+
+    def test_第二次只寫新的那幾根(self, repository):
+        candles = [make_candle(index * 3_600_000) for index in range(5)]
+        repository.record_candles("USD", 2, "1h", candles)
+
+        # 下一輪多了一根，前面四根不該被重寫。
+        extended = candles + [make_candle(5 * 3_600_000)]
+        written = repository.record_candles("USD", 2, "1h", extended)
+
+        # 已存最新那根 ＋ 新的那根 = 2（等號是刻意的，理由見下一條測試）
+        assert written == 2
+        assert len(self.stored(repository)) == 6
+
+    def test_最新那根還在成形就要跟著更新(self, repository):
+        """**邊界要含等號。** 已存的最新那根當時可能還在成形中，
+        它的 high 之後還會變大——而 `high` 正是這個策略唯一在意的欄位（D035）。
+        少了等號，每根 K 都會被凍結在它剛出生那一刻的樣子。"""
+        repository.record_candles("USD", 2, "1h", [make_candle(0, high=0.0002)])
+        repository.record_candles("USD", 2, "1h", [make_candle(0, high=0.0009)])
+
+        rows = self.stored(repository)
+        assert len(rows) == 1
+        assert rows[0]["high"] == 0.0009
+
+    def test_沒有新的就一根都不寫(self, repository):
+        candles = [make_candle(index * 3_600_000) for index in range(3)]
+        repository.record_candles("USD", 2, "1h", candles)
+
+        # 同一份資料再送一次：只有最新那根需要覆蓋。
+        assert repository.record_candles("USD", 2, "1h", candles[:-1]) == 0
+
+    def test_不同天期互不干擾(self, repository):
+        """`p{period}` 這一段不能省：不指定天期會把所有天期混在一起，
+        而 2 天期佔了 86% 的供給、價格結構與長天期不同（D030）。"""
+        repository.record_candles("USD", 2, "1h", [make_candle(0, high=0.0002)])
+        repository.record_candles("USD", 30, "1h", [make_candle(0, high=0.0004)])
+
+        rows = self.stored(repository)
+        assert len(rows) == 2
+        assert {row["period"]: row["high"] for row in rows} == {2: 0.0002, 30: 0.0004}
+
+    def test_空清單不炸(self, repository):
+        assert repository.record_candles("USD", 2, "1h", []) == 0

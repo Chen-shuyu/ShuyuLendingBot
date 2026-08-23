@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from core import hold_time
+from core import hold_time, market_snapshot
 from notify import messages
 from utils import clock
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
@@ -161,6 +161,11 @@ class BotEngine:
         trades = self._fetch_trades()
         candles = self._fetch_candles()
         self._log_market_rate(trades)
+        # **落地要放在這裡，不能放在下面任何一個出口之後**（M1）。底下有五條路徑會
+        # 提早 `raise SkipCycleError`（策略無計畫、維持場上既有掛單、重掛不划算……），
+        # 而那些正好是「市場走弱、單子空掛」的輪次——也就是最需要留下市場長相的輪次。
+        # 這是 D038 的同一課：閒置量測原本擺在提早 return 之後，於是永遠量不到閒置最久的那些輪。
+        self._record_market_snapshot(frr, book, trades, candles)
 
         # 掛在場上的錢也是我們的錢。只看 `get_available_balance()` 的話，單子一掛出去
         # 餘額就變成 0，策略會以為沒錢可放而回傳空計畫——於是每一輪都在「取消才有錢、
@@ -468,6 +473,43 @@ class BotEngine:
                 f"中位數 {forecast['median_hours']:.1f}h／"
                 f"四分之三在 {forecast['p75_hours']:.1f}h 內 → {verdict}。"
             )
+
+    def _record_market_snapshot(self, frr, book, trades, candles) -> None:
+        """把這一輪的市場長相落 DB（M1 市場資料落地）。
+
+        **為什麼要有這件事**：在它之前，每次分析都得重抓即時資料，用完就丟，
+        而歷史再也回不去。D3 那個「候選價位數 111 → 110，選中的目標同時
+        9.78% → 9.50%，而市場常態價一小時內沒變」到今天無法證實，
+        就是因為當時的簿子與 K 線窗都沒有留下來。
+        成本實測一列約 1.2 KB，一年約 68 MB（見 `db/models.py` 的表註解）。
+
+        **這裡只存觀測，不存決策**：欄位全部算自本輪剛抓回來的原始資料，
+        不讀策略的 `last_evaluation`。決策落地（M1-b）要等 D041 在正式環境
+        驗收過再進來——日誌印錯還有鄰行可以拆穿，**DB 裡多一列假資料沒有鄰行會反駁**，
+        而 M2 回測工具會拿它當事實。
+
+        **落帳失敗不能拖垮巡檢**：這是觀測資料，寫不進去就記一行警告，
+        讓它變成看得見的缺口而不是靜默的空白（與 `_record_wait_forecast()` 同一個判斷）。
+        """
+        try:
+            self.repository.record_market_snapshot(
+                "USD",
+                frr,
+                book=market_snapshot.summarize_book(book),
+                trades=market_snapshot.summarize_trades(trades),
+                candles=market_snapshot.summarize_candles(candles),
+            )
+            if candles:
+                stored = self.repository.record_candles(
+                    "USD",
+                    getattr(self.strategy, "offer_period", 2),
+                    getattr(self.strategy, "candle_timeframe", "1h"),
+                    candles,
+                )
+                if stored:
+                    self.logger.debug(f"市場快照已落地，K 線更新 {stored} 根。")
+        except Exception as exc:  # noqa: BLE001 - 觀測資料不值得讓一輪巡檢失敗
+            self.logger.warning(f"市場快照寫入失敗，這一輪的市場長相不會留下：{exc}")
 
     def _record_wait_forecast(self, result) -> None:
         """把掛單當下的等待預估落 DB，供事後校準（D038）。

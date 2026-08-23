@@ -14,8 +14,9 @@
 
 ## 進行中
 
-**分支 `feature/market-snapshot-landing`**（M1-a ＋ C2）——程式碼與測試完成，
-待開 PR。內容見 [DECISIONS.md](DECISIONS.md) 的 **D042** 與
+**目前沒有進行中的分支。** 最近兩次合併是 PR #41（M1-a ＋ C2，08-23 17:19 合併、
+17:20 部署，**新程式碼第一輪就被執行到**）與 PR #42（文件同步）。
+內容見 [DECISIONS.md](DECISIONS.md) 的 **D042** 與
 [PROGRESS.md](PROGRESS.md) 的 2026-08-23（續二）。
 
 **在等一件事**：部位 `464242253` 收回（最晚 2026-08-23 22:31）。

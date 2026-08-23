@@ -36,16 +36,21 @@ dry-run 仍然保留（`config.yaml` 的 `engine.dry_run`），但不再是主�
 
 ## 專案文件
 
-本專案採用文件化管理，所有規劃、進度、決策與待辦都放在 [`.project-docs/`](.project-docs/)，不靠對話記憶延續：
+本專案採用文件化管理，所有規劃、進度、決策與待辦都放在 [`.project-docs/`](.project-docs/)，不靠對話記憶延續。
 
-| 檔案 | 用途 |
-| --- | --- |
-| [`.project-docs/PLAN.md`](.project-docs/PLAN.md) | 專案目標與分階段 Roadmap |
-| [`.project-docs/PROGRESS.md`](.project-docs/PROGRESS.md) | 工作進度日誌 |
-| [`.project-docs/DECISIONS.md`](.project-docs/DECISIONS.md) | 設計決策與原因（ADR 格式） |
-| [`.project-docs/TASKS.md`](.project-docs/TASKS.md) | 待辦事項清單 |
-| [`.project-docs/CHANGELOG.md`](.project-docs/CHANGELOG.md) | 版本變更紀錄 |
-| [`.project-docs/ARCHITECTURE.md`](.project-docs/ARCHITECTURE.md) | 系統架構與設計說明 |
+文件依**時間尺度**分三層（2026-08-23 重整，理由見
+[`.project-docs/archive/README.md`](.project-docs/archive/README.md)）：
+
+| 層 | 檔案 | 用途 |
+| --- | --- | --- |
+| **L1 現在** | [`.project-docs/STATUS.md`](.project-docs/STATUS.md) | **唯一一份「現在」**：資金狀態、跑什麼策略、下三步。**新對話從這裡開始讀** |
+| | [`.project-docs/TASKS.md`](.project-docs/TASKS.md) | 還沒做的事 |
+| **L2 為什麼** | [`.project-docs/DECISIONS.md`](.project-docs/DECISIONS.md) | 設計決策與原因（ADR），最前面有 41 條索引表 |
+| | [`.project-docs/ARCHITECTURE.md`](.project-docs/ARCHITECTURE.md) | 系統架構與設計說明 |
+| | [`.project-docs/PLAN.md`](.project-docs/PLAN.md) | 專案目標與分階段 Roadmap |
+| **L3 當時發生什麼** | [`.project-docs/PROGRESS.md`](.project-docs/PROGRESS.md) | 工作進度日誌 |
+| | [`.project-docs/CHANGELOG.md`](.project-docs/CHANGELOG.md) | 版本變更紀錄 |
+| | [`.project-docs/archive/`](.project-docs/archive/) | 歷史文件，**入口是該資料夾的 README** |
 
 早期的規劃書（`PRD.md`、`SHUYU_PROJECT_PLAN.md`）已歸檔至 [`archive/`](archive/)，內容已分類遷移進上述文件，僅保留作為歷史脈絡備查。
 

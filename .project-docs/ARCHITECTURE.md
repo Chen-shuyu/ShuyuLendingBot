@@ -68,9 +68,13 @@ ShuyuLendingBot/
 │   │                            #   offer_wait_forecasts 為 D038 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── notify/
-│   └── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
+│   ├── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
+│   └── messages.py             # 通知訊息的唯一產生處：統一格式、圖示分級、
+│                                # 推的是狀態轉換而不是狀態（D029 新增）
 ├── utils/
 │   ├── logger.py               # BotLogger：RotatingFileHandler（M3 改）
+│   ├── clock.py                # 時區：一律以設定檔的 `logging.timezone` 取現在時間，
+│   │                            # 不吃容器環境的 TZ（D028 新增）
 │   └── exceptions.py           # RetryableError / FatalError / SkipCycleError
 ├── scripts/                    # 維運腳本，皆不在主程式執行路徑上、皆只用標準函式庫
 │   ├── healthcheck.py          # 容器內：唯讀讀 bot_state 心跳（M4 新增，見 D016）
@@ -80,7 +84,7 @@ ShuyuLendingBot/
 │   ├── shuyu-lending-bot.container        # 正式部署的 Quadlet 單元（D017、D020）
 │   ├── shuyu-lending-bot-alert.service    # OnFailure= 觸發的告警單元（D020）
 │   └── bfx-lending-bot.service            # 本機測試用，非正式部署路線
-├── tests/                      # 三層測試 575 項（M4 新增，見 DECISIONS.md D015、D016）
+├── tests/                      # 三層測試（M4 新增，見 DECISIONS.md D015、D016）
 │   ├── conftest.py             # 共用 fixture 與測試替身（FakeLogger／FakeNotifier／repository）
 │   ├── unit/                   # 純邏輯：策略、重試、資料層、設定、日誌、交易所客戶端、告警腳本
 │   ├── functional/             # run_once() 巡檢流程、FailureTracker 告警去重、離開碼與退出路徑
@@ -194,6 +198,14 @@ ShuyuLendingBot/
 - `notify/line_messaging.py`：LINE Messaging API push（`POST /v2/bot/message/push`）。
   `send()` 永遠不拋例外——它在致命錯誤的退出路徑上被呼叫，拋例外會蓋掉原始錯誤與離開碼。
   **只送事件、不送例行**：免費方案每月 200 則，每輪巡檢推一則會在兩天內用光（見 D024）。
+- `notify/messages.py`：**所有通知訊息的唯一產生處**（D029）。`build()` 統一格式與圖示分級，
+  其餘每個函式對應一種事件（啟動檢查失敗、致命錯誤、連續失敗、恢復、掛單上線／消失／
+  被拒、資金借出／收回）。訊息在這裡組好才交給 `line_messaging.py` 送出——**格式與通道
+  分開**，所以改格式不必碰 HTTP、換通道不必重寫每一則訊息。
+  交易面推的是**狀態轉換而不是狀態**：`offers_placed()` / `offers_gone()` 由
+  `core/bot_engine.py` 的 `_offers_live` 三態（有／沒有／還不知道）驅動，同一個狀態
+  連續成立不會重複推。這也是 D041 修的那個病的另一半——**登記狀態的人必須跟著
+  「看到的」走，訊息層才報得出真的轉換**。
 - `main.py`：只做 bootstrap——載入 secrets 與 `config.yaml`、建好 logger／notifier／策略／
   交易所客戶端／`Repository`，組成 `BotEngine` 後把它回傳的離開碼交給作業系統。
   這裡不該再出現任何巡檢邏輯。
@@ -210,6 +222,10 @@ ShuyuLendingBot/
 - `scripts/hold_report.py`：`core/hold_time.py` 的彙總報告，唯讀開 DB（同 healthcheck
   的原則：報告不該有副作用）。`python3 scripts/hold_report.py` 隨時可跑。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
+- `utils/clock.py`：`now()` / `get_timezone()`——時間一律以 `config.yaml` 的
+  `logging.timezone` 解析，**不吃容器環境的 `TZ`**。時區是應用程式屬性，不是部署環境的
+  副作用（D028）：靠環境變數的話，同一份日誌在不同機器上跑出不同時間，而事後對照
+  交易所回報的時間戳就再也對不起來。
 - `scripts/healthcheck.py`：容器 healthcheck 的執行檔，唯讀開啟 SQLite 讀 `bot_state.last_run_at`，
   心跳超過「巡檢間隔 × 3 + 60 秒」（可由 `engine.health_max_silence_seconds` 覆寫）就以
   離開碼 1 回報 unhealthy。刻意不看 `consecutive_failures`（那是交易所端問題，重啟無益），

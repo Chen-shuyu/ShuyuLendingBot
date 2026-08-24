@@ -310,7 +310,7 @@ M1-b 的放行條件是 2026-08-23 23:04 由 D040／D041 雙雙驗收通過解�
 | **C2　`docs_only` 只認 `.project-docs/`** | 2026-08-23 | 改為文件白名單（`.project-docs/`、`README.md`、`LICENSE`、`.gitignore`、`.gitattributes`），fail-open 不變。見 [PROGRESS.md](PROGRESS.md) 2026-08-23（續二）第六節——含兩組對照實驗，以及「本機 grep 是 ugrep、`-q` 忽略 `-v`」那個差點被當成程式錯誤的坑 |
 | **M1-a　市場快照落地** | 2026-08-23 | [DECISIONS.md](DECISIONS.md) **D042** |
 | **M1-b　決策落地** | 2026-08-24 | [DECISIONS.md](DECISIONS.md) **D043**（M1 仍是 `[~]`：正式環境驗收待 08-25 部位收回） |
-| **B5　餘額不足被當成認證失敗而停機** | 2026-08-24 | [CHANGELOG.md](CHANGELOG.md) 的 Fixed（2026-08-24）。分類改成**看訊息不看型別**，歸為 `SkipCycleError`；起因見 **D025** 的附帶發現 |
+| **B5　餘額不足被當成認證失敗而停機** | 2026-08-24 | [DECISIONS.md](DECISIONS.md) **D044**（起因是 D025 的附帶發現）。⚠ **正式環境尚未觸發過，而它可能永遠不觸發**——「沒發生」不等於驗收通過，五條條件在 D044 最後一節 |
 
 ---
 

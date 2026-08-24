@@ -17,7 +17,8 @@
   重啟不會打斷任何掛單。PR #43 部署（22:48）之後 41 分鐘
 
 ### Fixed（2026-08-24，分支 `fix/b5-insufficient-balance-classification`）
-- **B5：餘額不足不再被當成認證失敗而停機**（TASKS.md B5，起因見 D025）。
+- **B5：餘額不足不再被當成認證失敗而停機**（**完整敘述與驗收條件見 D044**，
+  起因是 D025 的附帶發現）。
   ccxt 把 Bitfinex 的
   `Invalid offer: not enough USD balance available in deposit wallet`
   歸類成 `AuthenticationError`，於是它走 `FatalError` 那一支

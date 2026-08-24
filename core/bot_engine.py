@@ -306,6 +306,14 @@ class BotEngine:
                 # 標成 False 是為了讓下一輪成功時推得出「掛單已重新上線」。
                 self._offers_live = False
                 raise
+            except SkipCycleError as exc:
+                # 餘額不足這一類（B5／D025）：交易所拒單，但**下一輪重算金額就可能自己好**
+                # ——例如資金剛被搬走又搬回來。留痕與上面同理（掛單無法 rollback），
+                # 但**刻意不推 LINE**：它可能連續好幾輪都發生，而額度是每月 200 則，
+                # 燒完之後真正的故障告警一則都送不出去（D024）。
+                self.repository.record_offer_failure(plan, str(exc))
+                self._offers_live = False
+                raise
             self.logger.info(f"掛單結果：{result}")
             # dry-run 由交易所回應自己表明（`status: dry_run`），不必再從別處傳一個旗標
             # 進來——資料怎麼說就怎麼寫，少一條會走岔的路。

@@ -556,3 +556,176 @@ class TestEvaluationDoesNotLeakAcrossRounds:
             344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
         )
         assert strategy.describe_decision() is not None
+
+
+class TestPricingDecisionRecord:
+    """落 DB 的那一份決策紀錄（M1-b）。
+
+    **這張表跟日誌不一樣的地方在於它會被當成事實**：M2 回測工具要拿它回答
+    「如果當時跑的是另一個策略會怎樣」，而一列錯的決策沒有鄰行可以拆穿它
+    ——D041 當初把 M1-b 擋在驗收後面，理由就是這個。所以這裡驗的是
+    **「存下去的東西跟當時真的算出來的是同一個」**，而不只是欄位有值。
+    """
+
+    def _candles(self, annual_pct=10.0, count=60):
+        return [candle(i, daily(annual_pct)) for i in range(count)]
+
+    def _evaluated(self, **overrides):
+        strategy = ExpectedValueStrategy(base_config(ev_min_hits=5, **overrides))
+        highs = [daily(20.0) if i % 10 == 0 else daily(9.0) for i in range(60)]
+        strategy.choose_rate([candle(i, high) for i, high in enumerate(highs)])
+        return strategy
+
+    def test_沒評估過就回None(self):
+        assert ExpectedValueStrategy(base_config()).pricing_decision() is None
+
+    def test_選中的價位與日誌和預估講的是同一個(self):
+        """三個出口（日誌、`offer_wait_forecasts`、`pricing_decisions`）
+        讀的是同一份 `last_evaluation`。**其中一個講別的價位，事後就對不起來**
+        ——而三份資料互相矛盾時，沒有人知道該相信哪一份。"""
+        strategy = self._evaluated()
+
+        decision = strategy.pricing_decision()
+        forecast = strategy.chosen_forecast()
+        line = strategy.describe_decision()
+
+        assert decision["chosen_rate"] == pytest.approx(forecast["rate"])
+        assert f"選中年化 {annual(decision['chosen_rate']):.2f}%" in line
+        assert decision["chosen_mean_hours"] == pytest.approx(forecast["mean_hours"])
+
+    def test_選中的是實質年化最高的那一個而不是利率最高的(self):
+        """這是整個策略的主張本身（D035）。存錯了，M2 會以為當初選的是別的東西。
+
+        **資料刻意選在兩者會分家的地方**：年化 10% 每 12 小時才掃到一次，
+        而 9% 幾乎每小時都掃得到——等待成本吃掉那一個百分點之後，
+        `利率 × 48 ÷ (等待 + 48)` 選的是 9% 那個。兩者不分家的資料驗不到東西。
+        """
+        strategy = ExpectedValueStrategy(base_config(ev_min_hits=5))
+        strategy.choose_rate(
+            [candle(i, daily(10.0) if i % 12 == 0 else daily(9.0)) for i in range(60)]
+        )
+        decision = strategy.pricing_decision()
+
+        best = max(strategy.last_evaluation, key=lambda item: item["effective"])
+        assert decision["chosen_rate"] == pytest.approx(best["rate"])
+        assert decision["chosen_effective"] == pytest.approx(best["effective"])
+        assert annual(decision["chosen_rate"]) == pytest.approx(9.0, abs=0.05)
+        assert decision["chosen_rate"] < max(
+            item["rate"] for item in strategy.last_evaluation
+        ), "前置條件：這組資料裡利率最高的不是實質年化最高的，否則這個測試沒在驗東西"
+
+    def test_對照組是等最短的那一個(self):
+        """`fastest` 就是舊策略會選的那一類價位。兩者並列才看得出取捨換到了什麼。"""
+        strategy = self._evaluated()
+        decision = strategy.pricing_decision()
+
+        assert decision["fastest_mean_hours"] == pytest.approx(
+            min(item["wait_hours"] for item in strategy.last_evaluation)
+        )
+        assert decision["fastest_rate"] < decision["chosen_rate"]
+
+    def test_候選集依價位排序(self):
+        """事後要比對兩輪「111 → 110 少了哪一個」，靠的就是這個順序（D3）。"""
+        rates = self._evaluated().pricing_decision()["candidate_rates"]
+
+        assert rates == sorted(rates)
+        assert len(set(rates)) == len(rates), "候選價位量化過，不該有重複"
+
+    def test_候選集兩排等長且對得起來(self):
+        """價位與實質年化是兩排平行的陣列。長度一旦對不上，
+        **事後每一個「這個價位當時算出多少」都會讀到隔壁那一個的值**。"""
+        strategy = self._evaluated()
+        decision = strategy.pricing_decision()
+
+        assert len(decision["candidate_rates"]) == decision["candidate_count"]
+        assert len(decision["candidate_effectives"]) == decision["candidate_count"]
+        by_rate = {item["rate"]: item["effective"] for item in strategy.last_evaluation}
+        for rate, effective in zip(
+            decision["candidate_rates"], decision["candidate_effectives"]
+        ):
+            assert effective == pytest.approx(by_rate[rate])
+
+    def test_選中的價位一定在候選集裡(self):
+        decision = self._evaluated().pricing_decision()
+        assert decision["chosen_rate"] in decision["candidate_rates"]
+
+    def test_記下當時的窗長到哪一根K為止(self):
+        """D3 問的是「哪一根 K 滾出窗」。少了這兩個座標，事後只能猜。"""
+        # `ev_min_candles` 一起調小：窗比它短的話 `choose_rate()` 會在算窗之前
+        # 就以「資料不足」出局，那樣驗到的是另一件事。
+        strategy = ExpectedValueStrategy(
+            base_config(ev_min_hits=5, ev_window_hours=20, ev_min_candles=20)
+        )
+        candles = [candle(i, daily(10.0)) for i in range(60)]
+        strategy.choose_rate(candles)
+
+        decision = strategy.pricing_decision()
+        assert decision["candle_count"] == 20, "窗長就是 ev_window_hours，不是抓回來的根數"
+        assert decision["candle_latest_mts"] == candles[-1]["mts"]
+        assert decision["window_hours"] == 20
+
+    def test_存下的是當時假設的持有時間而不是實測值(self):
+        """`hold_hours_assumed` 存的是**假設**。這個 48 已知與現實不符
+        （D040 實測完成率 43.6%），存它的理由是 M2 要拿它當「當時假設了什麼」
+        ——改掉那個數字之後，舊決策才有辦法跟新決策比較。"""
+        decision = self._evaluated().pricing_decision()
+        assert decision["hold_hours_assumed"] == pytest.approx(48.0)
+
+    def test_記下是哪一個策略算的(self):
+        assert self._evaluated().pricing_decision()["strategy"] == "ExpectedValueStrategy"
+
+    def test_餘額掉到門檻以下的下一輪不可以留下決策(self):
+        """**D041 的保護要延伸到這個新出口**，否則 M1-b 就是把那個 bug
+        從日誌搬進 DB——而 DB 那一份沒有鄰行會反駁它。"""
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.pricing_decision() is not None, "前置條件：這一輪要真的評估過"
+
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+
+        assert strategy.pricing_decision() is None
+
+    def test_反向斷言_不可以留下上一輪那一列的內容(self):
+        """只斷言 `is None` 的話，把方法改成永遠回傳 `None` 也會過。"""
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        上一輪 = strategy.pricing_decision()
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+
+        assert strategy.pricing_decision() != 上一輪
+
+    def test_窗的座標也不可以跨輪殘留(self):
+        """`last_window` 是跟著 M1-b 一起加進來的第三個「本輪狀態」。
+        **每多一個都得在同一個地方重置**，漏掉的那一個不會有人發現（D041）。"""
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.last_window != {}
+
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+
+        assert strategy.last_window == {}
+
+    def test_下一輪重新評估後又留得下來(self):
+        """對照組：**不是把這個能力關掉**，只是不准跨輪沿用。"""
+        strategy = ExpectedValueStrategy(base_config())
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.pricing_decision() is None
+
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
+        )
+        assert strategy.pricing_decision() is not None

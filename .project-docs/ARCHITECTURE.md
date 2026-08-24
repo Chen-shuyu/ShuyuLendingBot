@@ -62,14 +62,17 @@ ShuyuLendingBot/
 │   ├── hold_time.py            # 實際持有時間量測：右設限分開報、完成率取代
 │   │                            # 「借滿」二分類、小樣本不報中位數（D040 新增）
 │   └── market_snapshot.py      # 市場原始資料 → 可長期存放的摘要。**刻意不認識
-│                                # 任何策略物件**：只存觀測、不存決策（D042 新增）
+│                                # 任何策略物件**：只存觀測、不存決策（D042 新增；
+│                                # 決策那一半走 pricing_decisions，見 D043）
 ├── db/
 │   ├── models.py               # loan_offers / earnings_daily / funding_positions /
 │   │                            # bot_state / offer_wait_forecasts /
-│   │                            # market_snapshots / market_candles 的 DDL
+│   │                            # market_snapshots / market_candles /
+│   │                            # pricing_decisions 的 DDL
 │   │                            # （funding_positions 為 D030、
 │   │                            #   offer_wait_forecasts 為 D038、
-│   │                            #   後兩張為 D042 新增）
+│   │                            #   market_* 兩張為 D042、
+│   │                            #   pricing_decisions 為 D043 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── notify/
 │   ├── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
@@ -205,8 +208,19 @@ ShuyuLendingBot/
   「市場走弱、單子空掛」的輪次（D038 的同一課；日誌漏印看得出來，DB 漏一列看不出來）。
   摘要有損的地方都有欄位承認：`book_truncated`、`trade_span_minutes`、
   沒觀測到的欄位留 NULL 而不是 0（D039 從日誌延伸到資料表）。
-  尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）；
-  `market_snapshots` 目前只存觀測，**本輪選中的價位與候選集（M1-b）等 D041 驗收後才進來**。
+  `pricing_decisions` 是**決策的落地**（D043，M1-b）：策略每真的評估過一輪就一列，
+  存選中的價位與它的等待分佈、對照組（等最短的那個候選）、候選集的價位與實質年化兩排、
+  以及當時的窗長與那個已知錯的 `hold_hours_assumed`（存的是**假設**，不是事實——
+  M2 換掉它之後，舊決策才有辦法跟新決策比較）。
+  **寫入點緊接在 `_log_pricing_rationale()` 之後**：兩者讀同一份 `last_evaluation`，
+  於是**日誌那一行就是 DB 那一列的鄰行**——D041 當初把 M1-b 擋在驗收後面的理由是
+  「DB 裡多一列假資料沒有鄰行會反駁」，這個位置把那個保護接了回來。
+  **沒評估過的輪次一列都不寫**（資金全借出時餘額守門檻讓 `choose_rate()` 跑不到），
+  因為一列全是 NULL 的決策會讓「這段期間評估過幾次」這個數字說謊。
+  候選集只留價位與實質年化兩排、不留每個候選的等待分佈：實測 110 個候選的完整評估
+  是 17 KB，兩排是 2.6 KB，而 `effective` 就是排序依據——**留下它才答得出
+  「為什麼是這個價位」**，那正是 D3 的問題。
+  尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
 - `notify/line_messaging.py`：LINE Messaging API push（`POST /v2/bot/message/push`）。
   `send()` 永遠不拋例外——它在致命錯誤的退出路徑上被呼叫，拋例外會蓋掉原始錯誤與離開碼。
   **只送事件、不送例行**：免費方案每月 200 則，每輪巡檢推一則會在兩天內用光（見 D024）。

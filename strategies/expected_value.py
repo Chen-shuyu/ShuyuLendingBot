@@ -171,6 +171,15 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 與 `last_skip_reason` 並排——那裡才是「新的一輪開始了」。
         self.last_evaluation: List[Dict[str, float]] = []
 
+        # **本輪**評估用的那個 K 線窗長什麼樣，供 M1-b 落 DB。
+        # 少了它，事後看得到「選了哪個價位」卻答不出「當時的窗到哪一根 K 為止」
+        # ——而 D3 問的正是「一根 K 滾出窗，價格目標就自己跳一階」。
+        #
+        # **它跟 `last_evaluation` 是同一種東西，所以必須在同一個地方重置**：
+        # 每多一個「本輪的狀態」，就多一個會跨輪殘留的成員（D041 已經有兩個了）。
+        # 重置點只有一個，就在 `build_offer_plan()` 的開頭。
+        self.last_window: Dict[str, Any] = {}
+
 
     # ------------------------------------------------------------------
     # 小工具
@@ -246,6 +255,56 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
             "window_hours": self.ev_window_hours,
         }
 
+    def pricing_decision(self) -> Optional[Dict[str, Any]]:
+        """把**本輪**的定價決策整理成可以落 DB 的一份資料（M1-b 決策落地）。
+
+        **與 `describe_decision()` 是同一份 `last_evaluation` 的兩種輸出**，
+        而這件事本身就是設計的一部分：迴圈層把兩者接在一起呼叫，於是
+        **日誌那一行就是 DB 那一列的鄰行**。D041 當初把決策落地擋在 M1-b 之後，
+        理由正是「日誌印錯還有鄰行可以拆穿，DB 裡多一列假資料沒有鄰行會反駁」
+        ——同源同時機是把那個保護延續下來的方法，不是巧合。
+
+        回傳 `None` 代表這一輪沒有評估過任何候選價位。
+
+        **候選集只給價位與實質年化兩排**，其餘的等待分佈只有選中的那一個留下來
+        （`chosen_*`）。理由與成本見 `db/models.py` 的表註解：
+        110 個候選的完整評估是 17 KB，這兩排是 2.6 KB，而
+        **`effective` 就是排序依據——留下它才答得出「為什麼是這個價位」**。
+        """
+        if not self.last_evaluation:
+            return None
+
+        chosen = max(self.last_evaluation, key=lambda item: item["effective"])
+        fastest = min(self.last_evaluation, key=lambda item: item["wait_hours"])
+        # 排序過才存：事後要比對兩輪的候選集差在哪一個價位，靠的是這個順序。
+        # 不排序的話「111 → 110 少了誰」得先自己排一次，而那正是 D3 的問題。
+        ordered = sorted(self.last_evaluation, key=lambda item: item["rate"])
+        return {
+            # 用類別名而不是設定檔的 `mode`：M2 要對上的是「當時跑的是哪一份程式碼」，
+            # 而 `mode` 只是指向它的字串，改個別名就對不上了。
+            "strategy": type(self).__name__,
+            "chosen_rate": chosen["rate"],
+            "chosen_effective": chosen["effective"],
+            "chosen_mean_hours": chosen["wait_hours"],
+            "chosen_median_hours": chosen["median_hours"],
+            "chosen_p75_hours": chosen["p75_hours"],
+            "chosen_hits": chosen["hits"],
+            "chosen_censored_ratio": chosen["censored_ratio"],
+            "fastest_rate": fastest["rate"],
+            "fastest_mean_hours": fastest["wait_hours"],
+            "fastest_effective": fastest["effective"],
+            "candidate_count": len(self.last_evaluation),
+            "candidate_rates": [item["rate"] for item in ordered],
+            "candidate_effectives": [item["effective"] for item in ordered],
+            "window_hours": self.ev_window_hours,
+            # **這個 48 是已知錯的**（D040：實測完成率 43.6%）。存下來不是因為它對，
+            # 而是因為 M2 回測工具要拿它當「當時假設了什麼」——換掉它之後，
+            # 舊決策才有辦法跟新決策比較。存的是假設，不是事實。
+            "hold_hours_assumed": self.offer_period * 24.0,
+            "candle_count": self.last_window.get("candle_count"),
+            "candle_latest_mts": self.last_window.get("candle_latest_mts"),
+        }
+
     # ------------------------------------------------------------------
     # 期望值計算
     # ------------------------------------------------------------------
@@ -314,6 +373,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         這同時也是天然的上限——不必另外設一個「最高不准超過多少」的旋鈕。
         """
         self.last_evaluation = []
+        self.last_window = {}
         if len(candles) < self.ev_min_candles:
             return None
 
@@ -321,6 +381,13 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         highs = [candle["high"] for candle in window]
         if len(highs) < self.ev_min_candles:
             return None
+
+        # 窗的兩個座標：幾根、最新那根是哪一根。**`mts` 不轉時區也不轉格式**
+        # ——它是對帳時唯一不會因為時區設定而跑掉的欄位（同 `market_candles`）。
+        self.last_window = {
+            "candle_count": len(window),
+            "candle_latest_mts": window[-1].get("mts"),
+        }
 
         # **這個假設已知與現實不符，刻意先不改**（TASKS.md D1、DECISIONS.md D040）。
         # 借款人可以隨時還款，所以 `offer_period` 是上限而不是實際持有時間：
@@ -381,7 +448,11 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 重置點放在這裡而不是那六個出口各補一次，是因為「新的一輪開始了」只有
         # 一個位置，而在每個出口補一次的作法，正是這個 bug 當初的成因：
         # 漏掉任何一條就再犯一次，而且漏掉的那條不會有人發現。
+        #
+        # **新增「本輪的狀態」時，這裡是唯一要一起加的地方**——`last_window`
+        # （M1-b）就是照這條規則放進來的第三個成員。
         self.last_evaluation = []
+        self.last_window = {}
 
         if balance_usd < self.min_required_usd:
             return self._skip(

@@ -6,6 +6,7 @@
 一條連線即可。
 """
 
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -201,8 +202,12 @@ class Repository:
         book: Optional[Dict[str, Any]] = None,
         trades: Optional[Dict[str, Any]] = None,
         candles: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """記下這一輪市場長什麼樣（M1）。三份摘要由 `core.market_snapshot` 產生。
+    ) -> Optional[int]:
+        """記下這一輪市場長什麼樣（M1），回傳這一列的 id（沒寫列就回傳 `None`）。
+
+        **回傳 id 是 M1-b 加的**：`pricing_decisions` 要指回本輪的市場長相，
+        而「本輪」這件事只有這裡知道。用時間去 JOIN 是行不通的——同一秒可能有
+        兩列，而且決策比快照晚幾百毫秒才產生。
 
         **三份摘要都可以是 `None`**：策略用不到的端點根本不會去打
         （`requires_book` / `requires_trades` / `requires_candles`），
@@ -216,13 +221,13 @@ class Repository:
         **FRR 的歷史除了這裡沒有第二個地方留得下來**。
         """
         if book is None and trades is None and candles is None and frr is None:
-            return
+            return None
 
         book = book or {}
         trades = trades or {}
         candles = candles or {}
         with self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 INSERT INTO market_snapshots
                     (captured_at, currency, frr,
@@ -267,6 +272,7 @@ class Repository:
                     candles.get("close_latest"),
                 ),
             )
+        return cursor.lastrowid
 
     def record_candles(self, currency: str, period: int, timeframe: str, candles) -> int:
         """把 K 線一根一列寫進 `market_candles`，回傳這一次實際寫了幾根。
@@ -332,6 +338,75 @@ class Repository:
                 ],
             )
         return len(pending)
+
+    def record_pricing_decision(
+        self,
+        currency: str,
+        decision: Dict[str, Any],
+        snapshot_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """記下這一輪策略**怎麼選出那個價位的**（M1-b 決策落地）。
+
+        `decision` 由策略的 `pricing_decision()` 產生——**策略層不碰 IO，
+        這裡不碰策略**。傳進來的是純資料，序列化成 JSON 是儲存的細節，
+        所以留在這一層（與 `market_snapshot.summarize_book()` 相反的分工是刻意的：
+        那個模組的曲線點數本身就是摘要的一部分，而候選集不是）。
+
+        回傳這一列的 id；`decision` 是空的就什麼都不做並回傳 `None`
+        ——**「這一輪沒有評估過」不可以寫成一列什麼都是 NULL 的決策**。
+        資金全部借出的日子裡餘額守門檻會讓 `choose_rate()` 一次都跑不到，
+        那些輪次在這張表裡就該不存在，而不是存成一列空的（D041 的同一條界線：
+        DB 裡多一列假資料沒有鄰行會反駁）。
+        """
+        if not decision:
+            return None
+
+        candidate_rates = decision.get("candidate_rates")
+        candidate_effectives = decision.get("candidate_effectives")
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO pricing_decisions
+                    (decided_at, currency, strategy, snapshot_id,
+                     chosen_rate, chosen_effective, chosen_mean_hours,
+                     chosen_median_hours, chosen_p75_hours, chosen_hits,
+                     chosen_censored_ratio,
+                     fastest_rate, fastest_mean_hours, fastest_effective,
+                     candidate_count, candidate_rates_json, candidate_effectives_json,
+                     window_hours, hold_hours_assumed, candle_count, candle_latest_mts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso(),
+                    currency,
+                    decision.get("strategy"),
+                    snapshot_id,
+                    decision["chosen_rate"],
+                    decision["chosen_effective"],
+                    decision.get("chosen_mean_hours"),
+                    decision.get("chosen_median_hours"),
+                    decision.get("chosen_p75_hours"),
+                    decision.get("chosen_hits"),
+                    decision.get("chosen_censored_ratio"),
+                    decision.get("fastest_rate"),
+                    decision.get("fastest_mean_hours"),
+                    decision.get("fastest_effective"),
+                    decision["candidate_count"],
+                    # 分隔符去掉空白：110 個候選省下約 400 位元組，而這兩欄
+                    # 是這張表最大的一項。
+                    None if candidate_rates is None else json.dumps(
+                        candidate_rates, separators=(",", ":")
+                    ),
+                    None if candidate_effectives is None else json.dumps(
+                        candidate_effectives, separators=(",", ":")
+                    ),
+                    decision.get("window_hours"),
+                    decision.get("hold_hours_assumed"),
+                    decision.get("candle_count"),
+                    decision.get("candle_latest_mts"),
+                ),
+            )
+        return cursor.lastrowid
 
     def upsert_daily_earning(
         self,

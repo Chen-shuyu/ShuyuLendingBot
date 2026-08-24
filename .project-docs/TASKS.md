@@ -14,10 +14,11 @@
 
 ## 進行中
 
-**進行中的分支**：`feature/persist-pricing-decision`（**M1-b 決策落地**，見
-[DECISIONS.md](DECISIONS.md) 的 **D043**）。放行條件在 2026-08-23 23:04 解除
-——D040 與 D041 雙雙在正式環境驗收通過（D041 拿到的是連續 130 輪不重播定價決策，
-比原本要求的「下一輪」強得多），證據見 [PROGRESS.md](PROGRESS.md) 的 2026-08-24。
+**目前沒有進行中的分支**：`feature/persist-pricing-decision`（M1-b 決策落地，
+見 [DECISIONS.md](DECISIONS.md) 的 **D043**）已隨 PR #43 合併部署（08-24 22:48）；
+`fix/b5-insufficient-balance-classification`（B5）已隨 PR #44 合併部署（08-24 23:29）。
+M1-b 的放行條件是 2026-08-23 23:04 由 D040／D041 雙雙驗收通過解除的，
+證據見 [PROGRESS.md](PROGRESS.md) 的 2026-08-24。
 
 **下一個要盯的驗收窗口**：部位 `464372858` 於 **2026-08-25 23:50 到期**。
 在那之前 `pricing_decisions` 會**正確地保持 0 列**（每一輪都走餘額守門檻）
@@ -273,21 +274,6 @@
     `private_post_auth_r_funding_loans_symbol`（已出借未被借走）。
     **與 P2-1 共用同一份查詢結果**，兩項一起做最省事。
 
-- [ ] **B5：ccxt 把「餘額不足」歸類成 `AuthenticationError`，日誌寫成「認證失敗」**
-  - **現象**：Bitfinex 回的是
-    `Invalid offer: not enough USD balance available in deposit wallet`（金額問題），
-    但 ccxt 丟出 `ccxt.AuthenticationError`，於是 `create_loan_offer()` 走到
-    `except ccxt.AuthenticationError` 那一支，日誌寫「建立放貸掛單認證失敗」。
-  - **影響**：訊息把人引去查 API 金鑰權限，而真正的問題在掛單金額——
-    半夜看到這則告警會往完全錯誤的方向查。分類為 `FatalError` 導致機器人**永久停止**
-    也偏嚴厲：餘額問題下一輪可能就自己好了（例如有人剛把錢轉走又轉回來）。
-  - **建議修法**：在 `api/bitfinex_client.py` 的 `create_loan_offer()` 裡，
-    先看錯誤訊息內容再決定分類——訊息含 `not enough` / `balance` 之類字樣時，
-    歸為 `SkipCycleError`（本輪略過、下一輪重算金額）而不是 `FatalError`，
-    日誌也要寫成「餘額不足」而不是「認證失敗」。
-    真正的認證問題（金鑰無效、權限不足）才維持 `FatalError`。
-  - **不急**：金額 bug 修掉之後，這條路徑在正常情況下不會再被觸發。
-
 - [ ] **B6：把既有的測試替身與測試資料，逐一對照真實回應校正**（見 DECISIONS.md D027）
   - **背景**：實單第一天的兩個 bug（D025、D026）都通過了完整測試套件，
     而且各自都有一條測試「正在守護那個性質」。漏掉的原因相同——
@@ -324,6 +310,7 @@
 | **C2　`docs_only` 只認 `.project-docs/`** | 2026-08-23 | 改為文件白名單（`.project-docs/`、`README.md`、`LICENSE`、`.gitignore`、`.gitattributes`），fail-open 不變。見 [PROGRESS.md](PROGRESS.md) 2026-08-23（續二）第六節——含兩組對照實驗，以及「本機 grep 是 ugrep、`-q` 忽略 `-v`」那個差點被當成程式錯誤的坑 |
 | **M1-a　市場快照落地** | 2026-08-23 | [DECISIONS.md](DECISIONS.md) **D042** |
 | **M1-b　決策落地** | 2026-08-24 | [DECISIONS.md](DECISIONS.md) **D043**（M1 仍是 `[~]`：正式環境驗收待 08-25 部位收回） |
+| **B5　餘額不足被當成認證失敗而停機** | 2026-08-24 | [CHANGELOG.md](CHANGELOG.md) 的 Fixed（2026-08-24）。分類改成**看訊息不看型別**，歸為 `SkipCycleError`；起因見 **D025** 的附帶發現 |
 
 ---
 

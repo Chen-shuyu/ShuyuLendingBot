@@ -12,12 +12,28 @@ from typing import Any, Dict, List, Optional
 
 from api.base import ExchangeClient
 from api.rate_limiter import RetrySettings, with_retry
-from utils.exceptions import FatalError, RetryableError
+from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
 try:
     import ccxt
 except ModuleNotFoundError:  # pragma: no cover - environment fallback
     ccxt = None
+
+
+def _is_insufficient_balance(message: str) -> bool:
+    """從錯誤訊息判斷這是不是「餘額不足」，而不是真正的認證問題（TASKS.md B5）。
+
+    ccxt 把 Bitfinex 的
+    `Invalid offer: not enough USD balance available in deposit wallet`
+    歸類成 `AuthenticationError`（D025 首次實單就是這樣被記成「認證失敗」的）。
+    **例外的型別在這裡不可信，只有訊息內容可信**，所以分類要看訊息。
+
+    只認 `not enough` 與 `insufficient` 兩個字樣，**刻意不單獨認 `balance`**：
+    「查餘額失敗」之類的訊息也含這個字，而把真正的認證問題誤判成「本輪略過」
+    會讓機器人拿無效金鑰空轉一整天——**這個方向的誤判比反過來貴得多**。
+    """
+    lowered = (message or "").lower()
+    return "not enough" in lowered or "insufficient" in lowered
 
 
 def _optional_millis(value) -> Optional[int]:
@@ -521,11 +537,16 @@ class BitfinexClient(ExchangeClient):
         except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
             self.logger.warning(f"建立放貸掛單逾時或超過速率限制：{exc}")
             raise RetryableError(str(exc)) from exc
-        except ccxt.AuthenticationError as exc:
-            self.logger.error(f"建立放貸掛單認證失敗：{exc}")
-            raise FatalError(str(exc)) from exc
-        except ccxt.ExchangeError as exc:
-            self.logger.error(f"建立放貸掛單時交易所回傳錯誤：{exc}")
+        except (ccxt.AuthenticationError, ccxt.ExchangeError) as exc:
+            # 這兩種一起接：餘額不足這件事 ccxt 是丟 `AuthenticationError` 出來的
+            # （D025），而它下次改版丟哪一種沒有人保證。**分類看訊息，不看型別。**
+            if _is_insufficient_balance(str(exc)):
+                self.logger.warning(f"建立放貸掛單失敗：融資錢包餘額不足（{exc}）")
+                raise SkipCycleError(f"融資錢包餘額不足，本輪不掛單：{exc}") from exc
+            if isinstance(exc, ccxt.AuthenticationError):
+                self.logger.error(f"建立放貸掛單認證失敗：{exc}")
+            else:
+                self.logger.error(f"建立放貸掛單時交易所回傳錯誤：{exc}")
             raise FatalError(str(exc)) from exc
 
         # 回應為通知信封：[4]=FUNDING_OFFER_ARRAY，[6]=STATUS，[7]=TEXT
@@ -533,6 +554,11 @@ class BitfinexClient(ExchangeClient):
         status = response[6] if len(response) > 6 else None
         if status != "SUCCESS":
             text = response[7] if len(response) > 7 else status
+            # 拒單的理由也可能是餘額不足，而它是走信封回來、不是拋例外
+            # ——兩條路都要問同一個問題，否則哪天回應形式一改就漏掉一半。
+            if _is_insufficient_balance(str(text)):
+                self.logger.warning(f"建立放貸掛單被拒：融資錢包餘額不足（{text}）")
+                raise SkipCycleError(f"融資錢包餘額不足，本輪不掛單：{text}")
             raise FatalError(f"建立放貸掛單失敗：{text}")
 
         offer = response[4]

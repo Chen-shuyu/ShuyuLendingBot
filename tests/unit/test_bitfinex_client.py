@@ -13,7 +13,7 @@ import pytest
 
 from api.bitfinex_client import BitfinexClient
 from api.rate_limiter import RetrySettings
-from utils.exceptions import FatalError, RetryableError
+from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
 # Bitfinex V2 funding offer 陣列：0=ID, 1=SYMBOL, 4=AMOUNT, 14=RATE, 15=PERIOD
 # https://docs.bitfinex.com/reference/rest-auth-funding-offers
@@ -430,6 +430,65 @@ class TestCreateLoanOffer:
         client = make_client(FakeExchange(private_post_auth_w_funding_offer_submit=error))
         with pytest.raises(expected):
             client.create_loan_offer("USD", 200.0, 0.0004, 2)
+
+    # B5／D025：ccxt 把 Bitfinex 的「餘額不足」歸類成 `AuthenticationError`，
+    # 於是它走 FatalError 那一支——機器人**永久停止**，日誌還寫「認證失敗」。
+    # 這一組守住兩件事：分類看訊息而不是型別，以及真正的認證問題仍然停機。
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # 取自 D025 首次實單的真實回應原文
+            ccxt.AuthenticationError(
+                "Invalid offer: not enough USD balance available in deposit wallet"
+            ),
+            ccxt.ExchangeError("Insufficient funds"),
+        ],
+    )
+    def test_insufficient_balance_is_skip_not_fatal(self, make_client, error):
+        client = make_client(FakeExchange(private_post_auth_w_funding_offer_submit=error))
+        with pytest.raises(SkipCycleError):
+            client.create_loan_offer("USD", 200.0, 0.0004, 2)
+
+    def test_insufficient_balance_log_says_balance_not_auth(self, make_client, fake_logger):
+        """半夜看到「認證失敗」會往金鑰權限查，而真正的問題在金額——B5 的成本就是這個。"""
+        client = make_client(
+            FakeExchange(
+                private_post_auth_w_funding_offer_submit=ccxt.AuthenticationError(
+                    "Invalid offer: not enough USD balance available in deposit wallet"
+                )
+            )
+        )
+        with pytest.raises(SkipCycleError):
+            client.create_loan_offer("USD", 200.0, 0.0004, 2)
+
+        assert any("餘額不足" in text for text in fake_logger.messages["warning"])
+        assert not any("認證失敗" in text for text in fake_logger.all_messages())
+
+    @pytest.mark.parametrize(
+        "message",
+        ["apikey: invalid", "Invalid X-BFX-SIGNATURE", "permission denied"],
+    )
+    def test_real_auth_error_is_still_fatal(self, make_client, message):
+        """只有訊息說餘額不足才降級。誤把金鑰問題當成「本輪略過」，
+        機器人會拿無效金鑰空轉一整天——這個方向的誤判貴得多。"""
+        client = make_client(
+            FakeExchange(
+                private_post_auth_w_funding_offer_submit=ccxt.AuthenticationError(message)
+            )
+        )
+        with pytest.raises(FatalError):
+            client.create_loan_offer("USD", 200.0, 0.0004, 2)
+
+    def test_insufficient_balance_in_envelope_is_also_skip(self, make_client):
+        """拒單也可能走回應信封而不是例外，兩條路要問同一個問題。"""
+        exchange = FakeExchange(
+            private_post_auth_w_funding_offer_submit=make_submit_response(
+                status="ERROR",
+                text="Invalid offer: not enough USD balance available in deposit wallet",
+            )
+        )
+        with pytest.raises(SkipCycleError):
+            make_client(exchange).create_loan_offer("USD", 200.0, 0.0004, 2)
 
     def test_submit_is_called_exactly_once_on_failure(self, make_client):
         """守住「掛單不重試」：逾時後重送等於實盤重複借出（DECISIONS.md D013）。"""

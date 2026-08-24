@@ -340,6 +340,42 @@ class TestOfferFailure:
         assert len(offers_in_db(repository)) == 1
 
 
+class TestInsufficientBalanceRejection:
+    """B5：餘額不足的拒單是「本輪略過」，但仍然要留痕、且不燒 LINE 額度。"""
+
+    def test_recorded_but_not_pushed(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        client = FakeClient(offer_effects=[SkipCycleError("融資錢包餘額不足，本輪不掛單")])
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        rows = offers_in_db(repository)
+        assert [row["status"] for row in rows] == ["failed"]
+        assert "餘額不足" in rows[0]["detail"]
+        # 它可能連續好幾輪都發生，而 LINE 每月只有 200 則（D024）
+        assert fake_notifier.sent == []
+
+    def test_remaining_offers_are_not_attempted(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        """錢不夠掛第二筆，就更不夠掛第三筆——不要用剩下的額度再撞一次牆。"""
+        client = FakeClient(balance=600.0, offer_effects=[None, SkipCycleError("餘額不足")])
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+        assert len(client.offers) == 2
+
+    def test_does_not_write_success_state(
+        self, fake_logger, fake_notifier, strategy, repository, no_sleep
+    ):
+        client = FakeClient(offer_effects=[SkipCycleError("餘額不足")])
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        state = repository.get_state()
+        assert state["last_action"] is None
+
+
 class TestExchangeReportedValues:
     def test_db_uses_exchange_values_not_plan(
         self, fake_logger, fake_notifier, strategy, repository, no_sleep

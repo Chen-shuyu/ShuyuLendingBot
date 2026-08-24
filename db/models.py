@@ -11,6 +11,7 @@
 - `offer_wait_forecasts`：掛單當下對「要等多久」的預估，供事後校準（D038）。
 - `market_snapshots`：每輪一列的市場快照（M1）。
 - `market_candles`：利率 K 線，一根一列（M1）。
+- `pricing_decisions`：策略每評估過一輪就一列的定價決策（M1-b）。
 
 時間一律以帶時區偏移的 ISO 8601 字串存放（見 `repository.now_iso()`），
 避免容器與主機時區不一致造成誤判；交易所給的毫秒時間戳則原樣留在 `*_mts` 欄位，
@@ -133,7 +134,9 @@ CREATE TABLE IF NOT EXISTS offer_wait_forecasts (
 #
 # **這張表只存觀測，不存決策。** 每個欄位都算自本輪剛抓回來的原始資料，
 # 不碰策略物件的任何跨輪狀態（理由見 `core/market_snapshot.py` 的模組說明）。
-# 本輪選中的價位與候選集屬於 M1-b，等 D041 在正式環境驗收過再進來。
+# 本輪選中的價位與候選集在 `pricing_decisions`（M1-b，D043，2026-08-24 落地）
+# ——**這條界線沒有因此消失，只是多了另一邊**：那張表寫在策略評估完之後，
+# 而這一張寫在所有提早離開的出口之前，兩者連得起來靠的是 `snapshot_id`。
 #
 # 曲線與天期分佈用 JSON 存在單一欄位：它們是「一起讀才有意義」的一組數字，
 # 拆成欄位會變成二十幾個 `curve_05` / `curve_10`，而且點數一改就要動 schema。
@@ -204,6 +207,70 @@ CREATE TABLE IF NOT EXISTS market_candles (
 );
 """
 
+# 每一次「策略真的評估過一輪」留下的決策紀錄（M1-b 決策落地）。
+#
+# **為什麼跟 `market_snapshots` 分成兩張表**：兩者的寫入時機不同，而且不是每輪都成對。
+# 快照在 `build_offer_plan()` **之前**就寫（那是刻意的：底下五條提早 return 的路徑
+# 正好是最需要留下市場長相的輪次），決策要等策略評估完才有；資金全部借出的日子裡
+# 餘額守門檻會讓 `choose_rate()` 一次都跑不到，那些輪次有市場、沒有決策。
+# 併成一張表就得為「有觀測沒決策」留一整排 NULL，而 NULL 太多的表沒有人讀得懂。
+#
+# **這張表存的是「當時我們怎麼想」，不是「當時市場長怎樣」**（後者在
+# `market_snapshots` 與 `market_candles`）。`snapshot_id` 把兩邊接起來，
+# 允許 NULL——快照寫失敗不該讓決策跟著消失，那會把一個看得見的缺口變成兩個。
+#
+# **候選集只存價位與實質年化，不存每一個候選的等待分佈。**
+# 成本是實測的：110 個候選的完整評估序列化後 17 KB，只留這兩排是 2.6 KB。
+# 選中的那一個候選的完整評估另外有欄位（`chosen_*`），而其餘候選的等待分佈是
+# 中間量——**排序依據是 `effective`，留下它就能回答「為什麼是這個價位」**，
+# 這正是 D3 要問的。要更細的話 `market_candles` 存著同一批 K 線可以重算。
+#
+# ⚠ **重算不保證重現**：最新那一根 K 還在成形，事後 UPSERT 過的 high 已經不是
+# 當時看到的值。所以「當時算出什麼」只有這張表留得下來，而重算出來的東西
+# **是另一個問題的答案**，不可以拿來冒充當時的決策。
+#
+# **成本是實測的，不是估的**（2026-08-24 拿正式 DB 的 K 線跑出 109 個候選，
+# 寫 200 列再 VACUUM 量檔案增長）：**一列 4,137 位元組**，含索引。
+# 其中兩排候選集約 2.6 KB，其餘是 20 個 REAL 欄位與頁面開銷。
+#
+# 只有**評估過的輪次**才寫：資金全部借出時餘額守門檻讓 `choose_rate()` 跑不到，
+# 那些輪次一列都不寫（2026-08-24 整天 130 輪就是這種）。以目前資金使用率約
+# 四分之三、每天約 35 輪會評估估算，**一年約 50 MB**；
+# **最壞情況（每輪都評估）一年 207 MB** ——這個數字要講出來，
+# 因為它比 `market_snapshots` 的 68 MB/年 大三倍，而那是「市場一直很好、
+# 錢一直掛不出去」的日子，正好也是最想回頭看的日子。
+CREATE_PRICING_DECISIONS = """
+CREATE TABLE IF NOT EXISTS pricing_decisions (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    decided_at                TEXT    NOT NULL,
+    currency                  TEXT    NOT NULL,
+    strategy                  TEXT,
+    snapshot_id               INTEGER,
+    chosen_rate               REAL    NOT NULL,
+    chosen_effective          REAL    NOT NULL,
+    chosen_mean_hours         REAL,
+    chosen_median_hours       REAL,
+    chosen_p75_hours          REAL,
+    chosen_hits               INTEGER,
+    chosen_censored_ratio     REAL,
+    fastest_rate              REAL,
+    fastest_mean_hours        REAL,
+    fastest_effective         REAL,
+    candidate_count           INTEGER NOT NULL,
+    candidate_rates_json      TEXT,
+    candidate_effectives_json TEXT,
+    window_hours              INTEGER,
+    hold_hours_assumed        REAL,
+    candle_count              INTEGER,
+    candle_latest_mts         INTEGER
+);
+"""
+
+CREATE_PRICING_DECISIONS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_pricing_decisions_decided_at
+    ON pricing_decisions (decided_at);
+"""
+
 ALL_STATEMENTS = (
     CREATE_LOAN_OFFERS,
     CREATE_LOAN_OFFERS_INDEX,
@@ -215,5 +282,7 @@ ALL_STATEMENTS = (
     CREATE_MARKET_SNAPSHOTS,
     CREATE_MARKET_SNAPSHOTS_INDEX,
     CREATE_MARKET_CANDLES,
+    CREATE_PRICING_DECISIONS,
+    CREATE_PRICING_DECISIONS_INDEX,
     INIT_BOT_STATE_ROW,
 )

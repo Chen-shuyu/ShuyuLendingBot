@@ -165,7 +165,7 @@ class BotEngine:
         # 提早 `raise SkipCycleError`（策略無計畫、維持場上既有掛單、重掛不划算……），
         # 而那些正好是「市場走弱、單子空掛」的輪次——也就是最需要留下市場長相的輪次。
         # 這是 D038 的同一課：閒置量測原本擺在提早 return 之後，於是永遠量不到閒置最久的那些輪。
-        self._record_market_snapshot(frr, book, trades, candles)
+        snapshot_id = self._record_market_snapshot(frr, book, trades, candles)
 
         # 掛在場上的錢也是我們的錢。只看 `get_available_balance()` 的話，單子一掛出去
         # 餘額就變成 0，策略會以為沒錢可放而回傳空計畫——於是每一輪都在「取消才有錢、
@@ -174,6 +174,14 @@ class BotEngine:
         disposable_usd = balance_usd + committed_usd
         plans = self.strategy.build_offer_plan(disposable_usd, frr, book, trades, candles)
         self._log_pricing_rationale()
+        # **緊接在日誌那一行後面是刻意的**（M1-b）。兩者讀同一份 `last_evaluation`，
+        # 於是日誌行就是 DB 那一列的鄰行——D041 當初把決策落地擋在後面的理由是
+        # 「DB 裡多一列假資料沒有鄰行會反駁」，這個位置把那個保護接了回來。
+        #
+        # **底下第二次 `build_offer_plan()`（取消舊單後用真實餘額重算）不再落一列**：
+        # `choose_rate()` 只吃 K 線、不看餘額，同一輪的兩次評估必然選出同一個價位，
+        # 多存一列只會讓「這段期間評估過幾次」這個數字說謊。
+        self._record_pricing_decision(snapshot_id)
 
         if not plans:
             skip_reason = self._strategy_skip_reason()
@@ -474,8 +482,8 @@ class BotEngine:
                 f"四分之三在 {forecast['p75_hours']:.1f}h 內 → {verdict}。"
             )
 
-    def _record_market_snapshot(self, frr, book, trades, candles) -> None:
-        """把這一輪的市場長相落 DB（M1 市場資料落地）。
+    def _record_market_snapshot(self, frr, book, trades, candles) -> Optional[int]:
+        """把這一輪的市場長相落 DB（M1 市場資料落地），回傳那一列的 id。
 
         **為什麼要有這件事**：在它之前，每次分析都得重抓即時資料，用完就丟，
         而歷史再也回不去。D3 那個「候選價位數 111 → 110，選中的目標同時
@@ -484,15 +492,19 @@ class BotEngine:
         成本實測一列約 1.2 KB，一年約 68 MB（見 `db/models.py` 的表註解）。
 
         **這裡只存觀測，不存決策**：欄位全部算自本輪剛抓回來的原始資料，
-        不讀策略的 `last_evaluation`。決策落地（M1-b）要等 D041 在正式環境
-        驗收過再進來——日誌印錯還有鄰行可以拆穿，**DB 裡多一列假資料沒有鄰行會反駁**，
-        而 M2 回測工具會拿它當事實。
+        不讀策略的 `last_evaluation`。決策由 `_record_pricing_decision()` 另外落地
+        （M1-b，2026-08-24；放行條件「D041 在正式環境驗收過」已於 08-23 23:04 達成），
+        **而且是在策略評估完之後**——這條界線沒有因為 M1-b 而消失，只是多了另一邊。
+
+        回傳的 id 讓決策那一列指得回本輪的市場長相。**寫失敗就回傳 `None`**，
+        決策照樣落得下去（`snapshot_id` 允許 NULL）：一個看得見的缺口不該變成兩個。
 
         **落帳失敗不能拖垮巡檢**：這是觀測資料，寫不進去就記一行警告，
         讓它變成看得見的缺口而不是靜默的空白（與 `_record_wait_forecast()` 同一個判斷）。
         """
+        snapshot_id = None
         try:
-            self.repository.record_market_snapshot(
+            snapshot_id = self.repository.record_market_snapshot(
                 "USD",
                 frr,
                 book=market_snapshot.summarize_book(book),
@@ -510,6 +522,34 @@ class BotEngine:
                     self.logger.debug(f"市場快照已落地，K 線更新 {stored} 根。")
         except Exception as exc:  # noqa: BLE001 - 觀測資料不值得讓一輪巡檢失敗
             self.logger.warning(f"市場快照寫入失敗，這一輪的市場長相不會留下：{exc}")
+        return snapshot_id
+
+    def _record_pricing_decision(self, snapshot_id: Optional[int] = None) -> None:
+        """把「這個價位是怎麼選出來的」落 DB（M1-b 決策落地）。
+
+        **這是 `_log_pricing_rationale()` 的另一半**：同一份 `last_evaluation`，
+        一份給人看（日誌），一份給 M2 回測工具看（DB）。兩者相鄰呼叫，
+        於是任何一列可疑的決策都有一行日誌可以對照——D041 擋下決策落地時
+        指出的正是「DB 裡多一列假資料沒有鄰行會反駁」。
+
+        策略沒有這個能力就靜靜跳過——`frr_plus` 與 `orderbook_depth` 不做期望值評估
+        （與 `_log_pricing_rationale()`、`_record_wait_forecast()` 同一個判斷）。
+
+        **落帳失敗不能拖垮巡檢**：決策資料是給事後分析用的，寫不進去就記一行警告，
+        讓它變成看得見的缺口而不是靜默的空白。
+        """
+        decide = getattr(self.strategy, "pricing_decision", None)
+        if decide is None:
+            return
+        decision = decide()
+        if not decision:
+            # 這一輪根本沒評估過（餘額守門檻在 `choose_rate()` 之前就 return）。
+            # **不寫列**，而不是寫一列空的——那些輪次在這張表裡就該不存在。
+            return
+        try:
+            self.repository.record_pricing_decision("USD", decision, snapshot_id)
+        except Exception as exc:  # noqa: BLE001 - 分析資料不值得讓一輪巡檢失敗
+            self.logger.warning(f"定價決策寫入失敗，這一輪怎麼選的不會留下：{exc}")
 
     def _record_wait_forecast(self, result) -> None:
         """把掛單當下的等待預估落 DB，供事後校準（D038）。

@@ -1810,3 +1810,170 @@ class TestMarketSnapshotLands:
 
         assert len(client.offers) == 1
         assert any("市場快照寫入失敗" in text for text in fake_logger.messages["warning"])
+
+
+def decisions_in_db(repository):
+    return [
+        dict(row)
+        for row in repository.connection.execute(
+            "SELECT * FROM pricing_decisions ORDER BY id"
+        )
+    ]
+
+
+class TestPricingDecisionLands:
+    """定價決策要落地（M1-b 決策落地）。
+
+    **跟上面那組的分界線就是這一組存在的理由。** `market_snapshots` 存「市場長怎樣」，
+    每一輪只要抓得到資料就寫；這張表存「我們怎麼想」，**只有策略真的評估過的輪次才寫**。
+    D041 把 M1-b 擋在正式環境驗收後面，理由是「日誌印錯還有鄰行可以拆穿，
+    DB 裡多一列假資料沒有鄰行會反駁」——所以這裡的反向斷言比正向的多。
+
+    放行條件（D041 驗收）於 2026-08-23 23:04 達成，見 PROGRESS.md 的 2026-08-24。
+    """
+
+    # 沿用上面那組的測試替身：**兩組測的是同一輪巡檢的兩半**，各自造一份
+    # 世界的話，「快照有、決策沒有」這種斷言就變成在比兩個不同的情境。
+    # `staticmethod()` 要包回去——直接賦值會讓它變回普通方法，於是 `self`
+    # 跑進第一個參數。
+    make_strategy = staticmethod(TestMarketSnapshotLands.make_strategy)
+    candles = staticmethod(TestMarketSnapshotLands.candles)
+    make_client = TestMarketSnapshotLands.make_client
+
+    def test_評估過的一輪留下決策(self, fake_logger, fake_notifier, repository,
+                                  no_sleep, strategy_config):
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        rows = decisions_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["strategy"] == "ExpectedValueStrategy"
+        assert rows[0]["candidate_count"] >= 1
+        assert rows[0]["window_hours"] == 168
+
+    def test_決策指得回本輪的市場快照(self, fake_logger, fake_notifier, repository,
+                                      no_sleep, strategy_config):
+        """兩張表是同一輪的兩半。接不起來的話，M2 就答不出
+        「當時的簿子長那樣，為什麼選了這個價位」。"""
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert decisions_in_db(repository)[0]["snapshot_id"] == \
+            snapshots_in_db(repository)[0]["id"]
+
+    def test_餘額不足的一輪有市場沒有決策(self, fake_logger, fake_notifier, repository,
+                                          no_sleep, strategy_config):
+        """**這是這組測試最重要的一條。** 餘額守門檻在 `choose_rate()` 之前就 return，
+        那一輪根本沒有人評估過任何價位——2026-08-24 一整天 130 輪全部是這種。
+        寫一列的話，M2 會讀到 130 個從來沒發生過的決策。"""
+        client = self.make_client(balance=0.17)
+
+        with pytest.raises(SkipCycleError):
+            run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                     client, repository)
+
+        assert len(snapshots_in_db(repository)) == 1, "市場那一半照樣要留"
+        assert decisions_in_db(repository) == []
+
+    def test_連續多輪沒錢也不會累積出決策(self, fake_logger, fake_notifier, repository,
+                                          no_sleep, strategy_config):
+        """跨輪殘留的形狀（D041）在 DB 這一側的樣子：策略物件活得跟行程一樣久，
+        **bug 只在第二輪之後才現形**。三輪跑完該有 3 列快照、0 列決策。"""
+        strategy = self.make_strategy(strategy_config)
+        client = self.make_client(balance=0.17)
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+
+        for _ in range(3):
+            try:
+                engine.run_once()
+            except SkipCycleError:
+                pass
+
+        assert len(snapshots_in_db(repository)) == 3
+        assert decisions_in_db(repository) == []
+
+    def test_評估過之後又沒錢的那一輪不留下第二列(self, fake_logger, fake_notifier,
+                                                  repository, no_sleep, strategy_config):
+        """**這才是 D041 真正的形狀**：清單先被填滿過，然後才掉回門檻以下。
+        上面那個測試從頭到尾沒錢，清單本來就是空的——
+        「還沒有機會犯錯」與「有機會犯錯而沒有犯」，中間隔的正好是一次驗收。
+        """
+        strategy = self.make_strategy(strategy_config)
+        client = self.make_client()
+        engine = make_engine(fake_logger, fake_notifier, strategy, client, repository)
+        engine.run_once()
+        assert len(decisions_in_db(repository)) == 1, "前置條件：第一輪要真的評估過"
+
+        client.balance = 0.17
+        client.active_offers = []
+        try:
+            engine.run_once()
+        except SkipCycleError:
+            pass
+
+        assert len(decisions_in_db(repository)) == 1, "第二輪不可以再留下一列"
+        assert len(snapshots_in_db(repository)) == 2
+
+    def test_維持場上既有掛單的一輪也算評估過(self, fake_logger, fake_notifier, repository,
+                                              no_sleep, strategy_config):
+        """單子空掛的輪次每一輪都重新評估過——**那些正是 D3 要看的輪次**
+        （候選集少一個、目標就跳一階）。掛單沒有動，不代表沒有做過判斷。"""
+        client = self.make_client(active_offers=[live_offer(amount=600.0, rate=0.00026)])
+
+        try:
+            run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config),
+                     client, repository)
+        except SkipCycleError:
+            pass
+
+        assert len(decisions_in_db(repository)) == 1
+
+    def test_決策與日誌那一行講的是同一個價位(self, fake_logger, fake_notifier, repository,
+                                              no_sleep, strategy_config):
+        """**日誌行就是 DB 那一列的鄰行**，這是 M1-b 把 D041 的保護接回來的方法。
+        兩者講不同的價位，那個保護就沒了。"""
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        row = decisions_in_db(repository)[0]
+        annual_pct = row["chosen_rate"] * 365 * 100
+        assert any(
+            f"選中年化 {annual_pct:.2f}%" in text for text in fake_logger.messages["info"]
+        )
+
+    def test_落地失敗不能拖垮巡檢(self, fake_logger, fake_notifier, repository,
+                                  no_sleep, strategy_config, monkeypatch):
+        """錢已經掛出去了，分析資料寫不進去只該留一行警告。"""
+        def boom(*args, **kwargs):
+            raise RuntimeError("磁碟滿了")
+
+        monkeypatch.setattr(repository, "record_pricing_decision", boom)
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert len(client.offers) == 1
+        assert any("定價決策寫入失敗" in text for text in fake_logger.messages["warning"])
+
+    def test_快照寫不進去時決策照樣落地(self, fake_logger, fake_notifier, repository,
+                                        no_sleep, strategy_config, monkeypatch):
+        """**一個看得見的缺口不該變成兩個。**"""
+        def boom(*args, **kwargs):
+            raise RuntimeError("磁碟滿了")
+
+        monkeypatch.setattr(repository, "record_market_snapshot", boom)
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        rows = decisions_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["snapshot_id"] is None

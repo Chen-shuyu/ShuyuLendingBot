@@ -609,6 +609,22 @@ class TestMarketSnapshot:
 
         assert len(self.rows(repository)) == 3
 
+    def test_回傳寫進去那一列的id(self, repository):
+        """M1-b 的決策要指得回本輪的市場長相。**用時間去 JOIN 是行不通的**
+        ——同一秒可能有兩列，而決策比快照晚幾百毫秒才產生。"""
+        first = repository.record_market_snapshot("USD", 0.0002, trades={"count": 5})
+        second = repository.record_market_snapshot("USD", 0.0003, trades={"count": 6})
+
+        assert [row["id"] for row in self.rows(repository)] == [first, second]
+        assert first != second
+
+    def test_沒寫列的時候回None而不是上一列的id(self, repository):
+        """回傳上一列的 id 的話，決策會指到別一輪的市場長相上
+        ——**而那種錯誤看起來完全正常**。"""
+        repository.record_market_snapshot("USD", 0.0002, trades={"count": 5})
+
+        assert repository.record_market_snapshot("USD", None) is None
+
 
 class TestMarketCandles:
     """`market_candles` 的 UPSERT（M1）。
@@ -671,3 +687,106 @@ class TestMarketCandles:
 
     def test_空清單不炸(self, repository):
         assert repository.record_candles("USD", 2, "1h", []) == 0
+
+
+class TestPricingDecisions:
+    """`pricing_decisions` 的寫入（M1-b 決策落地）。
+
+    **這張表跟 `market_snapshots` 的差別在於它存的是判斷，不是觀測。**
+    D041 當初把它擋在驗收後面，理由是「日誌印錯還有鄰行可以拆穿，
+    DB 裡多一列假資料沒有鄰行會反駁」——所以這裡驗的第一件事是
+    **沒評估過的輪次不可以留下任何一列**。
+    """
+
+    @staticmethod
+    def rows(repository):
+        return repository.connection.execute(
+            "SELECT * FROM pricing_decisions ORDER BY id"
+        ).fetchall()
+
+    @staticmethod
+    def decision(**overrides):
+        base = {
+            "strategy": "ExpectedValueStrategy",
+            "chosen_rate": 0.00026027,
+            "chosen_effective": 0.00024,
+            "chosen_mean_hours": 6.1,
+            "chosen_median_hours": 3.5,
+            "chosen_p75_hours": 10.0,
+            "chosen_hits": 53,
+            "chosen_censored_ratio": 0.06,
+            "fastest_rate": 0.00015,
+            "fastest_mean_hours": 0.5,
+            "fastest_effective": 0.00014844,
+            "candidate_count": 3,
+            "candidate_rates": [0.00015, 0.00021918, 0.00026027],
+            "candidate_effectives": [0.00014844, 0.00021, 0.00024],
+            "window_hours": 168,
+            "hold_hours_assumed": 48.0,
+            "candle_count": 168,
+            "candle_latest_mts": 1_787_576_400_000,
+        }
+        base.update(overrides)
+        return base
+
+    def test_沒評估過就不寫列(self, repository):
+        """資金全借出的日子裡餘額守門檻會讓 `choose_rate()` 一次都跑不到。
+        那些輪次在這張表裡就該不存在，**而不是存成一列什麼都是 NULL 的決策**
+        ——後者會讓「這段期間評估過幾次」這個數字說謊。"""
+        assert repository.record_pricing_decision("USD", {}) is None
+        assert repository.record_pricing_decision("USD", None) is None
+
+        assert self.rows(repository) == []
+
+    def test_選中的價位與統計量都存下來(self, repository):
+        repository.record_pricing_decision("USD", self.decision())
+
+        row = self.rows(repository)[0]
+        assert row["chosen_rate"] == 0.00026027
+        assert row["chosen_effective"] == 0.00024
+        assert row["chosen_median_hours"] == 3.5
+        assert row["chosen_hits"] == 53
+        assert row["strategy"] == "ExpectedValueStrategy"
+        assert row["hold_hours_assumed"] == 48.0
+
+    def test_候選集兩排讀回來還是原來的數字(self, repository):
+        """JSON 是儲存的細節，讀回來要跟存進去的一模一樣。
+        **浮點數在這裡不可以四捨五入**：候選價位就是量化過的日利率，
+        差一個小數位就是另一個價位。"""
+        import json
+
+        sent = self.decision()
+        repository.record_pricing_decision("USD", sent)
+
+        row = self.rows(repository)[0]
+        assert json.loads(row["candidate_rates_json"]) == sent["candidate_rates"]
+        assert json.loads(row["candidate_effectives_json"]) == sent["candidate_effectives"]
+
+    def test_候選集用緊湊分隔符(self, repository):
+        """這兩欄是這張表最大的一項，110 個候選省下約 400 位元組。"""
+        repository.record_pricing_decision("USD", self.decision())
+
+        assert ", " not in self.rows(repository)[0]["candidate_rates_json"]
+
+    def test_接得回本輪的市場快照(self, repository):
+        snapshot_id = repository.record_market_snapshot("USD", 0.0003, trades={"count": 5})
+        repository.record_pricing_decision("USD", self.decision(), snapshot_id)
+
+        assert self.rows(repository)[0]["snapshot_id"] == snapshot_id
+
+    def test_快照寫不進去時決策照樣落得下來(self, repository):
+        """**一個看得見的缺口不該變成兩個。** `snapshot_id` 允許 NULL，
+        快照那邊失敗時決策仍然要留下——決策才是這張表的主體。"""
+        assert repository.record_pricing_decision("USD", self.decision(), None) is not None
+
+        assert self.rows(repository)[0]["snapshot_id"] is None
+
+    def test_每輪各留一列(self, repository):
+        for rate in (0.00026027, 0.00024971, 0.00021918):
+            repository.record_pricing_decision("USD", self.decision(chosen_rate=rate))
+
+        assert [row["chosen_rate"] for row in self.rows(repository)] == [
+            0.00026027,
+            0.00024971,
+            0.00021918,
+        ]

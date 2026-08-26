@@ -147,8 +147,12 @@ class HoldSummary:
         return ordered[index]
 
 
-def _parse(moment: Optional[str]) -> Optional[datetime]:
+def parse_moment(moment: Optional[str]) -> Optional[datetime]:
     """把 DB 裡的 ISO 字串轉回 datetime；轉不動回 None 而不是拋例外。
+
+    **公開的（原本叫 `_parse`）**：`core/wait_time.py`（D045）要用同一條規則讀
+    同一批時間戳。兩支模組各寫一份的話，「舊列帶 `+00:00`、新列帶 `+08:00`」
+    這件事就會有兩個各自演化的答案——而時區不一致正是 `utils/clock.py` 存在的理由。
 
     舊列帶 `+00:00`、新列帶 `+08:00`，兩者都是 aware，相減得到的秒數正確
     （同 `db/repository.py` 的 `now_iso()` 說明）。
@@ -173,16 +177,16 @@ def build_record(
     """
     now = now or clock.now()
 
-    opened = _parse(position.get("opened_at"))
+    opened = parse_moment(position.get("opened_at"))
     approximate = False
     if opened is None:
         # 退用「第一次看到它」的時間：同樣是高估，但比整筆丟掉有用。
-        opened = _parse(position.get("first_seen_at"))
+        opened = parse_moment(position.get("first_seen_at"))
         approximate = opened is not None
     if opened is None:
         return None
 
-    closed = _parse(position.get("closed_at"))
+    closed = parse_moment(position.get("closed_at"))
     censored = closed is None
     end = closed or now
 

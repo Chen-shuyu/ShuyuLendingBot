@@ -37,17 +37,20 @@
   `podman ps` 或 `python3 scripts/healthcheck.py`
 - **市場資料落地**（D042，08-23 17:20 上線）：每輪把簿子摘要、成交摘要寫進
   `market_snapshots`，K 線一根一列寫進 `market_candles`。**這張表只存觀測**
+- **兩份校準報告**（隨時可跑，唯讀開 DB，都只量測不決策）：
+  `scripts/hold_report.py` 量算式裡的 `P`（D040）、
+  `scripts/wait_report.py` 量算式裡的 `W`（D045）
 - **決策落地**（D043，08-24 22:48 上線）：策略每真的評估過一輪就往
   `pricing_decisions` 寫一列——選中的價位、候選集、當時的窗。
   **寫在日誌那一行的旁邊**，於是日誌行就是 DB 那一列的鄰行
-- **測試 650 項**（單元＋功能 624、整合 26）
+- **測試 676 項**（單元＋功能 650、整合 26）
 - **已知限制**（都是刻意的，不是疏漏）：公式假設借滿 48h 但實測完成率 51.8%
   （D040，等 M2 才改）、**等待估計高估 3.9 倍**（D045，同樣等 M2）、天期寫死 2 天
 
 ## 接下來三步
 
-1. **D045 等待估計校準報告**（`scripts/wait_report.py`）——量測算式裡的 `W`，
-   與 `hold_report.py` 量測 `P` 成對。**只量測，不改策略**
+1. ~~D045 等待估計校準報告~~ **已完成**（分支 `feature/measure-wait-accuracy`）：
+   `python3 scripts/wait_report.py` 隨時可跑，四條驗收全過
 2. **P4-1／B6 測試替身校正** → 再接 **P2-2 `earnings_daily`（Bitfinex ledger）**。
    B6 要排在前面：ledger 是下一個回應解析的重災區，D027 記過的坑、D041 的兩個 bug 都栽在這
 3. **M2 回測工具** → 第 2 期的策略決策（D1 改公式那一半、A2-b、天期、`ev_window_hours`）

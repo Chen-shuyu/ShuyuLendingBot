@@ -29,6 +29,7 @@ systemd 放棄重啟）——免費方案每月 200 則，每輪推一則兩天�
         ├─ api/bitfinex_client.py ───┤（交易所讀寫、Rate Limit 重試）
         ├─ strategies/expected_value.py ─┤（純函式：以單位時間報酬期望值算利率/金額/天期）
         ├─ core/hold_time.py ────────┤（純函式：實際持有時間量測，只量測不決策）
+        ├─ core/wait_time.py ────────┤（純函式：等待估計校準量測，只量測不決策）
         ├─ db/repository.py ─────────┤（SQLite WAL：掛單/收益/狀態）
         └─ notify/line_messaging.py ─┘（LINE Messaging API push）
 ```
@@ -61,6 +62,8 @@ ShuyuLendingBot/
 │   │                            # FailureTracker、離開碼常數（M4 由 main.py 移入）
 │   ├── hold_time.py            # 實際持有時間量測：右設限分開報、完成率取代
 │   │                            # 「借滿」二分類、小樣本不報中位數（D040 新增）
+│   ├── wait_time.py            # 等待估計校準量測：預估等待 vs 實際等待，
+│   │                            # 沒成交的掛單當右設限分開報（D045 新增）
 │   └── market_snapshot.py      # 市場原始資料 → 可長期存放的摘要。**刻意不認識
 │                                # 任何策略物件**：只存觀測、不存決策（D042 新增；
 │                                # 決策那一半走 pricing_decisions，見 D043）
@@ -86,6 +89,7 @@ ShuyuLendingBot/
 ├── scripts/                    # 維運腳本，皆不在主程式執行路徑上、皆只用標準函式庫
 │   ├── healthcheck.py          # 容器內：唯讀讀 bot_state 心跳（M4 新增，見 D016）
 │   ├── hold_report.py          # 實際持有時間報告：唯讀開 DB，隨時可跑（D040 新增）
+│   ├── wait_report.py          # 等待時間校準報告：唯讀開 DB，隨時可跑（D045 新增）
 │   └── notify_failure.py       # 主機端：systemd 失效告警（M4 新增，見 D020）
 ├── systemd/
 │   ├── shuyu-lending-bot.container        # 正式部署的 Quadlet 單元（D017、D020）
@@ -254,6 +258,20 @@ ShuyuLendingBot/
   插出來的是資料裡不存在的數（D040 決定五）。
 - `scripts/hold_report.py`：`core/hold_time.py` 的彙總報告，唯讀開 DB（同 healthcheck
   的原則：報告不該有副作用）。`python3 scripts/hold_report.py` 隨時可跑。
+- `core/wait_time.py`：**等待估計校準量測，只量測不做決策**（D045）。
+  與 `hold_time` 刻意成對——算式 `r × P ÷ (W + P)` 裡，`hold_time` 量 `P`、
+  這一支量 `W`。把 `offer_wait_forecasts` 的「掛出時以為要等多久」對上
+  `loan_offers` → `funding_positions` 的「實際等了多久」。
+  **連續、同利率、中間沒成交過的重掛合併成一段 `WaitSpell`**——兩條合併規則
+  少了任何一條都會靜靜地吃掉樣本（第二條是實跑正式資料才發現要加的）。
+  四個誠實度來源跟數字並排：**沒成交就被取代的掛單是右設限**（不進平均，
+  但最長的那一段單獨報出來——只看成交的會把等待看得比實際短）、
+  **成交時間是偵測時間**、**配對是靠利率＋區間推出來的**、
+  **D038 之前的掛單沒有預估值**（要說「沒有」而不是填 0）。
+  高估倍數用**總量比**而不是逐筆倍數的平均，且逐筆倍數與利率涵蓋帶一起印
+  ——校準樣本全部落在模型自己選出來的窄帶，**帶外不能外推**。
+- `scripts/wait_report.py`：`core/wait_time.py` 的彙總報告，唯讀開 DB。
+  `python3 scripts/wait_report.py` 隨時可跑（`--since` 可只看某個時間之後的掛單）。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。
 - `utils/clock.py`：`now()` / `get_timezone()`——時間一律以 `config.yaml` 的
   `logging.timezone` 解析，**不吃容器環境的 `TZ`**。時區是應用程式屬性，不是部署環境的

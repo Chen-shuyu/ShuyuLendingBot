@@ -19,7 +19,7 @@
 
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from core import hold_time, market_snapshot
 from notify import messages
@@ -211,10 +211,28 @@ class BotEngine:
         # **在任何「要不要動這張單」的判斷之前先量測。** 閒置時間是這些判斷的輸入，
         # 放在後面的話，凡是提早 return 的路徑（維持不動、重掛不划算）就永遠量不到
         # ——而那正好是單子閒置最久的那些輪次（D038）。
-        self._log_idle_time(existing)
+        idle = self._log_idle_time(existing)
         self._log_live_queue_position(book, existing)
 
-        if existing and self._plans_match(existing, plans):
+        # **兩個判斷的求值提到 `if` 之前，是為了讓落地讀得到它們的結果**（M1-c）。
+        # 求值順序與短路完全保持原樣——`matched` 為真時
+        # `_cheaper_repost_is_not_worth_it()` 依然不會被呼叫，所以連它那條棄權日誌
+        # 的行數都不變。**「行為零變化」是這樣保證的，不是靠測試證明的**（D046 驗收 3）。
+        matched = bool(existing) and self._plans_match(existing, plans)
+        not_worth_it = (
+            None if matched else self._cheaper_repost_is_not_worth_it(book, existing, plans)
+        )
+        # **落地放在這一行**，是因為到這裡為止「會不會動它」已經定案，而下面三條路
+        # 各自照著它走——於是 `action` 是**讀出來的，不是預測的**。落在
+        # `_log_idle_time()` 旁邊的話就得預測下面的判斷結果，而那正是 D046 驗收
+        # 條件 2 要擋的事（落下來的反事實在說謊，比沒有更糟）。
+        # 手法與 M1-b 把決策落地緊貼日誌那一行相同：**靠位置保證，不靠承諾**（D043）。
+        self._record_repost_comparison(
+            snapshot_id, book, existing, plans, idle,
+            matched=matched, not_worth_it=not_worth_it,
+        )
+
+        if matched:
             # **這一輪什麼都不做才是對的。** 同利率下是時間優先（先掛先成交），
             # 取消重掛會把排隊位置歸零重來。以 600 秒巡檢一輪計，等於一天把自己
             # 送回隊伍末端 144 次——而這個價位的成交本來就是陣發的，
@@ -232,7 +250,6 @@ class BotEngine:
         # **用確定的利息去換估出來的速度，要先證明划得來。** 這是 2026-08-16 19:31 的
         # 形狀：低價牆把候選價位往下拖，機器人送出取消，25 秒後那張單成交——
         # 是市場先一步吃單才沒把第一筆成交砍掉（D031／D034）。
-        not_worth_it = self._cheaper_repost_is_not_worth_it(book, existing, plans)
         if not_worth_it:
             self.repository.save_state(
                 last_frr=frr,
@@ -441,7 +458,7 @@ class BotEngine:
         if line:
             self.logger.info(line)
 
-    def _log_idle_time(self, existing) -> None:
+    def _log_idle_time(self, existing) -> List[Dict[str, Any]]:
         """把「場上這張單已經掛了多久」寫進日誌，並與掛單當初的預估對照（D038）。
 
         **為什麼需要這一行**：2026-08-19 那張單掛了 18 小時沒成交，而這段期間
@@ -452,7 +469,21 @@ class BotEngine:
         **這裡只量測，不做任何決策**：要不要因為等太久而降價是策略問題，
         得先有這些數字才談得上（D036 的順序）。直接拍一個「超過 N 小時就降價」
         的常數，就是 `target_queue_usd` 的死法。
+
+        **回傳量到的東西，不要算完就丟（M1-c，D046 決定的第 1 條）。** 原本這個
+        函式回傳 `None`：`idle_hours` 與 `forgone` 每十分鐘都算一次、寫進日誌，
+        然後**沒有任何判斷式讀得到**。使用者問的「符不符合機會成本」要的正是這兩個
+        數字，它們早就算好了，只是沒有出口。
+
+        ⚠ **回傳不等於接上決策**：這一輪它只流向 `_record_repost_comparison()`
+        落成反事實資料。**閒置久不是漲價的理由**——「等太久」是「這個價位成交比
+        預期慢」的證據，它支持的是降價（D046 那條警告：兩個訊號混在一起，會在市場
+        走弱、單子掛不出去的時候去漲價，正好是最糟的時機）。
+
+        每張場上掛單一項，**兩條 `continue` 的路徑照樣進清單**、欄位補 `None`
+        ——「不知道」要落成 NULL，不是整項消失。
         """
+        measured: List[Dict[str, Any]] = []
         for offer in existing:
             created_ms = offer.get("created_at_ms")
             if created_ms is None:
@@ -460,6 +491,7 @@ class BotEngine:
                 self.logger.info(
                     f"場上掛單 #{offer.get('id')} 沒有建立時間，無法計算已閒置多久。"
                 )
+                measured.append({"offer_id": offer.get("id")})
                 continue
 
             created_at = datetime.fromtimestamp(created_ms / 1000, tz=clock.get_timezone())
@@ -474,6 +506,11 @@ class BotEngine:
                     f"場上掛單已閒置 {idle_hours:.1f} 小時"
                     f"（機會成本約 {forgone:.4f} USD），沒有留下當初的等待預估。"
                 )
+                measured.append({
+                    "offer_id": offer.get("id"),
+                    "idle_hours": idle_hours,
+                    "forgone": forgone,
+                })
                 continue
 
             if idle_hours > forecast["p75_hours"]:
@@ -489,6 +526,16 @@ class BotEngine:
                 f"中位數 {forecast['median_hours']:.1f}h／"
                 f"四分之三在 {forecast['p75_hours']:.1f}h 內 → {verdict}。"
             )
+            measured.append({
+                "offer_id": offer.get("id"),
+                "idle_hours": idle_hours,
+                "forgone": forgone,
+                "forecast_mean_hours": forecast["mean_hours"],
+                "forecast_median_hours": forecast["median_hours"],
+                "forecast_p75_hours": forecast["p75_hours"],
+                "verdict": verdict,
+            })
+        return measured
 
     def _record_market_snapshot(self, frr, book, trades, candles) -> Optional[int]:
         """把這一輪的市場長相落 DB（M1 市場資料落地），回傳那一列的 id。
@@ -558,6 +605,139 @@ class BotEngine:
             self.repository.record_pricing_decision("USD", decision, snapshot_id)
         except Exception as exc:  # noqa: BLE001 - 分析資料不值得讓一輪巡檢失敗
             self.logger.warning(f"定價決策寫入失敗，這一輪怎麼選的不會留下：{exc}")
+
+    def _record_repost_comparison(self, snapshot_id, book, existing, plans, idle,
+                                  matched: bool, not_worth_it: Optional[str]) -> None:
+        """把「保住場上那張 vs 改掛本輪候選」的並排比較落 DB（M1-c 反事實落地，D046）。
+
+        **只落資料，不改任何行為。** 呼叫端已經把「會不會動它」算完了，這裡只是
+        把那個結果連同兩條路的數字寫下來——**這個函式不參與任何判斷**。
+
+        ## 為什麼需要它
+
+        往上調價**從頭到尾沒有判準**：`_cheaper_repost_is_not_worth_it()` 第一行就
+        `if candidate.rate >= live_rate: return None`，只管往下；往上的實際規則是
+        「比場上那張高過 2% 就直接砍掉重掛，不問划不划算」。要補上判準就得先知道
+        「如果當時調高了會怎樣」，而**那個問題只有當下答得出來**：事後重算不行，
+        因為最新那根 K 還在成形，事後 UPSERT 過的 `high` 已經不是當時看到的值。
+
+        **沒有這批資料，A2-b 就只能拍門檻，而那是 `target_queue_usd` 的死法**
+        （D032／D036）。
+
+        ## 三個「跟誰比」的細節，錯一個資料就沒用
+
+        - **`live` 取場上利率最低的那張**——與 `_cheaper_repost_is_not_worth_it()`
+          和 `_log_live_queue_position()` 用同一張。取別的話，落下來的比較跟實際
+          判斷的就不是同一個對象。`candidate` 同理取 `plans` 裡最低的那個。
+        - **兩邊都走策略的 `evaluate_rate()`**，不從 `last_evaluation` 撈候選那一項。
+          `plan.rate` 經過成交價下限與 spread 的加工（`build_offer_plan()`），
+          **不保證還在候選集裡**；而更重要的是同一個函式、同一窗 `high` 算出來的
+          兩個 `effective` 才比得起來（同 `_queue_ahead()` 的「同一把尺」）。
+        - **排隊位置走 `_describe_queue()` 而不是 `_queue_ahead()`**：後者越界時
+          回 `None`（那是給「拿來比較」用的契約），而這裡是記錄，下界照樣有資訊
+          ——只要把 `truncated` 一起存下去，別讓它冒充量測值。
+
+        **策略沒有 `evaluate_rate` 就安靜跳過**：`frr_plus` 與 `orderbook_depth`
+        沒有期望值模型，沒有「實質年化」可以並排（與 `_record_pricing_decision()`、
+        `_log_pricing_rationale()` 同一個判斷）。
+
+        **場上沒有掛單就一列都不寫**（D046 驗收條件 1）——那些輪次在這張表裡
+        就該不存在，而不是存成一列什麼都是 NULL 的比較。
+
+        ⚠ **`candidate_amount` 記的是「做決定當下」的金額，不保證等於最後掛出去的**：
+        走重掛那條路時，取消完會用**真實餘額**再算一次計畫（D025：掛單金額多一分錢
+        交易所就拒絕整筆），金額因此可能差一點。**利率不會差**——`choose_rate()`
+        只吃 K 線、不看餘額，同一輪的兩次評估必然選出同一個價位（同
+        `_record_pricing_decision()` 那段註解）。落地點刻意留在取消之前，
+        因為這張表要答的是「**當時是拿什麼在做比較**」，不是「最後掛了多少」；
+        後者在 `loan_offers` 裡，兩張表對不上的那一點就是這個差。
+
+        **落帳失敗不能拖垮巡檢**：反事實資料是給 M2 用的，寫不進去就記一行警告，
+        讓它變成看得見的缺口而不是靜默的空白。
+        """
+        if not existing or not plans:
+            return
+        evaluate = getattr(self.strategy, "evaluate_rate", None)
+        if evaluate is None:
+            return
+
+        live = min(existing, key=lambda offer: float(offer["rate"]))
+        candidate = min(plans, key=lambda plan: plan.rate)
+        live_rate = float(live["rate"])
+        live_period = int(live["period"])
+
+        live_eval = evaluate(live_rate) or {}
+        candidate_eval = evaluate(candidate.rate) or {}
+
+        # `_log_idle_time()` 剛量過的那一份，對得回這張單。對不上就留 NULL——
+        # 硬湊一個閒置時數正是那個函式開頭拒絕做的事。
+        idle_of = next(
+            (item for item in idle if item.get("offer_id") == live.get("id")), {}
+        )
+
+        live_queue = self._describe_queue(book, live_rate, live_period)
+        candidate_queue = self._describe_queue(book, candidate.rate, candidate.duration)
+
+        def queue_pair(queue):
+            if queue is None:
+                return None, None
+            ahead = min(float(queue["same_period"]), float(queue["all_periods"]))
+            return ahead, bool(queue.get("truncated"))
+
+        live_ahead, live_truncated = queue_pair(live_queue)
+        candidate_ahead, candidate_truncated = queue_pair(candidate_queue)
+
+        if matched:
+            action = "hold_matched"
+            reason = f"掛單條件與場上一致（利率容差 {self.rate_tolerance_pct}%）"
+        elif not_worth_it:
+            action = "hold_cheaper_not_worth_it"
+            reason = not_worth_it
+        else:
+            action = "repost"
+            # **這一格刻意留空。** 往上調價**沒有理由可寫**，因為它沒有判準
+            # ——那正是 D046 要記下來的事。硬填一句「候選價位較高」會讓事後看的人
+            # 以為有東西判斷過（D026 靜默失效的同一族）。
+            reason = None
+
+        comparison = {
+            "strategy": type(self.strategy).__name__,
+            "live_offer_id": live.get("id"),
+            "live_offer_count": len(existing),
+            "live_rate": live_rate,
+            "live_amount": float(live["amount"]),
+            "live_period": live_period,
+            "live_idle_hours": idle_of.get("idle_hours"),
+            "live_forgone_usd": idle_of.get("forgone"),
+            "live_forecast_mean_hours": idle_of.get("forecast_mean_hours"),
+            "live_forecast_median_hours": idle_of.get("forecast_median_hours"),
+            "live_forecast_p75_hours": idle_of.get("forecast_p75_hours"),
+            "live_wait_hours": live_eval.get("wait_hours"),
+            "live_hits": live_eval.get("hits"),
+            "live_censored_ratio": live_eval.get("censored_ratio"),
+            "live_effective": live_eval.get("effective"),
+            "candidate_rate": candidate.rate,
+            "candidate_amount": candidate.amount,
+            "candidate_period": candidate.duration,
+            "candidate_wait_hours": candidate_eval.get("wait_hours"),
+            "candidate_hits": candidate_eval.get("hits"),
+            "candidate_censored_ratio": candidate_eval.get("censored_ratio"),
+            "candidate_effective": candidate_eval.get("effective"),
+            "live_queue_ahead": live_ahead,
+            "live_queue_truncated": live_truncated,
+            "candidate_queue_ahead": candidate_ahead,
+            "candidate_queue_truncated": candidate_truncated,
+            "action": action,
+            "action_reason": reason,
+            # 已知錯的那個 48，理由同 `pricing_decisions`：存的是**當時假設了什麼**。
+            "hold_hours_assumed": getattr(self.strategy, "offer_period", 0) * 24.0 or None,
+            "window_hours": getattr(self.strategy, "ev_window_hours", None),
+        }
+
+        try:
+            self.repository.record_repost_comparison("USD", comparison, snapshot_id)
+        except Exception as exc:  # noqa: BLE001 - 反事實資料不值得讓一輪巡檢失敗
+            self.logger.warning(f"重掛比較寫入失敗，這一輪的反事實不會留下：{exc}")
 
     def _record_wait_forecast(self, result) -> None:
         """把掛單當下的等待預估落 DB，供事後校準（D038）。

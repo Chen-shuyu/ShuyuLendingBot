@@ -729,3 +729,117 @@ class TestPricingDecisionRecord:
             344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=self._candles()
         )
         assert strategy.pricing_decision() is not None
+
+
+class TestEvaluateRate:
+    """對**任意**利率重新評估（M1-c，D046）。
+
+    這個方法存在的唯一理由是「兩邊要用同一把尺」：M1-c 要把「保住場上那張單」跟
+    「改掛本輪候選」的實質年化並排比較，而**場上那張的利率通常不在候選集裡**
+    ——它是更早某一輪選出來的，中間還經過成交價下限與 spread 的加工。
+
+    所以這裡驗的是三件事：**同一把尺**（跟 `last_evaluation` 對得起來）、
+    **算不出來時講得清楚**（命中不足要留下 `hits`，不是回一個空白）、
+    以及**不准跨輪殘留**（D041 的那條規則，`last_highs` 是第四個成員）。
+    """
+
+    def _evaluated(self, **overrides):
+        """跑一輪真的評估過的定價，讓策略手上留著本輪那一窗。"""
+        strategy = ExpectedValueStrategy(base_config(**overrides))
+        highs = [daily(20.0) if i % 10 == 0 else daily(9.0) for i in range(60)]
+        strategy.choose_rate([candle(i, high) for i, high in enumerate(highs)])
+        return strategy
+
+    def test_沒評估過就回None(self):
+        assert ExpectedValueStrategy(base_config()).evaluate_rate(daily(9.0)) is None
+
+    def test_跟last_evaluation裡同一個利率算出來的完全相同(self):
+        """**這是「同一把尺」的本體。** 候選價位的 `effective` 出自
+        `choose_rate()`，場上那張的出自這裡；兩者只要有一絲不同，
+        並排比出來的差額就有一部分是尺的差，而不是市場的差。
+        """
+        strategy = self._evaluated()
+        item = strategy.last_evaluation[0]
+
+        again = strategy.evaluate_rate(item["rate"])
+
+        assert again["wait_hours"] == pytest.approx(item["wait_hours"])
+        assert again["median_hours"] == pytest.approx(item["median_hours"])
+        assert again["p75_hours"] == pytest.approx(item["p75_hours"])
+        assert again["hits"] == item["hits"]
+        assert again["censored_ratio"] == pytest.approx(item["censored_ratio"])
+        assert again["effective"] == pytest.approx(item["effective"])
+
+    def test_候選集以外的利率也算得出來(self):
+        """場上那張單的利率不必是窗內出現過的 `high`。
+
+        真實情境：`build_offer_plan()` 把選出來的價位經過成交價下限與 spread
+        加工之後才掛出去，於是**實際掛在場上的利率通常不在候選集裡**。
+        """
+        strategy = self._evaluated()
+        odd_rate = daily(9.37)  # 刻意不是任何一根 K 的 high
+        assert odd_rate not in [item["rate"] for item in strategy.last_evaluation]
+
+        result = strategy.evaluate_rate(odd_rate)
+
+        assert result is not None
+        assert result["rate"] == pytest.approx(odd_rate)
+        assert result["effective"] > 0
+
+    def test_命中不足時照樣回一列而且留下hits(self):
+        """**這一條是 08-19 那張單的形狀**：掛 9.78% 在場 34.2 小時沒成交。
+
+        回 `None` 的話，「窗裡一次都沒掃到這麼高」與「掃到了但只有三次」
+        會被壓成同一個空白，而那兩件事在分析長尾時意義完全不同。
+        """
+        strategy = self._evaluated(ev_min_hits=5)
+        too_high = daily(25.0)  # 窗內最高只到 20%
+
+        result = strategy.evaluate_rate(too_high)
+
+        assert result is not None, "算不出實質年化不等於不留紀錄"
+        assert result["effective"] is None
+        assert result["wait_hours"] is None
+        assert result["hits"] == 0, "『一次都沒掃到』要看得出來"
+
+    def test_掃到但次數不夠時hits講得出差多少(self):
+        """對照組：跟上面那條是兩件事，而 `hits` 是唯一分得出來的欄位。
+
+        窗內每 10 根有一根 20%，60 根共 **6 次**；把門檻拉到 10 次，
+        於是「掃到過但不夠」與「從沒掃到」在 `effective` 上長得一模一樣，
+        **只有 `hits` 分得出來**——6 對 0。
+        """
+        strategy = self._evaluated(ev_min_hits=10)
+
+        scanned = strategy.evaluate_rate(daily(20.0))
+        never = strategy.evaluate_rate(daily(25.0))
+
+        assert scanned["effective"] is None and never["effective"] is None
+        assert scanned["hits"] == 6, "掃到過六次"
+        assert never["hits"] == 0, "一次都沒掃到"
+
+    def test_不准跨輪殘留(self):
+        """`last_highs` 是第四個「本輪的狀態」，重置點跟前三個是同一處（D041）。
+
+        少了這條，資金借出去、餘額掉到門檻以下的那些輪次，會拿**上一輪的窗**
+        去評估這一輪場上那張單——而那正是 D041 兩個 bug 的成因。
+        """
+        strategy = ExpectedValueStrategy(base_config())
+        candles = [candle(i, daily(10.0)) for i in range(60)]
+        strategy.build_offer_plan(
+            344.3, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=candles
+        )
+        assert strategy.evaluate_rate(daily(9.0)) is not None, "前置條件：這一輪評估過"
+
+        strategy.build_offer_plan(
+            0.01, 0.0002, book=[], trades=trades_at(daily(10.0)), candles=candles
+        )
+
+        assert strategy.evaluate_rate(daily(9.0)) is None
+
+    def test_利率為零或負數回None(self):
+        """不是防禦性寫法：`live_rate` 來自交易所回應，而 D027 記的正是
+        「測試看到的世界比真實世界乾淨」。"""
+        strategy = self._evaluated()
+        assert strategy.evaluate_rate(0) is None
+        assert strategy.evaluate_rate(-0.0001) is None

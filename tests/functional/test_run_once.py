@@ -5,6 +5,8 @@
 照順序發生、資料有沒有正確落地」，而不是單一函式的計算結果。
 """
 
+import sqlite3
+
 import pytest
 
 from core import bot_engine
@@ -2013,3 +2015,251 @@ class TestPricingDecisionLands:
         rows = decisions_in_db(repository)
         assert len(rows) == 1
         assert rows[0]["snapshot_id"] is None
+
+
+def comparisons_in_db(repository):
+    return [
+        dict(row)
+        for row in repository.connection.execute(
+            "SELECT * FROM repost_comparisons ORDER BY id"
+        )
+    ]
+
+
+class TestRepostComparisonLands:
+    """「保住 vs 改掛」的並排比較要落地（M1-c 反事實落地，D046）。
+
+    **這一組測的是 D046 的驗收條件 1 與 2**，而第 2 條是整段最容易做錯的地方：
+    落下來的 `action` 必須是**這一輪真的發生的事**，不是對下面那些判斷的預測。
+    不一致的話，落下來的反事實在說謊——**比沒有更糟**。
+
+    保證的手法是位置：`action` 由呼叫端已經算完的 `matched` / `not_worth_it`
+    讀出來，而下面三條路照著同樣那兩個值走。所以這裡要驗的是
+    **「DB 那一列」與「客戶端真的被呼叫了什麼」對得起來**，
+    而不是欄位有值。
+    """
+
+    make_strategy = staticmethod(TestMarketSnapshotLands.make_strategy)
+    candles = staticmethod(TestMarketSnapshotLands.candles)
+    make_client = TestMarketSnapshotLands.make_client
+
+    def test_場上沒有掛單就一列都不寫(self, fake_logger, fake_notifier, repository,
+                                      no_sleep, strategy_config):
+        """**D046 驗收條件 1 的前半。** 資金 98% 的時間鎖在部位裡，場上根本沒有單
+        ——那些輪次在這張表裡就該不存在，而不是存成一列什麼都是 NULL 的比較。"""
+        client = self.make_client()
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.offers, "前置條件：這一輪真的掛了單"
+        assert comparisons_in_db(repository) == []
+
+    def test_維持不動的一輪落一列而且action說的就是維持不動(self, fake_logger,
+                                                              fake_notifier, repository,
+                                                              no_sleep, strategy_config):
+        """場上那張跟本輪候選一致 → 走 `_plans_match()` 那條路。"""
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(rate=0.00026, amount=600.0)]
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.cancel_calls == 0, "前置條件：這一輪真的沒動它"
+        rows = comparisons_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["action"] == "hold_matched"
+        assert rows[0]["live_rate"] == pytest.approx(0.00026)
+        assert rows[0]["strategy"] == "ExpectedValueStrategy"
+
+    def test_往上調價的一輪落一列而且action說的就是重掛(self, fake_logger, fake_notifier,
+                                                          repository, no_sleep,
+                                                          strategy_config):
+        """**這是 D046 的主角。** 場上掛 0.00020、本輪候選 0.00026，高過 2% 容差
+        於是直接砍掉重掛——**而沒有任何判斷式問過划不划算**
+        （`_cheaper_repost_is_not_worth_it()` 第一行就 `return None`）。
+
+        這一列存在的全部意義，就是讓 M2 事後答得出「當時調高了，然後呢」。
+        """
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(rate=0.00020, amount=600.0)]
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.cancel_calls == 1, "前置條件：這一輪真的動了它"
+        rows = comparisons_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["action"] == "repost"
+        assert rows[0]["candidate_rate"] > rows[0]["live_rate"], "往上調"
+        assert rows[0]["action_reason"] is None, "往上調價沒有判準可寫，這一格刻意留空"
+
+    def test_兩條路的實質年化並排落下來(self, fake_logger, fake_notifier, repository,
+                                        no_sleep, strategy_config):
+        """**這是 M2 真正要吃的東西**：保住那張 vs 改掛，兩個實質年化。
+
+        兩邊都得走策略的 `evaluate_rate()`——同一個函式、同一窗 `high`，
+        算出來的兩個數字才比得起來（`_queue_ahead()` 的「同一把尺」）。
+        """
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(rate=0.00020, amount=600.0)]
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        row = comparisons_in_db(repository)[0]
+        assert row["live_effective"] is not None
+        assert row["candidate_effective"] is not None
+        assert row["live_wait_hours"] is not None
+        assert row["candidate_wait_hours"] is not None
+        assert row["hold_hours_assumed"] == pytest.approx(48.0)
+        assert row["window_hours"] == 168
+
+    def test_比較指得回本輪的市場快照(self, fake_logger, fake_notifier, repository,
+                                      no_sleep, strategy_config):
+        """接不起來的話，M2 就答不出「當時的簿子長那樣，這個調高才是對的嗎」。"""
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(rate=0.00020, amount=600.0)]
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert comparisons_in_db(repository)[0]["snapshot_id"] == \
+            snapshots_in_db(repository)[0]["id"]
+
+    def test_閒置時間與機會成本落得下來(self, fake_logger, fake_notifier, repository,
+                                        no_sleep, strategy_config):
+        """**D046 決定的第 1 條**：`_log_idle_time()` 算出來的兩個數字原本
+        每十分鐘算一次然後丟掉，沒有任何判斷式讀得到。現在它們有出口了。
+
+        ⚠ 有出口不等於接上決策——這一輪它只流向反事實資料。
+        """
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(rate=0.00026, amount=600.0)]
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        row = comparisons_in_db(repository)[0]
+        assert row["live_idle_hours"] is not None and row["live_idle_hours"] > 0
+        assert row["live_forgone_usd"] is not None and row["live_forgone_usd"] > 0
+        assert row["live_offer_id"] == "1", "對得回 offer_wait_forecasts"
+
+    def test_沒有期望值模型的策略安靜跳過(self, fake_logger, fake_notifier, repository,
+                                          no_sleep, strategy):
+        """`frr_plus` 沒有 `evaluate_rate()`，也就沒有「實質年化」可以並排。
+
+        硬要它回答只會多一個會爆的地方——與 `_record_pricing_decision()`、
+        `_log_pricing_rationale()` 同一個判斷。
+        """
+        client = FakeClient(balance=0.0, frr=0.0002,
+                            active_offers=[live_offer(rate=0.0004 * 1.05)])
+
+        run_once(fake_logger, fake_notifier, strategy, client, repository)
+
+        assert client.cancel_calls == 1, "前置條件：這一輪真的走到重掛"
+        assert comparisons_in_db(repository) == []
+
+    def test_落帳失敗不影響掛單行為(self, fake_logger, fake_notifier, repository,
+                                    no_sleep, strategy_config, monkeypatch):
+        """反事實資料是給 M2 用的，寫不進去就記一行警告
+        ——**讓它變成看得見的缺口，而不是一輪失敗的巡檢**。"""
+        client = self.make_client(
+            balance=0.0, active_offers=[live_offer(rate=0.00020, amount=600.0)]
+        )
+
+        def boom(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(repository, "record_repost_comparison", boom)
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.cancel_calls == 1 and len(client.offers) == 1, "掛單照常"
+        assert any("重掛比較寫入失敗" in message
+                   for message in fake_logger.messages["warning"])
+
+    # 底端一道厚牆擋在兩個價位之前，於是降價幾乎換不到速度
+    # ——19:31 那一夜的形狀（D031／D034）。牆在候選價位**之下**是關鍵：
+    # 降下去也跳不過它，隊伍只縮短那 50,000。
+    WALLED_BELOW = [
+        {"rate": 0.00020, "period": 2, "amount": 1_820_000.0},
+        {"rate": 0.00026, "period": 2, "amount": 50_000.0},
+        {"rate": 0.00035, "period": 2, "amount": 50_000.0},
+        {"rate": 0.00050, "period": 2, "amount": 5_000_000.0},
+    ]
+
+    def test_往下重掛不划算的一輪落一列而且action說得出是哪一道守門檻(
+            self, fake_logger, fake_notifier, repository, no_sleep, strategy_config):
+        """第三條路：候選價位比場上那張低，而守門檻判定「補不回少收的利息」。
+
+        **三條路都要驗，因為 `action` 是三選一**——漏掉一條，就有一種輪次會
+        默默落成別的值，而事後沒有人分得出來。
+        """
+        client = self.make_client(
+            balance=0.0,
+            active_offers=[live_offer(rate=0.00035, amount=600.0)],
+            book=self.WALLED_BELOW,
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        assert client.cancel_calls == 0, "前置條件：守門檻真的擋下來了"
+        rows = comparisons_in_db(repository)
+        assert len(rows) == 1
+        assert rows[0]["action"] == "hold_cheaper_not_worth_it"
+        assert rows[0]["candidate_rate"] < rows[0]["live_rate"], "往下調"
+        assert "單位時間報酬" in rows[0]["action_reason"], "理由就是守門檻自己講的那一句"
+
+    def test_action與日誌講的是同一件事(self, fake_logger, fake_notifier, repository,
+                                        no_sleep, strategy_config):
+        """**D046 驗收條件 2 的本體。**
+
+        落下來的 `action` 若與同一輪日誌不一致，那一列反事實就是在說謊
+        ——而說謊的資料比沒有資料更糟，因為 M2 會相信它。
+        """
+        client = self.make_client(
+            balance=0.0,
+            active_offers=[live_offer(rate=0.00035, amount=600.0)],
+            book=self.WALLED_BELOW,
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        row = comparisons_in_db(repository)[0]
+        logged = " ".join(fake_logger.messages["info"])
+        assert row["action"] == "hold_cheaper_not_worth_it"
+        assert "維持不動" in logged
+        assert row["action_reason"] in logged, "DB 那一列的理由，就是日誌印出去的那一句"
+
+    def test_排隊位置順手落下來而且越界要標得出來(self, fake_logger, fake_notifier,
+                                                  repository, no_sleep, strategy_config):
+        """A2-b 的「空窗與排隊位置的成本」遲早要用到它，而這張表長得極慢
+        ——漏一欄等於再等好幾個月才補得回來。
+
+        **越界時落的是下界**，由 `*_truncated` 標著：簿子固定截斷 250 檔，
+        可見範圍會隨底下供給的厚薄呼吸，那個旗標不是角落情況（TASKS.md A2）。
+        """
+        client = self.make_client(
+            balance=0.0,
+            active_offers=[live_offer(rate=0.00035, amount=600.0)],
+            book=self.WALLED_BELOW,
+        )
+
+        run_once(fake_logger, fake_notifier, self.make_strategy(strategy_config), client,
+                 repository)
+
+        row = comparisons_in_db(repository)[0]
+        assert row["live_queue_ahead"] is not None
+        assert row["candidate_queue_ahead"] is not None
+        assert row["live_queue_ahead"] > row["candidate_queue_ahead"], \
+            "掛得越貴，前面排的錢越多"
+        assert row["live_queue_truncated"] == 0, "0.00050 那一檔在上面，沒有越界"

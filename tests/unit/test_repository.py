@@ -790,3 +790,145 @@ class TestPricingDecisions:
             0.00024971,
             0.00021918,
         ]
+
+
+class TestRepostComparisons:
+    """`repost_comparisons` 的寫入（M1-c 反事實落地，D046）。
+
+    **這張表存的是「沒發生的那條路」**，而沒發生的事沒有鄰行可以拆穿它
+    ——所以這裡驗的第一件事跟 `pricing_decisions` 一樣：**場上沒有掛單的輪次
+    不可以留下任何一列**（D046 驗收條件 1 的字面意思）。
+
+    第二件事是 **NULL 要保持 NULL**：`live_effective` 算不出來就是算不出來，
+    補成 0 會讓它在事後的聚合裡冒充「實質年化為零」，那比缺一格更糟。
+    """
+
+    @staticmethod
+    def rows(repository):
+        return repository.connection.execute(
+            "SELECT * FROM repost_comparisons ORDER BY id"
+        ).fetchall()
+
+    @staticmethod
+    def comparison(**overrides):
+        base = {
+            "strategy": "ExpectedValueStrategy",
+            "live_offer_id": 464505426,
+            "live_offer_count": 1,
+            "live_rate": 0.00024971,
+            "live_amount": 344.72,
+            "live_period": 2,
+            "live_idle_hours": 2.4,
+            "live_forgone_usd": 0.0086,
+            "live_forecast_mean_hours": 7.09,
+            "live_forecast_median_hours": 3.5,
+            "live_forecast_p75_hours": 10.0,
+            "live_wait_hours": 8.04,
+            "live_hits": 66,
+            "live_censored_ratio": 0.0,
+            "live_effective": 0.00021409,
+            "candidate_rate": 0.00027,
+            "candidate_amount": 344.72,
+            "candidate_period": 2,
+            "candidate_wait_hours": 14.2,
+            "candidate_hits": 21,
+            "candidate_censored_ratio": 0.02,
+            "candidate_effective": 0.00020876,
+            "live_queue_ahead": 5_381_114.0,
+            "live_queue_truncated": True,
+            "candidate_queue_ahead": 5_381_114.0,
+            "candidate_queue_truncated": True,
+            "action": "hold_matched",
+            "action_reason": "掛單條件與場上一致（利率容差 2%）",
+            "hold_hours_assumed": 48.0,
+            "window_hours": 168,
+        }
+        base.update(overrides)
+        return base
+
+    def test_空的比較不留任何一列(self, repository):
+        """場上沒有掛單的輪次，在這張表裡就該不存在——**而不是存成一列
+        什麼都是 NULL 的比較**（D043 的同一條界線）。"""
+        assert repository.record_repost_comparison("USD", {}) is None
+        assert repository.record_repost_comparison("USD", None) is None
+        assert self.rows(repository) == []
+
+    def test_寫得進去也讀得回來(self, repository):
+        row_id = repository.record_repost_comparison("USD", self.comparison(), 327)
+
+        rows = self.rows(repository)
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row["id"] == row_id
+        assert row["snapshot_id"] == 327, "指得回本輪的市場長相"
+        assert row["live_rate"] == pytest.approx(0.00024971)
+        assert row["candidate_rate"] == pytest.approx(0.00027)
+        assert row["action"] == "hold_matched"
+
+    def test_offer_id存成字串才對得上等待預估那張表(self, repository):
+        """`offer_wait_forecasts.offer_id` 是 TEXT。型別不一致的話
+        「當初的預估 vs 後來每一輪的重估」這個 JOIN 會安靜地回空集合。"""
+        repository.record_repost_comparison("USD", self.comparison())
+
+        row = dict(self.rows(repository)[0])
+        assert row["live_offer_id"] == "464505426"
+
+        repository.record_wait_forecast(
+            464505426,
+            {"rate": 0.00024971, "mean_hours": 7.09, "median_hours": 3.5,
+             "p75_hours": 10.0, "hits": 66, "censored_ratio": 0.0, "window_hours": 168},
+        )
+        joined = repository.connection.execute(
+            "SELECT f.mean_hours FROM repost_comparisons c "
+            "JOIN offer_wait_forecasts f ON f.offer_id = c.live_offer_id"
+        ).fetchall()
+        assert len(joined) == 1, "兩張表要 JOIN 得起來"
+
+    def test_算不出實質年化的那一列照樣要寫而且NULL保持NULL(self, repository):
+        """**這是 08-19 那張單的形狀**：掛 9.78% 在場 34.2 小時沒成交，
+        窗內命中不足，算不出實質年化。
+
+        那一列是最想留住的一列（D046 驗收條件 4 要靠它），而
+        `live_effective` 補成 0 會讓它在事後聚合時冒充「賺 0%」。
+        """
+        repository.record_repost_comparison(
+            "USD",
+            self.comparison(live_effective=None, live_wait_hours=None,
+                            live_censored_ratio=None, live_hits=0),
+        )
+
+        row = dict(self.rows(repository)[0])
+        assert row["live_effective"] is None
+        assert row["live_wait_hours"] is None
+        assert row["live_hits"] == 0, "『一次都沒掃到』是 0，不是 NULL"
+
+    def test_越界旗標答不出來時不可以被壓成沒越界(self, repository):
+        """`None`（拿不到簿子，答不出來）與 `False`（問過了，沒越界）
+        是兩件事。`int()` 會把前者壓成 0，於是事後看起來像「量過而且沒越界」
+        ——D026 靜默失效的同一族。"""
+        repository.record_repost_comparison(
+            "USD",
+            self.comparison(live_queue_truncated=None, live_queue_ahead=None,
+                            candidate_queue_truncated=False),
+        )
+
+        row = dict(self.rows(repository)[0])
+        assert row["live_queue_truncated"] is None
+        assert row["candidate_queue_truncated"] == 0
+
+    def test_三種action都落得下去(self, repository):
+        for action in ("hold_matched", "hold_cheaper_not_worth_it", "repost"):
+            repository.record_repost_comparison("USD", self.comparison(action=action))
+
+        assert [dict(r)["action"] for r in self.rows(repository)] == [
+            "hold_matched", "hold_cheaper_not_worth_it", "repost"
+        ]
+
+    def test_往上調價那一列的理由是空的(self, repository):
+        """**刻意的**：往上調價沒有判準可寫，那正是 D046 要記下來的事。
+        硬填一句理由會讓事後看的人以為有東西判斷過。"""
+        repository.record_repost_comparison(
+            "USD", self.comparison(action="repost", action_reason=None)
+        )
+
+        assert dict(self.rows(repository)[0])["action_reason"] is None

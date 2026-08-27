@@ -180,6 +180,14 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 重置點只有一個，就在 `build_offer_plan()` 的開頭。
         self.last_window: Dict[str, Any] = {}
 
+        # **本輪**評估用的那一窗 `high`，供 `evaluate_rate()` 對任意利率重估（M1-c）。
+        # 留下的是窗本身而不是評估結果：場上那張既有掛單的利率通常**不在**候選集裡
+        # （它是更早某一輪選出來的，中間還經過成交價下限與 spread 的加工），
+        # 所以要比較「保住它 vs 改掛」就得能對一個沒算過的利率重新評估。
+        #
+        # **第四個「本輪的狀態」，一樣只在同一處重置**（見上面那段的理由）。
+        self.last_highs: List[float] = []
+
 
     # ------------------------------------------------------------------
     # 小工具
@@ -374,6 +382,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         """
         self.last_evaluation = []
         self.last_window = {}
+        self.last_highs = []
         if len(candles) < self.ev_min_candles:
             return None
 
@@ -388,6 +397,9 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
             "candle_count": len(window),
             "candle_latest_mts": window[-1].get("mts"),
         }
+        # 留給 `evaluate_rate()`：M1-c 要拿**同一窗**去評估場上那張單的利率，
+        # 兩邊用同一把尺算出來的實質年化才比得起來。
+        self.last_highs = highs
 
         # **這個假設已知與現實不符，刻意先不改**（TASKS.md D1、DECISIONS.md D040）。
         # 借款人可以隨時還款，所以 `offer_period` 是上限而不是實際持有時間：
@@ -427,6 +439,64 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
 
         return best_rate
 
+    def evaluate_rate(self, rate: float) -> Optional[Dict[str, Any]]:
+        """用**本輪那一窗**回答「掛在這個利率會是什麼結果」（M1-c，D046）。
+
+        `choose_rate()` 的候選只取自窗內出現過的 `high`，所以**場上那張既有掛單
+        的利率通常不在候選集裡**——它是更早某一輪選出來的，而且中間還經過成交價
+        下限與 spread 的加工（見 `build_offer_plan()`）。要把「保住它」跟「改掛
+        本輪候選」並排比較，就得能對一個沒算過的利率重新評估一次。
+
+        **兩邊一定要走同一個函式。** 候選價位的 `effective` 出自這裡的算式，
+        場上那張若改用排隊金額換算，比出來的差額有一半會是兩把尺的差
+        ——`bot_engine._queue_ahead()` 的註解講的是同一件事。
+
+        回傳的 dict 與 `last_evaluation` 每一項同形狀。**本輪沒評估過**
+        （`choose_rate()` 沒跑到，或 K 線根本不夠）就回 `None`。
+
+        **命中不足 `ev_min_hits` 時照樣回一列**，只是等待相關的欄位是 `None`、
+        `hits` 填實際數字：「窗裡一次都沒掃到這麼高（`hits=0`）」與「掃到了但只有
+        三次（`hits=3 < 5`）」在分析長尾時意義完全不同，而回 `None` 會把兩者
+        壓成同一個空白。**08-19 那張掛了 34.2 小時沒成交的單，落下來就會長這樣**
+        ——那正是最想留住的一列，不能因為算不出實質年化就不寫。
+
+        ⚠ **回傳的等待不是「還要等多久」**：`estimate_wait()` 問的是「從任意時刻
+        進場要等多久」，而場上那張已經等了一段時間了。拿無記憶分佈去估剩餘等待
+        是高估（D045 已量出整體高估 3.9 倍），條件機率是 M2 的題目。
+
+        **唯讀，不動任何 `last_*`。** 它跟 `describe_decision()`／
+        `pricing_decision()`／`chosen_forecast()` 是同一族：對本輪評估殘留的投影，
+        所以引擎只要傳一個利率進來，不必也不該讓策略看見場上那張單（D046）。
+        """
+        if not self.last_highs or rate <= 0:
+            return None
+
+        hits = sum(1 for high in self.last_highs if high >= rate)
+        estimate = self.estimate_wait(self.last_highs, rate)
+        if estimate is None:
+            return {
+                "rate": rate,
+                "wait_hours": None,
+                "median_hours": None,
+                "p75_hours": None,
+                "hits": hits,
+                "censored_ratio": None,
+                "effective": None,
+            }
+
+        # 與 `choose_rate()` 完全同一條算式（D034）。**這個 `hold_hours` 是已知
+        # 錯的**（D040：實測完成率 51.8%），但兩邊都用它，所以比較仍然公平。
+        hold_hours = self.offer_period * 24.0
+        return {
+            "rate": rate,
+            "wait_hours": estimate.mean_hours,
+            "median_hours": estimate.median_hours,
+            "p75_hours": estimate.p75_hours,
+            "hits": estimate.hits,
+            "censored_ratio": estimate.censored_ratio,
+            "effective": rate * hold_hours / (estimate.mean_hours + hold_hours),
+        }
+
     # ------------------------------------------------------------------
     # 掛單計畫
     # ------------------------------------------------------------------
@@ -453,6 +523,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # （M1-b）就是照這條規則放進來的第三個成員。
         self.last_evaluation = []
         self.last_window = {}
+        self.last_highs = []
 
         if balance_usd < self.min_required_usd:
             return self._skip(

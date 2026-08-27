@@ -408,6 +408,92 @@ class Repository:
             )
         return cursor.lastrowid
 
+    def record_repost_comparison(
+        self,
+        currency: str,
+        comparison: Dict[str, Any],
+        snapshot_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """記下這一輪「保住場上那張 vs 改掛本輪候選」的並排比較（M1-c 反事實落地）。
+
+        `comparison` 由 `bot_engine._record_repost_comparison()` 組好——**引擎層算
+        比較、這裡只負責寫**，與 `record_pricing_decision()` 同一種分工。
+
+        `comparison` 是空的就什麼都不做並回傳 `None`：**場上沒有掛單的輪次，
+        在這張表裡就該不存在**，而不是存成一列什麼都是 NULL 的比較（D043 的同一條
+        界線）。這也是 D046 驗收條件 1 的字面意思。
+
+        **允許 NULL 的欄位不要在這裡補預設值。** `live_effective` 算不出來就是
+        算不出來（窗內命中不足），寫成 0 會讓它在事後的聚合裡冒充「實質年化為零」
+        ——那比缺一格更糟。
+        """
+        if not comparison:
+            return None
+
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO repost_comparisons
+                    (compared_at, currency, strategy, snapshot_id,
+                     live_offer_id, live_offer_count, live_rate, live_amount,
+                     live_period, live_idle_hours, live_forgone_usd,
+                     live_forecast_mean_hours, live_forecast_median_hours,
+                     live_forecast_p75_hours,
+                     live_wait_hours, live_hits, live_censored_ratio, live_effective,
+                     candidate_rate, candidate_amount, candidate_period,
+                     candidate_wait_hours, candidate_hits, candidate_censored_ratio,
+                     candidate_effective,
+                     live_queue_ahead, live_queue_truncated,
+                     candidate_queue_ahead, candidate_queue_truncated,
+                     action, action_reason, hold_hours_assumed, window_hours)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso(),
+                    currency,
+                    comparison.get("strategy"),
+                    snapshot_id,
+                    # 型別對齊 `offer_wait_forecasts.offer_id`（TEXT），
+                    # 兩張表要 JOIN 得起來才對得出「當初的預估 vs 後來每一輪的重估」。
+                    None if comparison.get("live_offer_id") is None
+                    else str(comparison["live_offer_id"]),
+                    comparison["live_offer_count"],
+                    comparison["live_rate"],
+                    comparison.get("live_amount"),
+                    comparison.get("live_period"),
+                    comparison.get("live_idle_hours"),
+                    comparison.get("live_forgone_usd"),
+                    comparison.get("live_forecast_mean_hours"),
+                    comparison.get("live_forecast_median_hours"),
+                    comparison.get("live_forecast_p75_hours"),
+                    comparison.get("live_wait_hours"),
+                    comparison.get("live_hits"),
+                    comparison.get("live_censored_ratio"),
+                    comparison.get("live_effective"),
+                    comparison["candidate_rate"],
+                    comparison.get("candidate_amount"),
+                    comparison.get("candidate_period"),
+                    comparison.get("candidate_wait_hours"),
+                    comparison.get("candidate_hits"),
+                    comparison.get("candidate_censored_ratio"),
+                    comparison.get("candidate_effective"),
+                    comparison.get("live_queue_ahead"),
+                    # SQLite 沒有布林；`None` 要保持 `None`（「答不出來」），
+                    # 不可以被 `int()` 壓成 0（「沒有越界」）——那是兩件事。
+                    None if comparison.get("live_queue_truncated") is None
+                    else int(bool(comparison["live_queue_truncated"])),
+                    comparison.get("candidate_queue_ahead"),
+                    None if comparison.get("candidate_queue_truncated") is None
+                    else int(bool(comparison["candidate_queue_truncated"])),
+                    comparison["action"],
+                    comparison.get("action_reason"),
+                    comparison.get("hold_hours_assumed"),
+                    comparison.get("window_hours"),
+                ),
+            )
+        return cursor.lastrowid
+
     def upsert_daily_earning(
         self,
         date: str,

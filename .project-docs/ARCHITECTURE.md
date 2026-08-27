@@ -71,11 +71,12 @@ ShuyuLendingBot/
 │   ├── models.py               # loan_offers / earnings_daily / funding_positions /
 │   │                            # bot_state / offer_wait_forecasts /
 │   │                            # market_snapshots / market_candles /
-│   │                            # pricing_decisions 的 DDL
+│   │                            # pricing_decisions / repost_comparisons 的 DDL
 │   │                            # （funding_positions 為 D030、
 │   │                            #   offer_wait_forecasts 為 D038、
 │   │                            #   market_* 兩張為 D042、
-│   │                            #   pricing_decisions 為 D043 新增）
+│   │                            #   pricing_decisions 為 D043、
+│   │                            #   repost_comparisons 為 D046 新增）
 │   └── repository.py           # SQLite WAL 讀寫封裝（M3 新增）
 ├── notify/
 │   ├── line_messaging.py       # LineNotifier：LINE Messaging API push（見 D002、D024）
@@ -158,6 +159,13 @@ ShuyuLendingBot/
   4. **`ev_min_hits`** 擋尾端：窗內最高的那一兩根 K 永遠「命中 1 次」，
      不擋的話期望值會一路爬到一個只發生過一次、等不到的價位。
 
+  `evaluate_rate()`（D046，M1-c）是同一套算式對**任意**利率的入口：本輪那一窗
+  （`last_highs`）已經留著，傳一個利率進去就回一份與 `last_evaluation` 同形狀的評估。
+  引擎拿它比較「場上那張 vs 本輪候選」——**場上那張的利率通常不在候選集裡**，
+  而兩邊必須用同一把尺算。**唯讀，不動任何 `last_*`**，與
+  `describe_decision()`／`pricing_decision()`／`chosen_forecast()` 同一族；
+  `last_highs` 是第四個「本輪的狀態」，**重置點跟前三個是同一處**（D041）。
+
   `describe_decision()` 把整段推導濃縮成一行給迴圈層寫日誌，
   `chosen_forecast()` 交出掛單當下的預估供落 DB（策略層仍然不碰 IO）。
   D033 與 D030 的兩道防線（成交價下限、`minimum_rate` 絕對地板）**原封不動沿用**。
@@ -224,6 +232,21 @@ ShuyuLendingBot/
   候選集只留價位與實質年化兩排、不留每個候選的等待分佈：實測 110 個候選的完整評估
   是 17 KB，兩排是 2.6 KB，而 `effective` 就是排序依據——**留下它才答得出
   「為什麼是這個價位」**，那正是 D3 的問題。
+  `repost_comparisons` 是**反事實的落地**（D046，M1-c）：場上有掛單的每一輪一列，
+  「保住那張 vs 改掛本輪候選」的實質年化並排，外加閒置時間、機會成本、當初的預估、
+  兩邊的排隊位置，以及**照現在的規則實際做了什麼**（三選一的 `action`）。
+  它補的是「**往上調價從頭到尾沒有判準**」這個缺口——守門檻第一行就
+  `if candidate.rate >= live_rate: return None`，只管往下。
+  **只落資料、不改行為**：沒有這批反事實，A2-b 的門檻就只能拍（D032／D036）。
+  兩邊的實質年化都走 `ExpectedValueStrategy.evaluate_rate()` 算，因為場上那張的
+  利率**通常不在候選集裡**，而兩邊得用**同一把尺**（同 `_queue_ahead()` 的分工）。
+  **寫入點在 `_plans_match()` 與往下重掛守門檻的求值之後、三條出口之前**：
+  到那一行為止「會不會動它」已經定案，於是 `action` 是**讀出來的、不是預測的**
+  ——與 `pricing_decisions` 緊貼日誌那一行是同一個手法（靠位置保證，不靠承諾）。
+  **場上沒有掛單的輪次一列都不寫**；`live_effective` 算不出來時那一列照樣要寫，
+  由 `live_hits` 分辨「一次都沒掃到」與「掃到了但不夠」。
+  ⚠ **這張表長得極慢**（一列 418 B，但只在場上有單時寫），**價值集中在長尾**
+  ——08-19 那種 34.2 小時沒成交的單，一次就落兩百列。
   尚待：`earnings_daily` 只有表結構與 `upsert_daily_earning()` 介面，還沒有資料來源（D013）。
 - `notify/line_messaging.py`：LINE Messaging API push（`POST /v2/bot/message/push`）。
   `send()` 永遠不拋例外——它在致命錯誤的退出路徑上被呼叫，拋例外會蓋掉原始錯誤與離開碼。

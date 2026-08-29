@@ -186,6 +186,71 @@ def test_總量比用總預估除以總實際而不是逐筆倍數的平均():
     assert summary.underestimated == 0
 
 
+def test_三個統計量各自算得出自己的倍數():
+    """同一份預估裡的平均／中位數／四分之三，要能分別對上實際等待。
+
+    **策略只用了平均**（`expected_value.py` 的 `effective` 拿 `mean_hours` 當分母），
+    而三個值是同一次 `estimate_wait()` 算出來的。少對照兩個，等於在證據上
+    先幫讀的人排除了兩個選項。
+    """
+    spells = wait_time.build_spells(
+        [offer()], [position()], forecasts={"5092133927": forecast()}, now=NOW
+    )
+    spell = spells[0]
+
+    # 實際約 0.277h；預估 平均 8.04h／中位數 2.5h／四分之三 13.5h
+    assert abs(spell.factor_for("mean") - 29.0) < 0.5
+    assert abs(spell.factor_for("median") - 9.0) < 0.3
+    assert abs(spell.factor_for("p75") - 48.7) < 0.5
+    # `overestimate_factor` 維持等於平均那一個，既有呼叫端不受影響
+    assert spell.factor_for("mean") == spell.overestimate_factor
+
+
+def test_p75_有被讀進來而不是留成空值():
+    """新加的欄位要真的接到 DB，不能靜默停在 `None`（D026 那一族）。"""
+    spells = wait_time.build_spells(
+        [offer()], [position()], forecasts={"5092133927": forecast()}, now=NOW
+    )
+    assert spells[0].forecast_p75_hours == 13.5
+
+
+def test_三個統計量的總量比與離散度分開報():
+    """離散度才是重點：總量比接近 1 但逐筆橫跨兩個數量級，一樣不能拿來算期望值。"""
+    offers = [
+        offer("a", rate=0.00026027, created_at="2026-08-20T15:15:21+08:00"),
+        offer("b", rate=0.00024971, created_at="2026-08-23T23:04:47+08:00"),
+    ]
+    positions = [
+        position("464168644", rate=0.00026027, opened_at="2026-08-20T19:10:59+08:00"),
+        position("464372858", rate=0.00024971, opened_at="2026-08-23T23:50:49+08:00"),
+    ]
+    forecasts = {
+        "a": {**forecast("a", mean_hours=6.095238095238095), "rate": 0.00026027},
+        "b": forecast("b", mean_hours=8.693452380952381),
+    }
+    summary = wait_time.summarize(offers, positions, forecasts=forecasts, now=NOW)
+
+    # 兩段的中位數預估都是 2.5h，實際 3.93h 與 0.77h → 總量比 5.0 ÷ 4.70 ≈ 1.06
+    assert abs(summary.overall_factor_for("median") - 1.06) < 0.05
+    assert abs(summary.overall_factor_for("mean") - 3.1) < 0.2
+    # **總量比接近 1 不代表準**：逐筆是 0.6× 與 3.2×，離散照樣要看得見
+    low, high = summary.factor_range_for("median")
+    assert abs(low - 0.64) < 0.05 and abs(high - 3.2) < 0.2
+    assert summary.calibratable_for("p75") == summary.calibratable_for("mean")
+
+
+def test_算不出倍數的統計量不會被當成零():
+    """某個統計量缺值時要退出可用集合，不能拿 0 去拉低總量比。"""
+    missing = {**forecast(), "median_hours": None}
+    summary = wait_time.summarize(
+        [offer()], [position()], forecasts={"5092133927": missing}, now=NOW
+    )
+    assert summary.calibratable_for("median") == []
+    assert summary.overall_factor_for("median") is None
+    # 平均那一個不受影響，兩者是分開算的
+    assert summary.overall_factor_for("mean") is not None
+
+
 def test_校準樣本的利率範圍會被報出來():
     """D045 最重要的但書：倍數只在有樣本的利率帶成立，帶外不能外推。"""
     summary = wait_time.summarize(

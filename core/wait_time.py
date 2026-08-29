@@ -50,7 +50,7 @@
 import statistics
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.hold_time import MIN_SAMPLES_FOR_QUANTILE, parse_moment
 from utils import clock
@@ -77,6 +77,7 @@ class WaitSpell:
     position_id: Optional[str]
     forecast_mean_hours: Optional[float]
     forecast_median_hours: Optional[float]
+    forecast_p75_hours: Optional[float]
     forecast_window_hours: Optional[int]
 
     @property
@@ -105,18 +106,35 @@ class WaitSpell:
         """
         return self.censored and self.hours < 1 / 60
 
+    def forecast_for(self, statistic: str) -> Optional[float]:
+        """取某一個統計量的預估值。`statistic` 是 `mean`／`median`／`p75`。"""
+        return getattr(self, f"forecast_{statistic}_hours")
+
+    def factor_for(self, statistic: str) -> Optional[float]:
+        """指定統計量的預估等待 ÷ 實際等待。
+
+        **三個統計量都是 `estimate_wait()` 從同一份 K 線算出來的**，
+        `offer_wait_forecasts` 三個都存了——但策略只用 `mean`
+        （`expected_value.py` 的 `effective = rate × P ÷ (mean_hours + P)`），
+        而報告一直也只印 `mean`。**同一份資料裡另外兩個統計量從來沒有被對照過。**
+        """
+        if self.censored or self.hours <= 0:
+            return None
+        predicted = self.forecast_for(statistic)
+        if predicted is None:
+            return None
+        return predicted / self.hours
+
     @property
     def overestimate_factor(self) -> Optional[float]:
-        """預估等待 ÷ 實際等待。**只在「有預估值 ＋ 已成交」時算得出來。**
+        """預估等待 ÷ 實際等待，**用策略正在使用的 `mean`**。
 
         右設限的期間一律回 `None`：它的 `hours` 是下界，拿下界當分母會把倍數
         算得比實際更大，而「模型高估幾倍」正是這份報告唯一想看的數字。
 
         實際等待為 0 也回 `None`（同一輪偵測到成交，除不了）。
         """
-        if self.censored or not self.has_forecast or self.hours <= 0:
-            return None
-        return self.forecast_mean_hours / self.hours
+        return self.factor_for("mean")
 
 
 @dataclass(frozen=True)
@@ -244,6 +262,46 @@ class WaitSummary:
     @property
     def underestimated(self) -> int:
         return sum(1 for s in self.calibratable if s.overestimate_factor < 1)
+
+    # ------------------------------------------------------------------
+    # 三個統計量的對照（D045 追記：「W 估不準」也可能是選錯統計量）
+    # ------------------------------------------------------------------
+
+    def calibratable_for(self, statistic: str) -> List[WaitSpell]:
+        """指定統計量算得出倍數的那些期間。
+
+        三個統計量都來自同一批 `offer_wait_forecasts` 列，所以三者的可用集合
+        **理論上完全相同**——分開算是為了讓「某個統計量剛好缺值」浮出來，
+        而不是被靜默地當成 0（D026 那一族）。
+        """
+        return [s for s in self.spells if s.factor_for(statistic) is not None]
+
+    def overall_factor_for(self, statistic: str) -> Optional[float]:
+        """指定統計量的總預估 ÷ 總實際。理由同 `overall_factor`。"""
+        usable = self.calibratable_for(statistic)
+        if not usable:
+            return None
+        predicted = sum(s.forecast_for(statistic) for s in usable)
+        actual = sum(s.hours for s in usable)
+        return predicted / actual if actual > 0 else None
+
+    def median_factor_for(self, statistic: str) -> Optional[float]:
+        factors = [s.factor_for(statistic) for s in self.calibratable_for(statistic)]
+        if len(factors) < MIN_SAMPLES_FOR_QUANTILE:
+            return None
+        return statistics.median(factors)
+
+    def factor_range_for(self, statistic: str) -> Optional[Tuple[float, float]]:
+        """逐筆倍數的最小與最大。
+
+        **離散度才是這張對照表的重點**，不是哪個代表值比較小：一個總量比
+        4.3× 但逐筆橫跨 1.6×～108.6× 的估計，跟一個 1.7× 且只橫跨
+        0.9×～9.0× 的估計，不是「準一點」的差別，是**能不能拿來算期望值**的差別。
+        """
+        factors = [s.factor_for(statistic) for s in self.calibratable_for(statistic)]
+        if not factors:
+            return None
+        return min(factors), max(factors)
 
     @property
     def calibration_rate_span(self) -> Optional[str]:
@@ -391,6 +449,11 @@ def build_spells(
                     if forecast and forecast.get("median_hours") is not None
                     else None
                 ),
+                forecast_p75_hours=(
+                    float(forecast["p75_hours"])
+                    if forecast and forecast.get("p75_hours") is not None
+                    else None
+                ),
                 forecast_window_hours=(
                     int(forecast["window_hours"])
                     if forecast and forecast.get("window_hours") is not None
@@ -438,9 +501,17 @@ def describe_spell(spell: WaitSpell) -> str:
     merged = f"（{spell.offer_count} 次重掛）" if spell.offer_count > 1 else ""
     if spell.has_forecast:
         forecast = f"，掛出時預估 平均 {spell.forecast_mean_hours:.2f}h"
+        # **中位數並排印出來**，因為策略只用了平均，而三個統計量是同一次
+        # `estimate_wait()` 算出來的。少印一個就等於幫讀的人排除了一個選項
+        # ——而 2026-08-29 的八個樣本裡，中位數八次都比平均接近實際。
+        if spell.forecast_median_hours is not None:
+            forecast += f"／中位數 {spell.forecast_median_hours:.2f}h"
         factor = spell.overestimate_factor
         if factor is not None:
             forecast += f"——高估 {factor:.1f} 倍"
+            median_factor = spell.factor_for("median")
+            if median_factor is not None:
+                forecast += f"（改用中位數是 {median_factor:.1f} 倍）"
     else:
         forecast = "，掛出時沒有留下預估值（早於 D038）"
 

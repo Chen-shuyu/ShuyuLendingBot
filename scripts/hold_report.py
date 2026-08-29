@@ -180,6 +180,37 @@ def format_report(summary: hold_time.HoldSummary, currency: str) -> str:
                 f"{hold_time.MIN_SAMPLES_FOR_QUANTILE} 筆已結束的部位才算得準，"
                 f"目前是 {split.cheaper.settled} 與 {split.pricier.settled} 筆。"
             )
+            if split.degenerate:
+                # 🔴 **上面那句話單獨出現時會騙人。** 它讀起來像「再等幾筆就會好」，
+                # 而分界同時是眾數的時候，多蒐集同利率的樣本永遠不會讓便宜組變大
+                # ——每一筆都同時把中位數釘在原地、又落進昂貴組。
+                # 說「還不夠」跟說「這樣分下去永遠不夠」是兩件事。
+                total_settled = split.cheaper.settled + split.pricier.settled
+                # ⚠ **兩個「相同」要分開講。** `at_pivot` 是日利率完全相等，
+                # `displayed_at_pivot` 是年化印出來相同——2026-08-29 的資料差一筆
+                # （0.00024972 對 0.00024971）。只講前者，讀的人會照逐筆那一段
+                # 數出後者然後以為報告算錯。
+                same_display = ""
+                if split.displayed_at_pivot > split.at_pivot:
+                    same_display = (
+                        f"（另有 {split.displayed_at_pivot - split.at_pivot} 筆的年化"
+                        f"也印成 {pivot_annual:.2f}%，但日利率差在小數第 8 位，"
+                        f"同樣落在昂貴組）"
+                    )
+                lines.append(
+                    f"    🔴 **而且這個分界不會自己好**：{total_settled} 筆已結束部位裡"
+                    f"有 {split.at_pivot} 筆的日利率**完全等於**分界"
+                    f"（年化 {pivot_annual:.2f}%，中位數同時是眾數），"
+                    f"`<` 把它們全掃進昂貴組{same_display}。"
+                )
+                lines.append(
+                    "    **再多蒐集同一個利率的樣本也不會讓便宜組變大**——"
+                    "模型每選一次同樣的價位，就同時把中位數釘在原地、又往昂貴組加一筆。"
+                )
+                lines.append(
+                    "    要比得出來，只能等**模型選到別的價位**（像 08-29 的 10.95%），"
+                    "或改用不靠中位數當分界的分組方式——後者是 M2 的題目，不在這裡拍板。"
+                )
             lines.append("    逐筆那一段仍然看得到形狀，只是還不夠下判斷。")
         elif gap > 0:
             lines.append(

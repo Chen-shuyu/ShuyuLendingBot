@@ -258,6 +258,72 @@ def test_兩組樣本都足夠時才比得出差距():
     assert split.gap_hours == pytest.approx(24.0, abs=0.01)
 
 
+def test_中位數同時是眾數時分界被標成退化():
+    """真實案例：16 筆已結束裡有 10 筆同為年化 9.11%（2026-08-29）。
+
+    中位數也是 9.11%，`<` 把整叢掃進昂貴組，得到便宜組 1 筆／昂貴組 15 筆。
+    **關鍵不是「樣本還不夠」，是「這樣分下去永遠不夠」**——模型每選一次
+    同樣的價位，就同時把中位數釘在原地、又往昂貴組加一筆。
+    """
+    positions = [
+        position("cheap1", rate=0.00015, opened_at="2026-08-16T21:30:43+08:00", closed_at="2026-08-18T18:35:22+08:00"),
+    ] + [
+        position(f"same{i}", rate=0.00024971,
+                 opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-20T12:00:00+08:00")
+        for i in range(5)
+    ]
+
+    split = hold_time.split_by_rate(hold_time.summarize(positions, now=NOW))
+
+    assert split.pivot_rate == 0.00024971
+    assert split.cheaper.settled == 1 and split.pricier.settled == 5
+    assert split.at_pivot == 5
+    assert split.degenerate is True
+    # 退化與「比不出來」是兩件事：後者只說現在不夠，前者說再等也不會夠
+    assert split.comparable is False
+
+
+def test_樣本分散時分界不算退化():
+    """便宜組餵得飽的時候，不該再喊「這個分界不會自己好」。"""
+    positions = [
+        position("cheap1", rate=0.00015, opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-21T00:00:00+08:00"),
+        position("cheap2", rate=0.00016, opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-21T04:00:00+08:00"),
+        position("cheap3", rate=0.00017, opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-21T08:00:00+08:00"),
+        position("rich1", rate=0.00026027, opened_at="2026-08-21T00:00:00+08:00", closed_at="2026-08-21T02:00:00+08:00"),
+        position("rich2", rate=0.00027, opened_at="2026-08-21T00:00:00+08:00", closed_at="2026-08-21T04:00:00+08:00"),
+        position("rich3", rate=0.0002729, opened_at="2026-08-21T00:00:00+08:00", closed_at="2026-08-21T06:00:00+08:00"),
+    ]
+
+    split = hold_time.split_by_rate(hold_time.summarize(positions, now=NOW))
+
+    assert split.degenerate is False
+
+
+def test_年化印起來相同但日利率不同的那一筆要分開數():
+    """**兩個「相同」不能混講。**
+
+    0.00024972 與 0.00024971 的年化都印成 9.11%，但 `<` 只看日利率。
+    報告若只講「完全相等」那個數字，讀的人會照逐筆那一段數出多一筆，
+    然後以為報告算錯了——所以兩個數字都要拿得到。
+    """
+    positions = [
+        position("cheap1", rate=0.00015, opened_at="2026-08-16T21:30:43+08:00", closed_at="2026-08-18T18:35:22+08:00"),
+    ] + [
+        position(f"same{i}", rate=0.00024971,
+                 opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-20T12:00:00+08:00")
+        for i in range(5)
+    ] + [
+        position("almost", rate=0.00024972,
+                 opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-20T12:00:00+08:00"),
+    ]
+
+    split = hold_time.split_by_rate(hold_time.summarize(positions, now=NOW))
+
+    assert split.at_pivot == 5            # 日利率完全相等
+    assert split.displayed_at_pivot == 6  # 年化印出來相同
+    assert split.degenerate is True
+
+
 def test_已結束不足兩筆時分不出組():
     summary = hold_time.summarize([position(closed_at=None)], now=NOW)
 

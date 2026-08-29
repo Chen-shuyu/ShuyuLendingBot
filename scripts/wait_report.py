@@ -27,6 +27,7 @@
 """
 
 import argparse
+import unicodedata
 import os
 import sqlite3
 import sys
@@ -98,9 +99,97 @@ def load_data(
         connection.close()
 
 
+def _display_width(text: str) -> int:
+    """字串在等寬終端機裡佔幾格。
+
+    中文是全形，`str.ljust()` 那類方法按**字元數**補空白，於是中文欄位一定
+    對不齊——`f"{'統計量':<18}"` 補出來的是 15 個空格，實際只差 12 格。
+    """
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def _pad(text: str, width: int, right: bool = False) -> str:
+    """照顯示寬度補到 `width` 格。"""
+    padding = " " * max(width - _display_width(text), 0)
+    return padding + text if right else text + padding
+
+
 def _hours(value: Optional[float]) -> str:
     """None 就寫「—」，不要印出 0.00 假裝有這個數字。"""
     return f"{value:.2f}h" if value is not None else "—"
+
+
+STATISTICS = (
+    ("mean", "平均（策略正在用）"),
+    ("median", "中位數"),
+    ("p75", "四分之三"),
+)
+
+
+def _statistic_table(summary: wait_time.WaitSummary) -> List[str]:
+    """三個統計量誰估得準的對照表。
+
+    **為什麼要有這張表**：`estimate_wait()` 一次算出平均／中位數／四分之三三個值，
+    `offer_wait_forecasts` 三個都存了，但策略只拿 `mean` 去算期望值
+    （`expected_value.py`：`effective = rate × P ÷ (mean_hours + P)`），
+    而這份報告在 2026-08-29 之前也只印 `mean`——**握著三份證據只看了一份**。
+
+    D045 本文與追記都把「W 估不準」當成一個要除掉的倍數在談（先是 3.9 倍、
+    後來 5.4 倍，追記又發現它是駝峰所以任何單一倍數都不對）。
+    **這張表是第三條路**：也許不是要除以一個數字，而是一開始就選錯了統計量。
+
+    ⚠ **這裡只把三個數字並排，不做選擇。** 換統計量會改變策略挑出來的價位，
+    那是 M2 回測工具的題目——先改參數再建量測正是 D036 記下的那個錯誤。
+    """
+    lines = ["  --- 換一個統計量會準多少（同一份預估，只是取不同的代表值）---"]
+    lines.append(
+        "    " + _pad("統計量", 20) + _pad("總量比", 10, right=True)
+        + _pad("逐筆中位", 10, right=True) + _pad("最好", 9, right=True)
+        + _pad("最差", 9, right=True)
+    )
+    for key, label in STATISTICS:
+        overall = summary.overall_factor_for(key)
+        if overall is None:
+            lines.append("    " + _pad(label, 20) + _pad("（無樣本）", 10, right=True))
+            continue
+        median = summary.median_factor_for(key)
+        span = summary.factor_range_for(key)
+        lines.append(
+            "    "
+            + _pad(label, 20)
+            + _pad(f"{overall:.2f}×", 10, right=True)
+            + _pad(f"{median:.1f}×" if median is not None else "—", 10, right=True)
+            + _pad(f"{span[0]:.1f}×" if span else "—", 9, right=True)
+            + _pad(f"{span[1]:.1f}×" if span else "—", 9, right=True)
+        )
+
+    # 只在三者都算得出來時才下這句話——少一個就沒有「全數」可言。
+    usable = summary.calibratable_for("mean")
+    ranked = [
+        (summary.overall_factor_for(key), key, label)
+        for key, label in STATISTICS
+        if summary.overall_factor_for(key) is not None
+    ]
+    if len(ranked) == len(STATISTICS) and usable:
+        best_key, best_label = min(ranked, key=lambda item: abs(item[0] - 1))[1:]
+        if best_key != "mean":
+            wins = sum(
+                1
+                for s in usable
+                if s.factor_for(best_key) is not None
+                and abs(s.factor_for(best_key) - 1) < abs(s.factor_for("mean") - 1)
+            )
+            lines.append(
+                f"    🔴 **{best_label}比策略正在用的平均更接近實際**，"
+                f"{len(usable)} 段裡有 {wins} 段較準。"
+            )
+            lines.append(
+                "    ⚠ **這不是「改成它就會賺比較多」**：三個統計量下的實質年化"
+                "算式分母不同，數字不可直接比較，而且樣本仍全落在模型自己選出來的"
+                "那條窄帶內。要不要換由 M2 回測回答。"
+            )
+    lines.append("")
+    return lines
 
 
 def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
@@ -200,6 +289,8 @@ def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
             f"  🔴 **但校準樣本全部落在年化 {span} 這個帶內**"
             f"——那正是模型自己選出來的區間。**帶外沒有樣本，不能外推。**"
         )
+    lines.append("")
+    lines.extend(_statistic_table(summary))
     lines.append(
         "  **這是觀察，不是結論**：要不要改 `estimate_wait()`、改成什麼，"
         "由 M2 回測工具回答（DECISIONS.md D045）。"

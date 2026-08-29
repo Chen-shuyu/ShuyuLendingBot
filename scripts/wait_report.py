@@ -192,6 +192,49 @@ def _statistic_table(summary: wait_time.WaitSummary) -> List[str]:
     return lines
 
 
+def _realized_section(summary: wait_time.WaitSummary) -> List[str]:
+    """實得年化：`r × P ÷ (W + P)`，兩項都用實測。
+
+    **這一節回答的是使用者每次都在問的那個問題**——「掛這個價位划不划算」。
+    在 2026-08-29 之前專案裡沒有任何地方算過它：`hold_report` 只有 `P`、
+    本報告只有 `W`，**兩份報告各拿一半，乘起來那個數字每次都是手算的**。
+
+    加這一節的直接理由：08-29 那筆年化 10.95% 等了 5.19h、借了 1.98h，
+    **實得只有 3.02%，是至今最差的一筆**——而名目利率是至今最高的一筆。
+    只看名目利率會把最差的決定看成最好的。
+    """
+    usable = summary.realized
+    if not usable:
+        return []
+
+    lines = ["--- 實得年化（`r × P ÷ (W + P)`，等待與持有都用實測）---"]
+    overall = summary.realized_effective
+    lines.append(
+        f"  {len(usable)} 段已完成一輪（掛出 → 成交 → 還回來）："
+        f"**時間加權實得年化 {overall:.2f}%**"
+    )
+
+    worst = summary.realized_worst
+    if worst is not None:
+        lines.append(
+            f"  最差的一段：{worst.started_at:%m-%d %H:%M} 名目年化 "
+            f"{worst.annual_rate:.2f}%——等 {worst.hours:.2f}h、借 {worst.hold_hours:.2f}h，"
+            f"**實得 {worst.realized_effective:.2f}%**"
+        )
+    lines.append(
+        "  ⚠ **這個數字偏樂觀**：沒等到成交的那些期間不在分母裡"
+        "（最長的一段空掛 34.20 小時，完全沒被算進去）。真正的成效量測是 M3。"
+    )
+    ongoing = sum(1 for s in summary.spells if s.hold_ongoing)
+    if ongoing:
+        lines.append(
+            f"  ⚠ 另有 {ongoing} 段仍在生息中，**不列入**"
+            f"——它們的持有時間是會繼續長的下界，乘進去等於宣告還沒發生的結果。"
+        )
+    lines.append("")
+    return lines
+
+
 def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
     """把摘要排成給人讀的報告。
 
@@ -255,6 +298,8 @@ def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
             f"它們的時數是下界且**會繼續長**，不是已經定案的觀測。"
         )
     lines.append("")
+
+    lines.extend(_realized_section(summary))
 
     lines.append("--- 對照 expected_value.py 的等待估計 ---")
     usable = summary.calibratable

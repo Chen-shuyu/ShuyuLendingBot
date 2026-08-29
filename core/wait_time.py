@@ -75,6 +75,10 @@ class WaitSpell:
     offer_count: int
     offer_ids: List[str]
     position_id: Optional[str]
+    # **等到之後借了多久**，也就是算式裡的 `P`。仍在生息中時是 `None` 而不是下界
+    # ——`realized_effective` 會拿它當分子，把下界乘進去等於宣告一個還沒發生的結果。
+    hold_hours: Optional[float]
+    hold_ongoing: bool
     forecast_mean_hours: Optional[float]
     forecast_median_hours: Optional[float]
     forecast_p75_hours: Optional[float]
@@ -124,6 +128,29 @@ class WaitSpell:
         if predicted is None:
             return None
         return predicted / self.hours
+
+    @property
+    def realized_effective(self) -> Optional[float]:
+        """**實得年化**：`r × P ÷ (W + P)`，`W` 與 `P` 兩項都用實測值。
+
+        這是「掛這個價位到底划不划算」唯一直接的答案，而在 2026-08-29 之前
+        **專案裡沒有任何地方算過它**——`hold_report` 只有 `P`、`wait_report`
+        只有 `W`，兩份報告各拿一半，乘起來的那個數字每次都是手算的。
+
+        08-29 那筆年化 10.95% 是它存在的理由：等 5.19h、借 1.98h，
+        名目 10.95% **實得只有 3.02%**，是至今最差的一筆。
+        單看利率會以為那是最好的一筆。
+
+        右設限（沒等到成交）或仍在生息中一律回 `None`：
+        前者沒有 `P`，後者的 `P` 是會繼續長的下界，
+        **拿下界當分子等於宣告一個還沒發生的結果**。
+        """
+        if self.censored or self.hold_hours is None:
+            return None
+        total = self.hours + self.hold_hours
+        if total <= 0:
+            return None
+        return self.annual_rate * self.hold_hours / total
 
     @property
     def overestimate_factor(self) -> Optional[float]:
@@ -303,6 +330,39 @@ class WaitSummary:
             return None
         return min(factors), max(factors)
 
+    # ------------------------------------------------------------------
+    # 實得年化：把 `W` 與 `P` 乘起來，回答「這些決定到底划不划算」
+    # ------------------------------------------------------------------
+
+    @property
+    def realized(self) -> List[WaitSpell]:
+        """算得出實得年化的那些期間（成交了、而且已經還回來了）。"""
+        return [s for s in self.spells if s.realized_effective is not None]
+
+    @property
+    def realized_effective(self) -> Optional[float]:
+        """整段期間的實得年化，**以時間加權**：`Σ(r×P) ÷ Σ(W+P)`。
+
+        用時間加權而不是逐筆平均，理由同 `overall_factor`：一筆等很久又借很短
+        的單，佔掉的時間遠多於它在逐筆平均裡的一票。**這個數字回答的是
+        「這段時間這些錢實際以幾趴在跑」**，那才是使用者問的問題。
+
+        ⚠ **沒等到成交的那些期間不在分母裡**，所以這個數字仍然偏樂觀
+        ——空掛 34.2 小時的那一段完全沒被算進去。真正的成效量測是 M3。
+        """
+        usable = self.realized
+        if not usable:
+            return None
+        earned = sum(s.annual_rate * s.hold_hours for s in usable)
+        elapsed = sum(s.hours + s.hold_hours for s in usable)
+        return earned / elapsed if elapsed > 0 else None
+
+    @property
+    def realized_worst(self) -> Optional[WaitSpell]:
+        """實得年化最差的那一段。**最差的那一筆比平均更值得看**。"""
+        usable = self.realized
+        return min(usable, key=lambda s: s.realized_effective) if usable else None
+
     @property
     def calibration_rate_span(self) -> Optional[str]:
         """校準樣本涵蓋的利率範圍。
@@ -407,10 +467,18 @@ def build_spells(
             if matched is None or opened < matched[0]:
                 matched = (opened, position)
 
+        hold_hours: Optional[float] = None
+        hold_ongoing = False
         if matched is not None:
             hours = (matched[0] - started).total_seconds() / 3600
             censored = False
             position_id = str(matched[1].get("position_id", ""))
+            closed = parse_moment(matched[1].get("closed_at"))
+            if closed is not None:
+                hold_hours = (closed - matched[0]).total_seconds() / 3600
+            else:
+                # 還在生息中。**不填下界**——理由見 `WaitSpell.hold_hours`。
+                hold_ongoing = True
         else:
             hours = (ends_at - started).total_seconds() / 3600
             censored = True
@@ -439,6 +507,8 @@ def build_spells(
                 offer_count=len(group),
                 offer_ids=[str(o.get("offer_id") or "") for _, _, o in group],
                 position_id=position_id,
+                hold_hours=hold_hours,
+                hold_ongoing=hold_ongoing,
                 forecast_mean_hours=(
                     float(forecast["mean_hours"])
                     if forecast and forecast.get("mean_hours") is not None
@@ -540,7 +610,17 @@ def describe_spell(spell: WaitSpell) -> str:
             f"{spell.started_at:%m-%d %H:%M} 年化 {spell.annual_rate:.2f}%{merged}"
             f"：至少掛了 {spell.hours:.2f} 小時**沒有成交**{tail}{forecast}"
         )
+    # **成交之後借了多久、實得多少，接在同一行。** 兩件事分開放在兩份報告裡，
+    # 就是 08-29 之前「名目 10.95% 看起來最好、實得 3.02% 最差」沒有人看得出來的原因。
+    if spell.realized_effective is not None:
+        outcome = (
+            f"，借 {spell.hold_hours:.2f}h → **實得年化 {spell.realized_effective:.2f}%**"
+        )
+    elif spell.hold_ongoing:
+        outcome = "，仍在生息中（實得年化還算不出來）"
+    else:
+        outcome = ""
     return (
         f"{spell.started_at:%m-%d %H:%M} 年化 {spell.annual_rate:.2f}%{merged}"
-        f"：等 {spell.hours:.2f} 小時成交（部位 {spell.position_id}）{forecast}"
+        f"：等 {spell.hours:.2f} 小時成交（部位 {spell.position_id}）{outcome}{forecast}"
     )

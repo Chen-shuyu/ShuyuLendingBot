@@ -15,13 +15,63 @@ from api.bitfinex_client import BitfinexClient
 from api.rate_limiter import RetrySettings
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
-# Bitfinex V2 funding offer 陣列：0=ID, 1=SYMBOL, 4=AMOUNT, 14=RATE, 15=PERIOD
+# Bitfinex V2 funding offer 陣列：0=ID, 1=SYMBOL, 2=MTS_CREATE, 3=MTS_UPDATE,
+# 4=AMOUNT, 5=AMOUNT_ORIG, 6=TYPE, 10=STATUS, 14=RATE, 15=PERIOD
 # https://docs.bitfinex.com/reference/rest-auth-funding-offers
-FUNDING_OFFER_FIELDS = 16
+#
+# 🔴 **21 不是 16。** 這個常數原本寫 16，而 `_parse_offers()` 的 docstring
+# 從 2026-08-16 起就寫著「21 欄」——**程式知道真相，替身不知道**，兩邊沒有人
+# 去對過。目前讀到的最大索引是 15，所以還沒出事；但 [10]=STATUS 在 16 欄的
+# 替身裡是 `None`，而真實回應是 `'ACTIVE'`。哪天要靠 STATUS 濾掉非作用中的
+# 掛單，測試會拿 `None` 走完全程然後亮綠燈（2026-08-29 實打確認，B6）。
+FUNDING_OFFER_FIELDS = 21
 
 
 # 2026-08-19 05:03:24 +0800，取自那天場上唯一一張單的真實回應（見 D038）。
 OFFER_CREATED_MS = "1787087004000"
+
+
+# 2026-08-29 17:56 +0800 對 `GET /v2/ticker/fUSD` 實打一次抄回來的（B6／D027 第 1 點）。
+#
+# **三件事只有實打才看得到，而三件事這個替身原本都不知道**：
+#   1. **17 欄**，不是 4 欄。Bitfinex 文件只列到 [15]，實際還多一欄 [16]（毫秒時間戳）。
+#   2. **除了兩個佔位以外全是字串**，包含 PERIOD 這種本質上是整數的欄位。
+#   3. **[13][14] 是 `None`**——不是 0、不是空字串。任何「先轉型再判斷」的寫法
+#      碰到它就會炸，而原本那個 `[0.00035, 1, 2, 3]` 的替身永遠測不到。
+#
+# **不要為了好寫而把它整理乾淨**（D027 第 3 點）——那正是 D025／D026 兩個 bug
+# 用真錢換來的教訓。
+REAL_TICKER_FUSD = [
+    "0.0003119890410958904",  # [ 0] FRR ← get_frr() 只讀這一欄
+    "0.000273972602739726",   # [ 1] BID
+    "120",                    # [ 2] BID_PERIOD
+    "18655088.09552367",      # [ 3] BID_SIZE
+    "0.00016",                # [ 4] ASK
+    "5",                      # [ 5] ASK_PERIOD
+    "7346513.09807776",       # [ 6] ASK_SIZE
+    "-0.00022404",            # [ 7] DAILY_CHANGE
+    "-0.7518",                # [ 8] DAILY_CHANGE_PERC
+    "0.00007397",             # [ 9] LAST_PRICE
+    "120196467.90810657",     # [10] VOLUME
+    "0.0003",                 # [11] HIGH
+    "0.0000258",              # [12] LOW
+    None,                     # [13] _PLACEHOLDER ← 真的是 None
+    None,                     # [14] _PLACEHOLDER ← 真的是 None
+    "271504913.17164093",     # [15] FRR_AMOUNT_AVAILABLE
+    "1469734163000",          # [16] 文件沒列，實際存在
+]
+
+
+def make_ticker_array(frr=None):
+    """模擬 `/v2/ticker/fUSD` 的回應，形狀取自真實回應（見 `REAL_TICKER_FUSD`）。
+
+    只換掉 [0]（FRR），其餘 16 欄維持實打抄回來的樣子——**測試要換的是被斷言的
+    那個值，不是信封的形狀**。
+    """
+    ticker = list(REAL_TICKER_FUSD)
+    if frr is not None:
+        ticker[0] = str(frr)
+    return ticker
 
 
 def make_offer_array(
@@ -31,6 +81,7 @@ def make_offer_array(
     rate=0.0004,
     period=2,
     created_at_ms=OFFER_CREATED_MS,
+    status="ACTIVE",
 ):
     """模擬 ccxt 回傳的 funding offer 陣列。
 
@@ -48,10 +99,49 @@ def make_offer_array(
     offer[0] = str(offer_id)
     offer[1] = symbol
     offer[2] = created_at_ms
+    offer[3] = created_at_ms  # MTS_UPDATE，沒被動過的單與 MTS_CREATE 同值（D038）
     offer[4] = str(amount)
+    offer[5] = str(amount)    # AMOUNT_ORIG
+    offer[6] = "LIMIT"        # TYPE
+    offer[10] = status        # STATUS ← 真實回應是 'ACTIVE'，不是 None
     offer[14] = str(rate)
     offer[15] = str(period)
+    offer[16] = "0"
+    offer[17] = "0"
+    offer[19] = "0"
     return offer
+
+
+# 2026-08-29 17:5x 對 `POST /v2/auth/r/funding/offers/fUSD` 實打抄回來的整列（B6）。
+# 抄得到是因為**當下場上剛好躺著一張單**——這個端點平常回空陣列，
+# 沒有掛單的時候抄不到任何形狀。
+REAL_FUNDING_OFFER = [
+    "5096173429", "fUSD", "1787989255000", "1787989255000", "345.02", "345.02",
+    "LIMIT", None, None, None, "ACTIVE", None, None, None, "0.0003", "2",
+    "0", "0", None, "0", None,
+]
+
+
+# 2026-08-29 17:5x `fetch_balance({"type": "funding"})` 實打抄回來的（B6）。
+#
+# 🔴 **兩件替身原本不知道的事**：
+#   1. `USD` 那一層有 `free`／`used`／`total` 三個鍵，而且 ccxt **已經轉成 float**
+#      ——外層那三個同名鍵則是「幣別 → 數字」的字典，兩層同名但形狀不同。
+#   2. **`info` 裡混著別的錢包。** 指定了 `type='funding'` 也一樣：這次回來的第二列
+#      是 `exchange`／`UST`。任何直接讀 `info` 的程式碼都必須自己濾 `[0] == 'funding'`，
+#      不濾就會把別的錢包的錢算進放貸餘額。
+#
+# 金額用真實精度（8 位小數）——D025 那個 bug 就是被兩位小數的測試資料放過去的。
+REAL_FUNDING_BALANCE = {
+    "USD": {"free": 0.00175079, "used": 345.02, "total": 345.02175079},
+    "free": {"USD": 0.00175079},
+    "used": {"USD": 345.02},
+    "total": {"USD": 345.02175079},
+    "info": [
+        ["funding", "USD", "345.02175079", "0", "0.00175079", None, None],
+        ["exchange", "UST", "0.01187148", "0", "0.01187148", "Affiliate Rebate", None],
+    ],
+}
 
 
 def make_submit_response(offer=None, status="SUCCESS", text="offer submitted"):
@@ -189,6 +279,29 @@ class TestUninitialisedExchange:
 
 
 class TestGetAvailableBalance:
+    def test_parses_the_real_captured_balance(self, make_client):
+        """B6：直接吃 2026-08-29 實打抄回來的那一份，一個字都沒改。
+
+        可用餘額 `0.00175079` 是**八位小數**——原本的替身給 `344.12`，兩位。
+        D025 那個 bug（總額超過餘額）就是被兩位小數的測試資料放過去的：
+        `floor` 與 `round` 在那種輸入下數學上必然相同，測試不可能失敗。
+        """
+        exchange = FakeExchange(fetch_balance=dict(REAL_FUNDING_BALANCE))
+        assert make_client(exchange).get_available_balance("USD") == 0.00175079
+
+    def test_info_carries_other_wallets_even_when_type_is_funding(self, make_client):
+        """🔴 指定了 `type='funding'`，`info` 裡照樣有別的錢包。
+
+        這次實打回來的第二列是 `exchange`／`UST`。**目前的解析走的是 ccxt 整理過的
+        `balance['USD']['free']`，所以踩不到**——這條守的是以後：哪天有人為了拿
+        原始精度而改讀 `info`，不濾 `[0] == 'funding'` 就會把交易錢包的錢
+        算進放貸餘額。替身要留著這一列，不然那個 bug 只能用真錢換。
+        """
+        wallets = [row[0] for row in REAL_FUNDING_BALANCE["info"]]
+        assert "funding" in wallets and "exchange" in wallets
+        # ccxt 整理過的那一層只認 funding，數字對得上
+        assert REAL_FUNDING_BALANCE["USD"]["free"] == 0.00175079
+
     def test_queries_the_funding_wallet(self, make_client):
         """查錯錢包會讀到交易錢包的錢，掛單金額就整個算錯。"""
         exchange = FakeExchange(fetch_balance={"USD": {"free": 344.12}})
@@ -220,12 +333,34 @@ class TestGetAvailableBalance:
 class TestGetFrr:
     def test_parses_first_element_of_ticker(self, make_client):
         """fUSD ticker 的 index 0 才是 FRR；先前誤用永續合約資金費率就是錯在這。"""
-        exchange = FakeExchange(public_get_ticker_symbol=[0.00035, 1, 2, 3])
+        exchange = FakeExchange(public_get_ticker_symbol=make_ticker_array(0.00035))
         assert make_client(exchange).get_frr("USD") == pytest.approx(0.00035)
         assert exchange.calls[0] == ("public_get_ticker_symbol", {"symbol": "fUSD"})
 
+    def test_parses_the_real_seventeen_field_envelope(self, make_client):
+        """B6：直接吃 2026-08-29 實打抄回來的那一份，一個字都沒改。
+
+        原本這一組測試餵的是 `[0.00035, 1, 2, 3]`——**4 欄、原生 float/int、
+        沒有 None**。三個性質都跟真實回應不同，而 `float(ticker[0])` 剛好兩種
+        都吃得下，所以測試一直是綠的。**綠燈不代表驗過真實世界**（D027）。
+        """
+        exchange = FakeExchange(public_get_ticker_symbol=list(REAL_TICKER_FUSD))
+        assert make_client(exchange).get_frr("USD") == pytest.approx(0.0003119890410958904)
+
+    def test_placeholder_nulls_do_not_break_parsing(self, make_client):
+        """[13][14] 真的是 `None`——不是 0、不是空字串。
+
+        `get_frr()` 只讀 [0] 所以現在踩不到，這條守的是**以後**：任何往後
+        索引的新程式碼，會在這裡先撞到 None，而不是在實盤那一刻。
+        """
+        ticker = make_ticker_array(0.00035)
+        assert ticker[13] is None and ticker[14] is None
+        assert make_client(FakeExchange(public_get_ticker_symbol=ticker)).get_frr("USD") == (
+            pytest.approx(0.00035)
+        )
+
     def test_uses_funding_symbol_prefix(self, make_client):
-        exchange = FakeExchange(public_get_ticker_symbol=[0.0001])
+        exchange = FakeExchange(public_get_ticker_symbol=make_ticker_array(0.0001))
         make_client(exchange).get_frr("UST")
         assert exchange.calls[0][1] == {"symbol": "fUST"}
 
@@ -546,11 +681,19 @@ class TestCcxtContract:
 # --- 市場深度與已借出部位（2026-08-16 新增，見 DECISIONS.md D030）-----------
 
 
+# 2026-08-29 17:56 +0800 對 `GET /v2/book/fUSD/P0` 實打抄回來的兩列（B6）。
+# 供給側 AMOUNT 為正、需求側為負；**四欄全是字串**，PERIOD 也是。
+# 需求側那一列的 PERIOD 是 `'120'`——**天期不是只有 2**，寫死 2 的替身看不到這件事。
+REAL_BOOK_ROW_SUPPLY = ["0.00015955", "2", "2", "956.79220808"]
+REAL_BOOK_ROW_DEMAND = ["0.000273972602739726", "120", "1", "-2324092.18650454"]
+
+
 def make_book_row(rate, period, amount, count=1):
     """模擬 `/v2/book/fUSD/P0` 的一列：[RATE, PERIOD, COUNT, AMOUNT]。
 
-    **每個欄位都是字串**，利率還是 `'0.0002808219178082192'` 這種長浮點——
-    形狀取自 2026-08-16 的實打回應。負的 AMOUNT 是借款需求側。
+    **每個欄位都是字串**，利率還是 `'0.000273972602739726'` 這種長浮點——
+    形狀取自 2026-08-16 的實打回應，**2026-08-29 重打一次確認沒變**（B6）。
+    負的 AMOUNT 是借款需求側，實例見 `REAL_BOOK_ROW_DEMAND`。
     """
     return [str(rate), str(period), str(count), str(amount)]
 
@@ -575,6 +718,18 @@ def make_position_array(position_id="1", symbol="fUSD", amount=160.0, rate=0.000
 
 
 class TestGetFundingBook:
+    def test_parses_the_real_captured_rows(self, make_client):
+        """B6：直接吃 2026-08-29 實打抄回來的兩列，一個字都沒改。"""
+        exchange = FakeExchange(public_get_book_symbol_precision=[
+            list(REAL_BOOK_ROW_SUPPLY),
+            list(REAL_BOOK_ROW_DEMAND),
+        ])
+        levels = make_client(exchange).get_funding_book("USD")
+
+        # 需求側（負 AMOUNT）被丟掉，只剩供給側那一列
+        assert len(levels) == 1
+        assert levels[0] == {"rate": 0.00015955, "period": 2, "amount": 956.79220808}
+
     def test_keeps_only_the_supply_side(self, make_client):
         # 負數是借款需求側：對放貸方來說那是買家不是競爭者，
         # 混進來會把「前面排了多少錢」算大好幾倍，掛單價位就整個歪掉。
@@ -697,6 +852,33 @@ class TestGetActivePositions:
 
 
 class TestGetActiveOffers:
+    def test_parses_the_real_captured_offer(self, make_client):
+        """B6：直接吃 2026-08-29 實打抄回來的整列（21 欄），一個字都沒改。
+
+        抄得到是因為當下場上剛好躺著一張單——這個端點平常回空陣列。
+        **21 欄裡有 8 個 `None`**，而替身原本只有 16 欄、[10] 也是 `None`
+        而不是 `'ACTIVE'`。
+        """
+        exchange = FakeExchange(
+            private_post_auth_r_funding_offers_symbol=[list(REAL_FUNDING_OFFER)]
+        )
+        offers = make_client(exchange).get_active_offers("USD")
+
+        assert offers == [{
+            "id": 5096173429,          # 字串轉整數——取消端點只收整數（D026）
+            "symbol": "fUSD",
+            "created_at_ms": 1787989255000,
+            "amount": 345.02,
+            "rate": 0.0003,
+            "period": 2,
+        }]
+
+    def test_real_envelope_has_twenty_one_fields_with_active_status(self):
+        """欄數與 STATUS 都要對得上真實回應，否則替身只是另一個世界。"""
+        assert len(REAL_FUNDING_OFFER) == FUNDING_OFFER_FIELDS == 21
+        assert REAL_FUNDING_OFFER[10] == "ACTIVE"
+        assert make_offer_array()[10] == "ACTIVE"
+
     def test_returns_parsed_offers_without_cancelling(self, make_client):
         exchange = FakeExchange(
             private_post_auth_r_funding_offers_symbol=[make_offer_array(offer_id=5081917947)]
@@ -712,16 +894,43 @@ class TestGetActiveOffers:
         assert BitfinexClient({}, fake_logger, dry_run=True).get_active_offers("USD") == []
 
 
+# 2026-08-29 17:56 +0800 對 `GET /v2/trades/fUSD/hist` 實打抄回來的兩列（B6）。
+# **五欄全是字串**；AMOUNT 正負都出現，PERIOD 同樣不是只有 2。
+REAL_TRADE_ROW_POSITIVE = ["430955886", "1787997395000", "500", "0.00007397", "2"]
+REAL_TRADE_ROW_NEGATIVE = ["430955884", "1787997234000", "-155513.4357044", "0.00019", "5"]
+
+
 def make_trade_row(trade_id=1, mts=1_786_879_800_000, amount=-25_000.0, rate=0.00025, period=2):
     """模擬 `/v2/trades/fUSD/hist` 的一列。
 
-    欄位：0=ID, 1=MTS, 2=AMOUNT, 3=RATE, 4=PERIOD。形狀取自 2026-08-16 的實打回應
-    ——**AMOUNT 有正有負**（表示吃單方向），而成交價是同一個數字，兩邊看到的都一樣。
+    欄位：0=ID, 1=MTS, 2=AMOUNT, 3=RATE, 4=PERIOD。形狀取自 2026-08-16 的實打回應，
+    **2026-08-29 重打一次確認五欄真的全是字串**（B6）——在那之前
+    `get_recent_trades()` 的註解寫的是「欄位**可能**是字串」，那個「可能」
+    是猜的，現在不是了。
+    **AMOUNT 有正有負**（表示吃單方向），而成交價是同一個數字，兩邊看到的都一樣。
     """
     return [str(trade_id), str(mts), str(amount), str(rate), str(period)]
 
 
 class TestGetRecentTrades:
+    def test_parses_the_real_captured_rows(self, make_client):
+        """B6：直接吃 2026-08-29 實打抄回來的兩列，一個字都沒改。
+
+        `make_trade_row()` 的形狀本來就對，但**沒有任何一條測試吃過未經加工的
+        真實列**——「照抄」與「照抄後還是綠的」是兩件事。
+        """
+        exchange = FakeExchange(public_get_trades_symbol_hist=[
+            list(REAL_TRADE_ROW_NEGATIVE),
+            list(REAL_TRADE_ROW_POSITIVE),
+        ])
+        trades = make_client(exchange).get_recent_trades("USD")
+
+        assert [t["rate"] for t in trades] == [0.00019, 0.00007397]
+        # 正負都被取絕對值——方向不影響成交價
+        assert [t["amount"] for t in trades] == [155513.4357044, 500.0]
+        # PERIOD 不是只有 2
+        assert [t["period"] for t in trades] == [5, 2]
+
     def test_amount_sign_is_dropped_because_it_only_means_direction(self, make_client):
         exchange = FakeExchange(public_get_trades_symbol_hist=[
             make_trade_row(amount=-25_000.0),

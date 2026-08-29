@@ -368,15 +368,30 @@ M1-b 的放行條件是 2026-08-23 23:04 由 D040／D041 雙雙驗收通過解�
     `private_post_auth_r_funding_loans_symbol`（已出借未被借走）。
     **與 P2-1 共用同一份查詢結果**，兩項一起做最省事。
 
-- [ ] **B6：把既有的測試替身與測試資料，逐一對照真實回應校正**（見 DECISIONS.md D027）
+- [~] **B6：把既有的測試替身與測試資料，逐一對照真實回應校正**（見 DECISIONS.md D027）
+      —— **七支已校正**（2026-08-29，分支 `feature/calibrate-test-doubles`）：
+      三個公開端點 ＋ 四個唯讀私有端點各實打一次。**兩支寫入端點抄不到**，
+      維持「部分完成」。
   - **背景**：實單第一天的兩個 bug（D025、D026）都通過了完整測試套件，
     而且各自都有一條測試「正在守護那個性質」。漏掉的原因相同——
     **測試看到的世界比真實世界乾淨**（輸入是手打的兩位小數、替身回傳原生型別）。
-  - **已處理**：`make_offer_array()` 改成回傳字串、金額測試加入真實精度的餘額。
-  - **還沒處理**：`FakeExchange` 其餘方法的回傳值（`fetch_balance`、
-    `public_get_ticker_symbol`、submit 回應信封）同樣是手寫的，型別是否與真實一致沒有查過。
-  - **建議做法**：用唯讀 API 各打一次，把型別與格式照抄進替身，並在 docstring 註明
-    「取自真實回應」。**接 ledger 端點之前要先做**——那是下一個回應解析的重災區。
+  - **✅ 已校正（2026-08-29 實打）**：`public_get_ticker_symbol`、
+    `public_get_book_symbol_precision`、`public_get_trades_symbol_hist`、
+    `fetch_balance`、`private_post_auth_r_funding_offers_symbol`。
+    新增五組 `REAL_*` 常數，每組配一條**直接吃未加工真實列**的測試
+    ——「照抄」與「照抄後還是綠的」是兩件事。測試 691 → 699。
+  - **抓到四個替身原本不知道的事實**（完整敘述見 DECISIONS.md **D027 的追記**）：
+    ticker 是 17 欄不是 4 欄且 [13][14] 真的是 `None`；**offer 陣列是 21 欄，
+    替身寫 16**，而 [10]=STATUS 真實是 `'ACTIVE'`；`fetch_balance` 指定了
+    `type='funding'`，`info` 裡照樣混著別的錢包；可用餘額是八位小數。
+  - **🟡 還沒處理，兩個原因各自不同**：
+    - `funding_credits` ／ `funding_loans`：**打的當下沒有部位在生息，兩邊都回
+      空陣列**。不是漏做，是抄不到——**下次有部位在生息時補打一次**即可。
+    - `*_w_funding_offer_submit` ／ `_cancel`：**寫入端點，不動真錢就抄不到回應**。
+      D027 已預先寫明不採用「改成整合測試打真實 API」，這兩支只能維持手寫，
+      要靠日誌與實單事後核對。
+  - **對 P2-2 的意義**：ledger 是下一個回應解析的重災區，而這次抓到的四件事
+    有三件是「欄數／型別／混進別的東西」——**同一族的坑在 ledger 幾乎一定會再出現一次**。
 
 - [ ] **P5-2　確認 `systemd/bfx-lending-bot.service` 的去留**
       —— D016 已決定正式路線改用 Quadlet（`systemd/shuyu-lending-bot.container`），

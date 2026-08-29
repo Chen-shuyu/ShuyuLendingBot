@@ -224,6 +224,61 @@ def test_右設限不列入平均但會被單獨報出來():
     assert abs(summary.longest_censored_hours - 34.20) < 0.01
 
 
+def test_還在計時的那一段不會被說成被取代():
+    """🔴 這一條是正式環境誤述抓出來的（2026-08-29）。
+
+    當時場上躺著一張年化 10.95%、才掛了 1.85 小時的單，而報告印的是
+    「至少掛了 1.69 小時**沒有成交**，**被下一張單取代**」——沒有任何一張單
+    取代它，它還在等。偏偏那是 D045 缺了兩週的高價端樣本，把「還在計時」
+    講成「已經結束」，等於把一個會繼續長的下界固定成量測值。
+    """
+    spells = wait_time.build_spells(
+        [offer("5096173429", rate=0.0003, created_at="2026-08-29T15:51:01+08:00")],
+        [],
+        now=datetime(2026, 8, 29, 17, 31, 56, tzinfo=TZ),
+    )
+
+    assert len(spells) == 1
+    assert spells[0].censored is True
+    assert spells[0].replaced is False
+    text = wait_time.describe_spell(spells[0])
+    assert "還在計時" in text
+    assert "被下一張單取代" not in text
+
+
+def test_真的被下一張單取代時照樣這樣講():
+    """反向那半：分得出來才算修好，不然只是把一句錯話換成另一句。"""
+    spells = wait_time.build_spells(
+        [
+            offer("5084375241", rate=0.000268, created_at="2026-08-19T05:03:24+08:00"),
+            offer("5086244279", rate=0.00026027, created_at="2026-08-20T15:15:21+08:00"),
+        ],
+        [],
+        now=NOW,
+    )
+
+    assert spells[0].replaced is True
+    assert "被下一張單取代" in wait_time.describe_spell(spells[0])
+    # 最後一段永遠沒有下一張單接手
+    assert spells[1].replaced is False
+
+
+def test_還在計時的段數會被單獨報出來():
+    """`longest_censored_hours` 是下界，而讀的人要知道它還會不會長。"""
+    summary = wait_time.summarize(
+        [
+            offer("5084375241", rate=0.000268, created_at="2026-08-19T05:03:24+08:00"),
+            offer("5096173429", rate=0.0003, created_at="2026-08-29T15:51:01+08:00"),
+        ],
+        [],
+        now=datetime(2026, 8, 29, 17, 31, 56, tzinfo=TZ),
+    )
+
+    assert summary.censored == 2
+    # 兩段都沒等到，但只有最後那一段還在長
+    assert summary.ongoing == 1
+
+
 def test_沒有預估值的掛單不會被填成零():
     """填 0 會讓它變成「預估 0h、實際 3.6h」的低估樣本，把結論整個翻過去。"""
     spells = wait_time.build_spells([offer()], [position()], forecasts={}, now=NOW)

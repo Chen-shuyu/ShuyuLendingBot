@@ -68,6 +68,10 @@ class WaitSpell:
     started_at: datetime
     hours: float
     censored: bool
+    # **`censored` 只說「沒等到成交」，沒說「為什麼結束」。** 這兩件事被混在
+    # 一起講過一次：見 `describe_spell()` 裡的說明。有沒有下一張單接手是查得到
+    # 的事實，就記成事實，不要讓敘述層去猜。
+    replaced: bool
     offer_count: int
     offer_ids: List[str]
     position_id: Optional[str]
@@ -151,6 +155,19 @@ class WaitSummary:
         把它們算進分母會把右設限比例稀釋掉，讓報告看起來比實際可信。
         """
         return self.censored / self.comparable if self.comparable else 0.0
+
+    @property
+    def ongoing(self) -> int:
+        """右設限的段數裡，有幾段**還在計時**（還沒有下一張單接手）。
+
+        這個數字要出現在報告裡，否則「最長的一段掛了至少 N 小時」會被讀成
+        已經定案的觀測——**而它可能還在長**。同輪的兄弟單不算（那不是等待）。
+        """
+        return sum(
+            1
+            for spell in self.spells
+            if spell.censored and not spell.replaced and not spell.simultaneous
+        )
 
     @property
     def enough_for_quantile(self) -> bool:
@@ -311,7 +328,12 @@ def build_spells(
         started = group[0][0]
         rate = group[0][1]
         # 這一段的結束點：下一段開始，或還沒有下一段就是現在。
-        ends_at = groups[index + 1][0][0] if index + 1 < len(groups) else now
+        #
+        # **「有沒有下一段」是事實，「為什麼結束」不是。** 最後一段的結束點取
+        # `now`，那只代表「到報告產生為止還沒有下一張單接手」——它可能還躺在
+        # 場上等，也可能已經消失而還沒補掛。分不出來就不要在敘述裡選一個講。
+        replaced = index + 1 < len(groups)
+        ends_at = groups[index + 1][0][0] if replaced else now
 
         matched = None
         for position in positions:
@@ -355,6 +377,7 @@ def build_spells(
                 started_at=started,
                 hours=hours,
                 censored=censored,
+                replaced=replaced,
                 offer_count=len(group),
                 offer_ids=[str(o.get("offer_id") or "") for _, _, o in group],
                 position_id=position_id,
@@ -408,6 +431,9 @@ def describe_spell(spell: WaitSpell) -> str:
 
     沒等到成交的期間改口說「至少」——與 D039 對排隊位置越界、D040 對仍在借出中
     的部位一致：**講得出下界就講下界，不要把下界說成量測值。**
+
+    右設限的期間再分兩種講法：**被下一張單取代**（已經結束的觀測）與
+    **還在計時**（下界會繼續長）。兩者混講會讓後者被當成前者，理由見下面。
     """
     merged = f"（{spell.offer_count} 次重掛）" if spell.offer_count > 1 else ""
     if spell.has_forecast:
@@ -425,9 +451,23 @@ def describe_spell(spell: WaitSpell) -> str:
             f"**分不出誰先誰後，不算一段等待**"
         )
     if spell.censored:
+        # 🔴 **這裡曾經對兩種情況說同一句話。** 舊版無論如何都寫「被下一張單取代」，
+        # 於是**還躺在場上等的那一段會被讀成「已經結束、沒等到」**。
+        # 2026-08-29 那筆年化 10.95% 正是這樣被誤述的：報告說它被取代了，
+        # 而它當時還掛在場上、才躺了 1.85 小時。
+        #
+        # 為什麼這一句值得單獨修：**D045 的結論全靠高價端有沒有樣本撐著**，
+        # 而高價端的樣本幾乎都是右設限的。把「還在計時」講成「已經結束」，
+        # 等於把一個會繼續長的下界固定成量測值——D026 靜默失效的同一族，
+        # 報告照樣印得出來、數字也不離譜，只是講了一件沒查證過的事。
+        tail = (
+            "，被下一張單取代"
+            if spell.replaced
+            else "，**這一段還在計時**（到報告產生為止還沒有下一張單接手，下界會繼續長）"
+        )
         return (
             f"{spell.started_at:%m-%d %H:%M} 年化 {spell.annual_rate:.2f}%{merged}"
-            f"：至少掛了 {spell.hours:.2f} 小時**沒有成交**，被下一張單取代{forecast}"
+            f"：至少掛了 {spell.hours:.2f} 小時**沒有成交**{tail}{forecast}"
         )
     return (
         f"{spell.started_at:%m-%d %H:%M} 年化 {spell.annual_rate:.2f}%{merged}"

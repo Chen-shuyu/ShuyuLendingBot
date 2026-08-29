@@ -262,6 +262,56 @@ class RateSplit:
         return self.cheaper.median_hours - self.pricier.median_hours
 
     @property
+    def at_pivot(self) -> int:
+        """已結束樣本裡「利率剛好等於分界」的筆數。
+
+        分界取的是中位數，而中位數**可能同時是眾數**。真的發生時，
+        `< pivot` 會把整叢同利率的樣本一次掃進昂貴組——見 `degenerate`。
+        """
+        return sum(
+            1
+            for record in self.pricier.records
+            if not record.censored and record.rate == self.pivot_rate
+        )
+
+    @property
+    def displayed_at_pivot(self) -> int:
+        """已結束樣本裡「年化印出來跟分界一模一樣」的筆數。
+
+        **跟 `at_pivot` 不是同一個數字**，而差別會騙人：2026-08-29 的資料裡
+        `at_pivot` 是 9、這一個是 10——第 10 筆的日利率是 0.00024972，
+        分界是 0.00024971，**只差第 8 位小數，但年化都印成 9.11%**。
+
+        報告若拿 `at_pivot` 去講「有幾筆的利率就是 9.11%」，讀的人會照著
+        逐筆那一段去數，數出 10 筆然後以為報告算錯了。**兩個數字都要拿得到，
+        講的時候才能說清楚是哪一種相同。**
+        """
+        return sum(
+            1
+            for record in self.pricier.records
+            if not record.censored
+            and round(record.annual_rate, 2) == round(self.pivot_rate * 365 * 100, 2)
+        )
+
+    @property
+    def degenerate(self) -> bool:
+        """這個分界**分不出組，而且不會因為多蒐集樣本而變好**。
+
+        2026-08-29 的實例：16 筆已結束部位裡有 10 筆同為年化 9.11%，
+        於是中位數也是 9.11%，`<` 把那 10 筆全掃進昂貴組，
+        得到便宜組 1 筆／昂貴組 15 筆。
+
+        **關鍵在「不會自己好」**：模型連續選同一個價位時，每多一筆樣本
+        都同時把中位數釘在原地、又落進昂貴組。這時候報告若只說
+        「還比不出來，要兩組各 3 筆」，等於暗示再等幾筆就會好——
+        而那是錯的，它暗示的是一件不會發生的事（D026 靜默失效的同一族：
+        報告印得出來、數字也不離譜，只是講了一件沒查證過的事）。
+        """
+        return self.at_pivot >= MIN_SAMPLES_FOR_QUANTILE and (
+            self.cheaper.settled < MIN_SAMPLES_FOR_QUANTILE
+        )
+
+    @property
     def comparable(self) -> bool:
         """兩組是否都有足夠的已結束樣本，可以拿中位數互相比較。"""
         return (

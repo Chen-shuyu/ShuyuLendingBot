@@ -120,7 +120,7 @@ def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
 
     lines.append(
         f"掛單期間 {summary.total} 段："
-        f"已成交 {summary.filled} 段、沒等到就被取代 {summary.censored} 段"
+        f"已成交 {summary.filled} 段、沒等到成交 {summary.censored} 段"
         f"（右設限 {summary.censored_ratio * 100:.0f}%）"
     )
     if summary.merged_offers:
@@ -159,6 +159,11 @@ def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
         lines.append(
             f"  ⚠ 另有 {summary.censored} 段沒等到成交，最長的一段掛了 "
             f"**至少 {longest:.2f} 小時**——**只看成交的那幾段，會把等待看得比實際短。**"
+        )
+    if summary.ongoing:
+        lines.append(
+            f"  ⚠ 其中 {summary.ongoing} 段**還在計時**（還沒有下一張單接手）——"
+            f"它們的時數是下界且**會繼續長**，不是已經定案的觀測。"
         )
     lines.append("")
 

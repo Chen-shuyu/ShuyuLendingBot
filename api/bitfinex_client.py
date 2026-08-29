@@ -245,8 +245,9 @@ class BitfinexClient(ExchangeClient):
         trades: List[Dict[str, Any]] = []
         try:
             for row in rows:
-                # [0]=ID, [1]=MTS, [2]=AMOUNT, [3]=RATE, [4]=PERIOD；**欄位可能是字串**
-                # （掛單簿實測就是這樣，見 `get_funding_book`），所以一律自己轉型（D027）。
+                # [0]=ID, [1]=MTS, [2]=AMOUNT, [3]=RATE, [4]=PERIOD；**五欄全是字串**
+                # ——2026-08-29 實打確認（B6）。在那之前這裡寫的是「可能是字串」，
+                # 而那個「可能」是從掛單簿推的，沒有查證過。所以一律自己轉型（D027）。
                 rate = float(row[3])
                 if rate <= 0:
                     continue

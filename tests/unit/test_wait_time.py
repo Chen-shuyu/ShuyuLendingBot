@@ -17,6 +17,8 @@
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from core import wait_time
 
 TZ = timezone(timedelta(hours=8))
@@ -39,7 +41,8 @@ def offer(offer_id="5092133927", rate=0.00024971, created_at="2026-08-26T00:14:1
 
 
 def position(
-    position_id="464505426", rate=0.00024971, opened_at="2026-08-26T00:30:51+08:00"
+    position_id="464505426", rate=0.00024971, opened_at="2026-08-26T00:30:51+08:00",
+    closed_at=None,
 ):
     """一列 `funding_positions`。"""
     return {
@@ -51,7 +54,7 @@ def position(
         "kind": "credit",
         "opened_at": opened_at,
         "first_seen_at": "2026-08-26T00:34:20+08:00",
-        "closed_at": None,
+        "closed_at": closed_at,
     }
 
 
@@ -249,6 +252,76 @@ def test_算不出倍數的統計量不會被當成零():
     assert summary.overall_factor_for("median") is None
     # 平均那一個不受影響，兩者是分開算的
     assert summary.overall_factor_for("mean") is not None
+
+
+def test_實得年化把等待與持有乘起來():
+    """🔴 **這一條守的是 08-29 那個最貴卻最差的樣本。**
+
+    名目年化 10.95%（至今最高）等 5.19h、借 1.98h，**實得只有 3.02%**
+    （至今最低）。只看名目利率會把最差的決定看成最好的，而在這一條之前
+    專案裡沒有任何地方把 `W` 與 `P` 乘起來過。
+    """
+    spells = wait_time.build_spells(
+        [offer("hi", rate=0.0003, created_at="2026-08-29T15:40:56+08:00")],
+        [position("464812689", rate=0.0003,
+                  opened_at="2026-08-29T20:52:13+08:00",
+                  closed_at="2026-08-29T22:50:57+08:00")],
+        now=NOW.replace(day=30),
+    )
+    spell = spells[0]
+
+    assert spell.hours == pytest.approx(5.19, abs=0.01)      # W
+    assert spell.hold_hours == pytest.approx(1.98, abs=0.01)  # P
+    assert spell.realized_effective == pytest.approx(3.02, abs=0.02)
+    # 名目是最高的，實得是最低的——這正是要能同時看到的理由
+    assert spell.annual_rate > spell.realized_effective * 3
+
+
+def test_仍在生息中的部位算不出實得年化():
+    """`P` 還會繼續長，乘進去等於宣告一個還沒發生的結果（同右設限的處理）。"""
+    spells = wait_time.build_spells(
+        [offer()], [position()], now=NOW
+    )
+    assert spells[0].censored is False       # 等到成交了
+    assert spells[0].hold_ongoing is True    # 但還沒還回來
+    assert spells[0].hold_hours is None
+    assert spells[0].realized_effective is None
+
+
+def test_沒等到成交的期間也算不出實得年化():
+    """右設限的期間根本沒有 `P`。"""
+    offers = [
+        offer("a", created_at="2026-08-26T00:14:13+08:00"),
+        offer("b", rate=0.0002729, created_at="2026-08-26T06:00:00+08:00"),
+    ]
+    spells = wait_time.build_spells(offers, [], now=NOW)
+
+    assert all(s.censored for s in spells)
+    assert all(s.realized_effective is None for s in spells)
+
+
+def test_彙總的實得年化以時間加權而不是逐筆平均():
+    """一筆等很久又借很短的單，佔掉的時間遠多於它在逐筆平均裡的一票。"""
+    offers = [
+        offer("a", rate=0.00024971, created_at="2026-08-26T00:14:13+08:00"),
+        offer("b", rate=0.0003, created_at="2026-08-29T15:40:56+08:00"),
+    ]
+    positions = [
+        # 好的那一筆：幾乎沒等、借滿
+        position("good", rate=0.00024971,
+                 opened_at="2026-08-26T00:30:51+08:00", closed_at="2026-08-28T00:46:00+08:00"),
+        # 差的那一筆：等 5.19h、只借 1.98h
+        position("bad", rate=0.0003,
+                 opened_at="2026-08-29T20:52:13+08:00", closed_at="2026-08-29T22:50:57+08:00"),
+    ]
+    summary = wait_time.summarize(offers, positions, now=NOW.replace(day=30))
+
+    assert len(summary.realized) == 2
+    per_item = sum(s.realized_effective for s in summary.realized) / 2
+    weighted = summary.realized_effective
+    # 逐筆平均約 6.0%，時間加權約 8.9%——**兩者差很多，而加權才是實際拿到的**
+    assert weighted > per_item + 1.0
+    assert summary.realized_worst.position_id == "bad"
 
 
 def test_校準樣本的利率範圍會被報出來():

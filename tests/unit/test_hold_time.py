@@ -299,6 +299,38 @@ def test_樣本分散時分界不算退化():
     assert split.degenerate is False
 
 
+def test_選到更高的價位不會讓便宜組變大():
+    """🔴 **這一條守的是一個實際寫錯過的判斷**（2026-08-29）。
+
+    當時報告寫「要比得出來只能等模型選到**別的價位**（像 08-29 的 10.95%）」。
+    那天稍晚 10.95% 那筆真的收回了，而**它落進昂貴組**——便宜組還是 1 筆。
+
+    便宜組收的是 `< pivot`，所以「別的價位」不夠，**只有「更低的價位」有用**；
+    更高的價位只會讓失衡更嚴重。錯的不是數字，是那句話指的方向。
+    """
+    base = [
+        position("cheap1", rate=0.00015, opened_at="2026-08-16T21:30:43+08:00", closed_at="2026-08-18T18:35:22+08:00"),
+    ] + [
+        position(f"same{i}", rate=0.00024971,
+                 opened_at="2026-08-20T00:00:00+08:00", closed_at="2026-08-20T12:00:00+08:00")
+        for i in range(5)
+    ]
+
+    before = hold_time.split_by_rate(hold_time.summarize(base, now=NOW))
+
+    # 再加一筆「更高」的價位（形狀取自 08-29 那筆 10.95%、借 1.98h）
+    higher = base + [
+        position("pricey", rate=0.0003,
+                 opened_at="2026-08-29T20:52:13+08:00", closed_at="2026-08-29T22:50:57+08:00"),
+    ]
+    after = hold_time.split_by_rate(hold_time.summarize(higher, now=NOW))
+
+    assert before.cheaper.settled == 1
+    assert after.cheaper.settled == 1          # 便宜組完全沒動
+    assert after.pricier.settled == before.pricier.settled + 1   # 全進了昂貴組
+    assert after.degenerate is True            # 退化狀態沒有被解除
+
+
 def test_年化印起來相同但日利率不同的那一筆要分開數():
     """**兩個「相同」不能混講。**
 

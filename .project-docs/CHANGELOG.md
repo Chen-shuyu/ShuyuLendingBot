@@ -10,6 +10,33 @@
 
 ## [Unreleased]
 
+### Added（2026-08-29，PR #49，分支 `feature/report-statistics`）
+- **`wait_report` 印出三個統計量的對照**：`estimate_wait()` 一次算出
+  平均／中位數／四分之三、`offer_wait_forecasts` 三個都存了，但策略只用
+  `mean`、報告也只印 `mean`——**握著三份證據只看了一份，看了兩週**。
+  八個樣本並排後 **`median` 8/8 全數較準**（總量比 1.67× 對 4.25×、
+  最差 9.0× 對 108.6×）。新增 `WaitSpell.factor_for()`、
+  `WaitSummary.overall_factor_for()` ／ `median_factor_for()` ／ `factor_range_for()`。
+  ⚠ **只並排，不選**——換統計量會把選中價位移動約 2 個百分點，那是 M2 的題目（D045）。
+
+### Fixed（2026-08-29，PR #49，同分支）
+- **`hold_report` 的「還比不出來」會暗示一件不會發生的事**：分組門檻取已結束
+  部位的利率中位數 = 9.11%，而 9.11% 同時是眾數（17 筆裡 10 筆），`<` 把整叢
+  掃進昂貴組。原本只說「要兩組各 3 筆才算得準」，**讀起來像「再等幾筆就會好」**。
+  新增 `RateSplit.degenerate` 講出「這個分界不會自己好」，
+  以及 `displayed_at_pivot` 區分「日利率相同」與「年化印起來相同」
+  （`0.00024972` 與 `0.00024971` 都印成 9.11%，但 `<` 只看日利率）。
+
+### Changed（2026-08-29，PR #48，分支 `feature/calibrate-funding-credits`）
+- **B6：`funding_credits` 補打，credits 那一半不再是猜的**（D027 追記）。
+  趁部位 `464812689` 生息中打了一次唯讀查詢——B6 當初抄不到就是因為
+  打的當下沒有部位。三件替身不知道的事：**22 欄**、
+  `[21]=POSITION_PAIR` 是 `'tBTCUSD'`、
+  **`[8]=RATE_TYPE` 真實是 `'FIXED'` 而替身留 `None`**（同一個坑的第三次現身）。
+  **這是 B6 第一次核對到整條鏈路**：原始列 → `_parse_positions()` → DB 四欄逐一對上。
+  🟡 `funding_loans` 仍抄不到（要「已借走但還沒用掉」的時刻）。
+
+
 ### Fixed（2026-08-29，分支 `feature/calibrate-test-doubles`）
 - **等待報告把「還在計時」誤述成「被下一張單取代」**：`describe_spell()` 對所有
   右設限的期間都寫同一句，而那是一個沒有查證過的原因。08-29 那筆年化 10.95%

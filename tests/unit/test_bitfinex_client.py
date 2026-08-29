@@ -27,6 +27,14 @@ from utils.exceptions import FatalError, RetryableError, SkipCycleError
 FUNDING_OFFER_FIELDS = 21
 
 
+# https://docs.bitfinex.com/reference/rest-auth-funding-credits
+#
+# credits 是 **22 欄**（索引 0～21），比 loans 多最後那一欄 `POSITION_PAIR`
+# ——2026-08-29 實打確認（B6）。`_parse_positions()` 的 docstring 從一開始就寫著
+# 「credits 比 loans 多一個 21=POSITION_PAIR」，這次是第一次拿真實回應對上。
+FUNDING_CREDIT_FIELDS = 22
+
+
 # 2026-08-19 05:03:24 +0800，取自那天場上唯一一張單的真實回應（見 D038）。
 OFFER_CREATED_MS = "1787087004000"
 
@@ -142,6 +150,28 @@ REAL_FUNDING_BALANCE = {
         ["exchange", "UST", "0.01187148", "0", "0.01187148", "Affiliate Rebate", None],
     ],
 }
+
+
+# 2026-08-29 21:5x 對 `POST /v2/auth/r/funding/credits/fUSD` 實打抄回來的整列（B6）。
+# 抄得到是因為**當下剛好有一筆部位在生息**——08-29 17:5x 那次實打時帳號沒有部位，
+# 這個端點回空陣列，所以 B6 當時只能把它留成 🟡。
+#
+# 🔴 **三件替身原本不知道的事**：
+#   1. **credits 是 22 欄**（索引 0～21），最後一欄 `[21]` 是 `POSITION_PAIR`
+#      ——這次拿到的是 `'tBTCUSD'`，也就是借款人把這筆錢用在哪個交易對上。
+#   2. **`[8]` 是 `RATE_TYPE`，真實值 `'FIXED'`**，替身留 `None`。
+#      這是 D027 那族坑的第三次現身（`REAL_FUNDING_OFFER[10]` 的 `'ACTIVE'` 是第二次）：
+#      哪天要靠它濾掉 FRR 浮動利率的部位，測試會拿 `None` 走完全程然後亮綠燈。
+#   3. **`[3]`／`[4]`（MTS_CREATE／MTS_UPDATE）有值且與 `[13]`（MTS_OPENING）相同**，
+#      替身這三格只填了 `[13]`。三個時間戳同值是「掛單成交當下就開始計息」的樣子，
+#      不是巧合——但**只有一個樣本，不能當成不變量**。
+#
+# 22 欄裡有 7 個 `None`，數值全是字串（含 `'345.02'`、`'0.0003'`、`'2'`）。
+REAL_FUNDING_CREDIT = [
+    "464812689", "fUSD", "1", "1788007933000", "1788007933000", "345.02", "0",
+    "ACTIVE", "FIXED", None, None, "0.0003", "2", "1788007933000", None, None,
+    "0", None, "0", None, "0", "tBTCUSD",
+]
 
 
 def make_submit_response(offer=None, status="SUCCESS", text="offer submitted"):
@@ -703,17 +733,30 @@ def make_position_array(position_id="1", symbol="fUSD", amount=160.0, rate=0.000
     """模擬 funding credits／loans 的一列。
 
     欄位（官方文件）：0=ID, 1=SYMBOL, 5=AMOUNT, 7=STATUS, 11=RATE, 12=PERIOD, 13=MTS_OPENING。
-    **這個形狀還沒被真實回應驗證過**——探測當下帳號一筆都沒成交，兩個端點都是空清單
-    （見 `BitfinexClient.get_active_positions()` 的註解）。
+
+    **credits 那一半已於 2026-08-29 實打校正**（見 `REAL_FUNDING_CREDIT`）：
+    22 欄、數值全是字串、`[8]=RATE_TYPE` 是 `'FIXED'` 而不是 `None`。
+    ⚠ **loans 那一半仍未校正**——它要「已借走但還沒用掉」的時刻，實打當下錢已經
+    被借走了，端點回空陣列。`length=21` 這個預設值仍取自官方文件，不是抄來的。
     """
     row = [None] * length
     row[0] = str(position_id)
     row[1] = symbol
+    row[2] = "1"              # SIDE
+    row[3] = str(opened_at) if opened_at is not None else None   # MTS_CREATE
+    row[4] = str(opened_at) if opened_at is not None else None   # MTS_UPDATE
     row[5] = str(amount)
-    row[7] = "ACTIVE"
+    row[6] = "0"
+    row[7] = "ACTIVE"         # STATUS
+    row[8] = "FIXED"          # RATE_TYPE ← 真實回應是 'FIXED'，不是 None
     row[11] = str(rate)
     row[12] = str(period)
-    row[13] = str(opened_at) if opened_at is not None else None
+    row[13] = str(opened_at) if opened_at is not None else None  # MTS_OPENING
+    row[16] = "0"
+    row[18] = "0"
+    row[20] = "0"
+    if length > 21:
+        row[21] = "tBTCUSD"   # POSITION_PAIR，只有 credits 有這一欄
     return row
 
 
@@ -793,6 +836,42 @@ class TestGetFundingBook:
 
 
 class TestGetActivePositions:
+    def test_parses_the_real_captured_credit(self, make_client):
+        """B6：直接吃 2026-08-29 實打抄回來的整列（22 欄），一個字都沒改。
+
+        抄得到是因為當下剛好有一筆部位在生息。**這一列走完整條鏈路核對過**：
+        交易所原始列 → `_parse_positions()` → DB 的 `funding_positions`，
+        三處的 `amount`／`rate`／`period`／`opened_at` 完全一致。
+        """
+        exchange = FakeExchange(
+            private_post_auth_r_funding_credits_symbol=[list(REAL_FUNDING_CREDIT)],
+            private_post_auth_r_funding_loans_symbol=[],
+        )
+        positions = make_client(exchange).get_active_positions("USD")
+
+        assert positions == [{
+            "id": "464812689",
+            "symbol": "fUSD",
+            "amount": 345.02,
+            "rate": 0.0003,
+            "period": 2,
+            "opened_at": 1788007933000,   # 2026-08-29T20:52:13+08:00
+            "kind": "credit",
+        }]
+
+    def test_real_credit_has_twenty_two_fields_with_rate_type(self):
+        """欄數、STATUS、RATE_TYPE 都要對得上真實回應，否則替身只是另一個世界。
+
+        **`[8]` 這一格是這次實打的收穫**：真實是 `'FIXED'`，替身留 `None`。
+        與 `REAL_FUNDING_OFFER[10]` 的 `'ACTIVE'` 同一族——欄位存在、
+        替身卻用 `None` 走完全程，是 D027 記的那個坑。
+        """
+        assert len(REAL_FUNDING_CREDIT) == FUNDING_CREDIT_FIELDS == 22
+        assert REAL_FUNDING_CREDIT[7] == "ACTIVE"
+        assert REAL_FUNDING_CREDIT[8] == "FIXED"
+        assert REAL_FUNDING_CREDIT[21] == "tBTCUSD"   # credits 比 loans 多的那一欄
+        assert len(make_position_array()) == FUNDING_CREDIT_FIELDS
+
     def test_merges_credits_and_loans(self, make_client):
         # 兩個端點都要查：credits 是「借款人已拿去用」，loans 是「借走但還沒用掉」，
         # 對放貸方而言兩者都是錢已經出去、正在生息。只查一個會漏掉另一半。

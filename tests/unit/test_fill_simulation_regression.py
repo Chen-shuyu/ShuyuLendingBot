@@ -202,3 +202,116 @@ class Test成交規則對得上真實成交:
         代表規則或資料出了事。"""
         validation = fs.validate_against_real_fills(self._spells(), history())
         assert validation.total_ratio() < 1.0
+
+
+class TestA2b重掛政策在這段歷史上分不出勝負:
+    """A2-b（D046）的答案是**否定的**，而否定的答案同樣要被釘住。
+
+    五種重掛政策在 403 根真實 K 線上跑出來的實得年化**幾乎完全相同**
+    （6.56%～6.57%）。成因不是「沒有機會作用」——等待佔掉整段歷史的 30%
+    ——而是**訊號本身太慢**：候選價位來自 168 小時的窗，一場十幾小時的乾旱
+    幾乎推不動它（D050）。
+    """
+
+    POLICIES = (
+        ("never", fs.never_repost()),
+        ("tolerance2", fs.rate_tolerance(2.0)),
+        ("down_only", fs.down_only(2.0)),
+        ("down_after_12.6h", fs.down_after_idle(12.6)),
+        ("down_after_18.9h", fs.down_after_idle(18.9)),
+    )
+
+    def _run(self, policy):
+        return fs.run_policy(
+            ExpectedValueStrategy(CONFIG),
+            history(),
+            hold_model=fs.empirical_hold(),
+            assumed_hold_hours=48.0,
+            repost_policy=policy,
+        )
+
+    def test_五種政策的實得年化幾乎相同(self):
+        結果 = [self._run(policy).realized_annual_pct for _, policy in self.POLICIES]
+        assert max(結果) - min(結果) < 0.05, f"分得出勝負了，要回頭看 D050：{結果}"
+
+    def test_不是因為沒有機會作用(self):
+        """等待佔整段歷史的 30%，其中 36% 集中在最長的那一段（38.5h）。
+
+        **「沒機會」與「有機會但訊號太慢」的處置完全不同**，
+        所以這一條要跟上一條綁在一起。
+        """
+        outcome = self._run(None)
+        等待 = sum(cycle.wait_hours for cycle in outcome.cycles)
+        持有 = sum(cycle.hold_hours or 0.0 for cycle in outcome.cycles)
+        assert 等待 / (等待 + 持有 + outcome.idle_hours) == pytest.approx(0.30, abs=0.02)
+        assert max(cycle.wait_hours for cycle in outcome.cycles) == pytest.approx(
+            38.5, abs=0.1
+        )
+
+    def test_訊號太慢是因為窗太長(self):
+        """最長那段空掛裡，候選價位**前 32 小時完全沒動**，
+        直到第 163 根才掉到差 2.88%（剛好越過 2% 容差）——
+        而那時候那段等待已經走完 83%。
+        """
+        from core import backtest
+
+        起點 = 131
+        掛著 = backtest.replay_at(ExpectedValueStrategy(CONFIG), history()[: 起點 + 1])
+        assert 掛著.chosen_annual_pct == pytest.approx(9.78, abs=0.01)
+
+        # 32 小時之後才第一次有差距
+        第32小時 = backtest.replay_at(
+            ExpectedValueStrategy(CONFIG), history()[: 起點 + 32 + 1]
+        )
+        漂移 = abs(第32小時.chosen_rate - 掛著.chosen_rate) / 掛著.chosen_rate * 100
+        assert 漂移 > 2.0
+
+        # 而在那之前（第 28 小時）還是一動也不動
+        第28小時 = backtest.replay_at(
+            ExpectedValueStrategy(CONFIG), history()[: 起點 + 28 + 1]
+        )
+        assert 第28小時.chosen_rate == 掛著.chosen_rate
+
+
+class TestD047的機制不是永遠同一個方向:
+    """🔴 **D047 的追記**：乾旱把估計拉好看，**只在乾旱還短的時候成立**。
+
+    兩段空掛，方向相反：
+
+    | 空掛 | 典型等待 | 乾旱長度 | `W` 平均怎麼走 |
+    |---|---|---|---|
+    | 第 387 根起（D047 記的那段） | ~10h | 16h | **10.52 → 7.33，變好看** |
+    | 第 131 根起（38.5h 那段） | ~5.9h | 33h | **5.88 → 8.14，變難看** |
+
+    機制：設限的起點記「至少等到窗尾」，最後 `k` 根貢獻的是 `k, k-1, …, 1`，
+    平均約 `k/2`。**`k/2` 小於典型等待時把平均拉低，大於時把平均拉高。**
+    D047 觀察到的是前者，而它不是通則。
+    """
+
+    @staticmethod
+    def _wait_mean(end_index, rate):
+        import statistics
+
+        highs = [candle["high"] for candle in history()[: end_index + 1]][-168:]
+        total = len(highs)
+        nxt, upcoming = [None] * total, None
+        for i in range(total - 1, -1, -1):
+            if highs[i] >= rate:
+                upcoming = i
+            nxt[i] = upcoming
+        waits = [
+            (total - s) if nxt[s] is None else (nxt[s] - s + 0.5) for s in range(total)
+        ]
+        return statistics.fmean(waits)
+
+    def test_長乾旱反而把估計推難看(self):
+        from core import backtest
+
+        rate = backtest.replay_at(
+            ExpectedValueStrategy(CONFIG), history()[:132]
+        ).chosen_rate
+        開頭 = self._wait_mean(131, rate)
+        乾旱32小時後 = self._wait_mean(163, rate)
+        assert 開頭 == pytest.approx(5.88, abs=0.02)
+        assert 乾旱32小時後 == pytest.approx(8.14, abs=0.02)
+        assert 乾旱32小時後 > 開頭, "這一段的方向與 D047 相反，追記講的就是這件事"

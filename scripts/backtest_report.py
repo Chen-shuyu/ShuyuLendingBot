@@ -345,6 +345,68 @@ def format_simulation(rows, hold_label: str, horizon_hours: float) -> str:
     return "\n".join(lines)
 
 
+REPOST_POLICIES = (
+    ("不重掛（下界對照）", lambda: None),
+    ("★ 現況：2% 容差雙向", lambda: fill_simulation.rate_tolerance(2.0)),
+    ("只往下，2% 容差", lambda: fill_simulation.down_only(2.0)),
+    ("躺 12.6h 後才往下", lambda: fill_simulation.down_after_idle(12.6)),
+    ("躺 18.9h 後才往下", lambda: fill_simulation.down_after_idle(18.9)),
+    ("候選一變就跟（上界）", lambda: fill_simulation.follow_candidate()),
+)
+
+
+def format_repost(rows, assumed_hold: float) -> str:
+    """A2-b 的比較表（D046／D050）。**機器人的重掛邏輯一行都沒有改。**"""
+    lines = ["", "=== 重掛政策比較（A2-b，只在模擬裡跑）===", ""]
+    lines.append(f"策略假設 P = {assumed_hold:.2f}h")
+    lines.append("")
+    lines.append(
+        _pad("重掛政策", 26)
+        + _pad("實得年化", 11, right=True)
+        + _pad("循環", 7, right=True)
+        + _pad("成交率", 8, right=True)
+        + _pad("改掛次數", 10, right=True)
+    )
+    for name, outcome in rows:
+        lines.append(
+            _pad(name, 26)
+            + _pad(_pct(outcome.realized_annual_pct), 11, right=True)
+            + _pad(str(len(outcome.cycles)), 7, right=True)
+            + _pad(
+                f"{outcome.fill_rate * 100:.0f}%" if outcome.fill_rate is not None else "—",
+                8,
+                right=True,
+            )
+            + _pad(str(outcome.repost_count), 10, right=True)
+        )
+
+    spread = None
+    values = [o.realized_annual_pct for _, o in rows if o.realized_annual_pct is not None]
+    if values:
+        spread = max(values) - min(values)
+    lines.append("")
+    if spread is not None and spread < 0.05:
+        lines.append(
+            f"  🔴 **分不出勝負**：最好與最差差 {spread:.2f} 個百分點。"
+            "**而這不是因為沒有機會作用**——等待佔掉整段歷史約三成。"
+        )
+        lines.append(
+            "     成因是**訊號太慢**：候選價位來自 168 小時的窗，"
+            "一場十幾小時的乾旱幾乎推不動它（D050）。"
+            "最長那段空掛裡，候選價位**前 32 小時完全沒動**。"
+        )
+        lines.append(
+            "  📌 **所以 A2-b 的下一步不是挑一個門檻，是換一個訊號**"
+            "——重掛的判斷需要比定價更短的視野。"
+        )
+    lines.append(
+        "  ⚠ **模擬看不到重掛的兩項成本**，兩項都讓重掛顯得比實際划算："
+        "(1) 取消會把排隊位置歸零；(2) 取消當下就成交的風險（D031 真的發生過）。"
+        "**所以上面的差距是上界。**"
+    )
+    return "\n".join(lines)
+
+
 def _display_width(text: str) -> int:
     """字串在等寬終端機裡佔幾格（中文全形算兩格）。同 `wait_report`。"""
     return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
@@ -538,6 +600,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="接上成交模擬，算出換掉那個 48 之後的**實得年化**（D1）",
     )
     parser.add_argument(
+        "--repost",
+        action="store_true",
+        help="比較幾種重掛政策的實得年化（A2-b，只在模擬裡跑）",
+    )
+    parser.add_argument(
         "--hold-model",
         default="empirical",
         help="實際持有時間怎麼給：empirical（實測分佈，預設）或 fixed:<小時>",
@@ -628,6 +695,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             )
         print(format_simulation(rows, hold_label, len(candles) * 1.0))
+
+    if args.repost:
+        try:
+            hold_model, _ = _build_hold_model(args.hold_model)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        assumed = args.hold_hours if args.hold_hours is not None else 48.0
+        rows = []
+        for name, build in REPOST_POLICIES:
+            rows.append(
+                (
+                    name,
+                    fill_simulation.run_policy(
+                        STRATEGIES[args.strategy](config),
+                        candles,
+                        hold_model=hold_model,
+                        assumed_hold_hours=assumed,
+                        repost_policy=build(),
+                        repost_policy_name=name,
+                    ),
+                )
+            )
+        print(format_repost(rows, assumed))
 
     return 0
 

@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from core import hold_time, market_snapshot
+from core import earnings, hold_time, market_snapshot
 from notify import messages
 from utils import clock
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
@@ -98,6 +98,7 @@ class BotEngine:
         push_trade_events: bool = True,
         rate_tolerance_pct: float = 2.0,
         queue_clear_usd_per_hour: float = 540_000.0,
+        earnings_sync_hours: float = 6.0,
     ):
         self.logger = logger
         self.notifier = notifier
@@ -109,6 +110,12 @@ class BotEngine:
         self.push_trade_events = bool(push_trade_events)
         # 場上掛單與新計畫差多少以內算「沒變」，用來決定要不要重掛（見 `_plans_match`）。
         self.rate_tolerance_pct = float(rate_tolerance_pct)
+        # 每隔幾小時把帳本同步一次（0 或負數 = 關掉）。**放在迴圈層，不在 `run_once()` 裡**
+        # ——理由見 `_maybe_sync_earnings()` 的 docstring（D052）。
+        self.earnings_sync_hours = float(earnings_sync_hours)
+        # **只存在記憶體裡**：重啟後多同步一次沒有代價（冪等，D051），
+        # 而那比為它加一個 `bot_state` 欄位便宜。
+        self._last_earnings_sync_at: Optional[datetime] = None
         # 排隊的錢被吃掉的速率，用來把「前方多少錢」換算成「要等多久」
         # （見 `_cheaper_repost_is_not_worth_it`）。**只有一個校準樣本**，
         # 目前僅用於分母差異不大的比較，敏感度低；D032 會把它換成每輪自己算。
@@ -1119,6 +1126,52 @@ class BotEngine:
         """
         self._offers_live = bool(existing)
 
+    def _maybe_sync_earnings(self) -> None:
+        """每隔一段時間把交易所帳本的利息同步進 `earnings_daily`（D052）。
+
+        🔴 **這支的第一守則是「絕對不能影響巡檢」。** 它吞掉所有 `Exception`
+        ——不是防禦性寫法，是它存在的前提：收益統計是**事後才看**的東西，
+        而掛單是**現在正在跑**的錢。**讓一份報表把放貸機器人弄停，任何理由都不划算。**
+
+        `KeyboardInterrupt` 那一族（`BaseException`）刻意不吞：那是使用者要它停。
+
+        **同步是冪等的**（`set_daily_earning()` 覆蓋語意，D051），
+        所以「多同步一次」沒有代價，「少同步一次」也只是晚一點補上。
+        因此節流用記憶體裡的時間戳就夠了，**不必為它動 `bot_state` 的 schema**
+        ——重啟後多跑一次同步，比多一個欄位要維護划算。
+        """
+        if not self.earnings_sync_hours:
+            return
+
+        now = clock.now()
+        if self._last_earnings_sync_at is not None:
+            elapsed = (now - self._last_earnings_sync_at).total_seconds()
+            if elapsed < self.earnings_sync_hours * 3600:
+                return
+
+        # 先記時間再同步：失敗了也不要下一輪馬上重試。
+        # **一個一直失敗的同步不該變成每 10 分鐘打一次交易所。**
+        self._last_earnings_sync_at = now
+
+        try:
+            entries = self.client.get_funding_ledger("USD")
+            summary = earnings.summarize(entries, currency="USD")
+            for day in summary.days:
+                self.repository.set_daily_earning(
+                    date=day.date,
+                    currency=day.currency,
+                    interest=day.interest,
+                    # **本金不填。** 帳本只看得到餘額，而餘額含已賺到的利息、
+                    # 也含還掛在場上沒借出去的錢——猜一個就變成推論（D051）。
+                    principal_avg=None,
+                )
+            self.logger.info(
+                f"帳本同步完成：{summary.total_rows} 列裡有 {summary.interest_rows} 列利息，"
+                f"寫入 {len(summary.days)} 天、合計 {summary.total_interest:.8f} USD"
+            )
+        except Exception as exc:  # noqa: BLE001 - 見 docstring：不能影響巡檢
+            self.logger.warning(f"帳本同步失敗，本輪略過（不影響掛單）：{exc}")
+
     def run_forever(self) -> int:
         """啟動檢查後進入常駐主迴圈，回傳離開碼。"""
         try:
@@ -1148,6 +1201,16 @@ class BotEngine:
                     return EXIT_FATAL
                 else:
                     self.failures.record_success()
+
+                # **帳本同步刻意放在這裡，不在 `run_once()` 裡面**（D052）。
+                # 兩個理由，都不是風格問題：
+                #
+                # 1. **`run_once()` 有五條提早 `raise SkipCycleError` 的路**，
+                #    而目前正式環境幾乎每一輪都走其中一條（掛單沒變 → 略過）。
+                #    放進去等於永遠不會執行——**D038 就是這樣量不到閒置最久的那些輪**。
+                # 2. **它與掛單完全無關。** 放在迴圈這一層，就算它整個爛掉也碰不到
+                #    定價、重掛、取消、下單任何一條路徑。
+                self._maybe_sync_earnings()
 
                 time.sleep(self.interval_seconds)
         except KeyboardInterrupt:

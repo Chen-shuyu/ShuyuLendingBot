@@ -88,6 +88,9 @@ def main() -> int:
         queue_clear_usd_per_hour=float(
             engine_config.get("queue_clear_usd_per_hour", 540_000)
         ),
+        # 每隔幾小時把交易所帳本的利息同步進 `earnings_daily`（D052）。
+        # 設 0 就關掉。**它不影響掛單**——同步整個爛掉也只是收益統計晚一點更新。
+        earnings_sync_hours=float(engine_config.get("earnings_sync_hours", 6.0)),
     )
 
     logger.info("開始執行 Bitfinex 放貸機器人")

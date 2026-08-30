@@ -252,3 +252,93 @@ class Test成交規則的驗收:
         )
         assert len(validation.comparable) == 2
         assert len(validation.above_resolution) == 1
+
+
+class Test重掛政策:
+    """A2-b（D046）。**這一族只測模擬器，機器人的重掛邏輯一行都沒有改。**"""
+
+    def test_沒有政策時與simulate_fill完全相同(self):
+        """🔴 **基準線必須逐位元不變**，否則「加了政策之後變好了」
+        會分不清是政策的功勞還是基準線被改掉了。"""
+        market = candles([0.00015] * 5 + [0.00031] + [0.00015] * 5)
+        直接 = fs.simulate_fill(market, 0, 0.00029)
+        經由policy = fs.run_policy(
+            _策略(), market, hold_model=fs.fixed_hold(48.0), repost_policy=None
+        )
+        assert 經由policy.cycles[0].wait_hours == 直接.wait_hours
+        assert 經由policy.cycles[0].repost_count == 0
+
+    def test_改掛之後等待時間不歸零(self):
+        """**這是最重要的一條記帳規則。** 歸零的話，一個「每小時都改掛」的
+        政策會顯示成永遠只等半小時——錢從掛出那一刻起就沒有在賺。"""
+        # 前 5 根都掃不到 0.00029，第 6 根掃到 0.00016
+        market = candles([0.00015] * 5 + [0.00016] * 5)
+        outcome = fs.run_policy(
+            _策略(rate=0.00029),
+            market,
+            hold_model=fs.fixed_hold(48.0),
+            repost_policy=fs.follow_candidate(),
+        )
+        cycle = outcome.cycles[0]
+        # 就算中途改掛，等待仍從第 0 根起算
+        assert cycle.wait_hours >= 5.0
+
+    def test_只往下的政策不會往上追(self):
+        """防棘輪（D046）：市場連漲時一路追高會永遠不成交。"""
+        policy = fs.down_only(2.0)
+        往上 = fs.RepostContext(live_rate=0.00025, candidate_rate=0.00031, idle_hours=20, index=0)
+        往下 = fs.RepostContext(live_rate=0.00031, candidate_rate=0.00025, idle_hours=20, index=0)
+        assert policy(往上) is None
+        assert policy(往下) == pytest.approx(0.00025)
+
+    def test_容差以內不動(self):
+        policy = fs.rate_tolerance(2.0)
+        微幅 = fs.RepostContext(
+            live_rate=0.00029879, candidate_rate=0.00029879 * 1.01, idle_hours=5, index=0
+        )
+        assert policy(微幅) is None
+
+    def test_容差政策兩個方向都會動(self):
+        """**這是正式環境現在真正在跑的行為**（往上沒有額外判準，D046）。"""
+        policy = fs.rate_tolerance(2.0)
+        往上 = fs.RepostContext(live_rate=0.00025, candidate_rate=0.00031, idle_hours=1, index=0)
+        往下 = fs.RepostContext(live_rate=0.00031, candidate_rate=0.00025, idle_hours=1, index=0)
+        assert policy(往上) == pytest.approx(0.00031)
+        assert policy(往下) == pytest.approx(0.00025)
+
+    def test_閒置門檻沒到就不動(self):
+        policy = fs.down_after_idle(12.6)
+        早 = fs.RepostContext(live_rate=0.00031, candidate_rate=0.00025, idle_hours=5.0, index=0)
+        晚 = fs.RepostContext(live_rate=0.00031, candidate_rate=0.00025, idle_hours=13.0, index=0)
+        assert policy(早) is None
+        assert policy(晚) == pytest.approx(0.00025)
+
+    def test_沒有候選價位時一律不動(self):
+        """`choose_rate()` 回 None 有好幾種成因，拿它當「該降價」的訊號是錯的。"""
+        for policy in (fs.rate_tolerance(), fs.down_only(), fs.down_after_idle(6), fs.follow_candidate()):
+            assert policy(
+                fs.RepostContext(live_rate=0.00029, candidate_rate=None, idle_hours=99, index=0)
+            ) is None
+
+    def test_改掛次數被記下來(self):
+        """真實世界每一次改掛都要付排隊位置的代價，而模擬裡是免費的
+        ——所以次數要看得見。"""
+        market = candles([0.00015] * 10)
+        outcome = fs.run_policy(
+            _策略(rate=0.00029),
+            market,
+            hold_model=fs.fixed_hold(48.0),
+            repost_policy=fs.follow_candidate(),
+        )
+        assert outcome.repost_count == outcome.cycles[0].repost_count
+
+    def test_最後成交的價位與一開始掛的價位分開記(self):
+        market = candles([0.00015] * 5 + [0.00016] * 5)
+        outcome = fs.run_policy(
+            _策略(rate=0.00029),
+            market,
+            hold_model=fs.fixed_hold(48.0),
+            repost_policy=fs.follow_candidate(),
+        )
+        cycle = outcome.cycles[0]
+        assert cycle.initial_rate == pytest.approx(0.00029)

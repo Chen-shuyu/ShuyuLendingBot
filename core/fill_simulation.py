@@ -182,6 +182,116 @@ def empirical_hold(
 
 
 # ----------------------------------------------------------------------
+# 重掛政策（A2-b，見 DECISIONS.md D046）
+# ----------------------------------------------------------------------
+#
+# **這一段只在模擬裡跑，機器人一行都沒有改。** 它存在的目的是先量出
+# 「哪一種重掛政策比較好」，而不是把某個直覺直接送上正式環境
+# ——直接拍一個「超過 N 小時就降價」正是 `target_queue_usd` 的死法（D032）。
+#
+# 🔴 **模擬不到的兩件事，而它們都讓重掛看起來比實際上划算**：
+#
+# 1. **排隊位置的成本。** 取消重掛會把排隊位置歸零，而 K 線看不到排隊。
+#    模擬裡「改掛一個新價位」是免費的，真實世界不是。
+# 2. **取消當下就成交的風險。** 2026-08-16 19:31 送出取消、25 秒後那張單
+#    成交了（D031）——**用確定的利息去換估出來的速度**。模擬裡不存在這件事。
+#
+# 所以下面比出來的差距**是上界**：真實的重掛只會比模擬更不划算。
+
+
+@dataclass(frozen=True)
+class RepostContext:
+    """要不要改掛時，政策看得到的東西。
+
+    **刻意不給「未來」**：政策只拿得到當下的候選價位與已經等了多久，
+    與策略在正式環境裡看得到的一樣多。
+    """
+
+    live_rate: float
+    candidate_rate: Optional[float]
+    idle_hours: float
+    index: int
+
+
+# 回傳新的利率代表「改掛」，回傳 `None` 代表「維持不動」。
+RepostPolicy = Callable[[RepostContext], Optional[float]]
+
+
+def never_repost() -> RepostPolicy:
+    """掛出去就不再動。**這是對照組的下界**，不是誰真的在用的政策。"""
+
+    def policy(context: RepostContext) -> Optional[float]:
+        return None
+
+    return policy
+
+
+def rate_tolerance(tolerance_pct: float = 2.0) -> RepostPolicy:
+    """**這是正式環境現在真正在跑的政策。**
+
+    `_plans_match()` 的利率容差：候選價位與場上差超過 `tolerance_pct` 就重掛，
+    **兩個方向都會**。往上沒有任何額外判準（D046 查證過），
+    往下那道守門檻在簿子被截斷時一律棄權（A2／A2-a），於是也等於放行。
+
+    所以「現況」不是「不重掛」，是「差超過 2% 就跟著走」
+    ——只是 D047 的乾旱回饋圈讓候選價位一直等於場上價位，它從沒被觸發過。
+    """
+
+    def policy(context: RepostContext) -> Optional[float]:
+        if context.candidate_rate is None or context.live_rate <= 0:
+            return None
+        drift_pct = abs(context.candidate_rate - context.live_rate) / context.live_rate * 100
+        return context.candidate_rate if drift_pct > tolerance_pct else None
+
+    return policy
+
+
+def follow_candidate() -> RepostPolicy:
+    """候選價位一變就跟著改。**對照組的上界**——重掛成本在模擬裡是零，
+    所以這一條在模擬裡會被高估得最厲害。"""
+
+    def policy(context: RepostContext) -> Optional[float]:
+        if context.candidate_rate is None:
+            return None
+        return context.candidate_rate if context.candidate_rate != context.live_rate else None
+
+    return policy
+
+
+def down_only(tolerance_pct: float = 2.0) -> RepostPolicy:
+    """只跟著往下，永遠不往上。**防的是棘輪**（D046）。
+
+    市場連漲時一路追高會永遠不成交，而「等太久」這個訊號**支持降價、
+    不支持漲價**——兩個訊號混在一起會在市場走弱時去漲價，正好是最糟的時機。
+    """
+
+    def policy(context: RepostContext) -> Optional[float]:
+        if context.candidate_rate is None or context.live_rate <= 0:
+            return None
+        if context.candidate_rate >= context.live_rate:
+            return None
+        drift_pct = (context.live_rate - context.candidate_rate) / context.live_rate * 100
+        return context.candidate_rate if drift_pct > tolerance_pct else None
+
+    return policy
+
+
+def down_after_idle(idle_hours: float, tolerance_pct: float = 2.0) -> RepostPolicy:
+    """躺超過 `idle_hours` 才准往下調，而且只往下。
+
+    門檻候選來自 D045 的追記：躺超過 **12.6～18.9 小時**就輸給簿子底部。
+    ⚠ **那個區間是推導出來的，不是量出來的**——這支存在正是為了量它。
+    """
+
+    def policy(context: RepostContext) -> Optional[float]:
+        if context.idle_hours < idle_hours:
+            return None
+        return down_only(tolerance_pct)(context)
+
+    return policy
+
+
+# ----------------------------------------------------------------------
 # 整段歷史跑一次
 # ----------------------------------------------------------------------
 
@@ -196,6 +306,10 @@ class Cycle:
     hold_hours: Optional[float]
     censored: bool
     realized_effective: Optional[float]
+    # 這一段等待中間改掛了幾次。**`rate` 記的是最後成交的那個價位**，
+    # 不是一開始掛出去的那個——兩者混在一起會讓「掛在哪裡」這個問題答錯。
+    repost_count: int = 0
+    initial_rate: Optional[float] = None
 
     @property
     def occupied_hours(self) -> float:
@@ -216,6 +330,7 @@ class PolicyOutcome:
 
     strategy_name: str
     hold_model_name: str
+    repost_policy_name: str = "none"
     cycles: List[Cycle] = field(default_factory=list)
     # 沒有選出價位（`choose_rate()` 回 None）而空轉掉的小時數。
     # **它也佔時間**，所以一樣進分母。
@@ -251,6 +366,12 @@ class PolicyOutcome:
         waits = [cycle.wait_hours for cycle in self.filled]
         return statistics.median(waits) if waits else None
 
+    @property
+    def repost_count(self) -> int:
+        """整段歷史改掛了幾次。**真實世界每一次都要付排隊位置的代價**，
+        而模擬裡是免費的——所以這個數字越大，上面那個實得年化越樂觀。"""
+        return sum(cycle.repost_count for cycle in self.cycles)
+
 
 def run_policy(
     strategy: Any,
@@ -261,6 +382,8 @@ def run_policy(
     assumed_hold_hours: Optional[float] = None,
     start_index: Optional[int] = None,
     candle_hours: float = 1.0,
+    repost_policy: Optional[RepostPolicy] = None,
+    repost_policy_name: str = "",
 ) -> PolicyOutcome:
     """把整段歷史跑一次：選價 → 等成交 → 借出 → 資金回來 → 再選一次。
 
@@ -292,20 +415,27 @@ def run_policy(
                 index += 1
                 continue
 
-            fill = simulate_fill(
-                candles, index, chosen, candle_hours=candle_hours
+            fill, final_rate, reposts = _wait_with_reposts(
+                candles,
+                index,
+                chosen,
+                strategy=strategy,
+                policy=repost_policy,
+                candle_hours=candle_hours,
             )
-            hold = None if fill.censored else model(chosen, len(cycles))
+            hold = None if fill.censored else model(final_rate, len(cycles))
             cycles.append(
                 Cycle(
                     decided_index=index,
-                    rate=chosen,
+                    rate=final_rate,
                     wait_hours=fill.wait_hours,
                     hold_hours=hold,
                     censored=fill.censored,
                     realized_effective=(
                         None if hold is None else fill.realized_effective(hold)
                     ),
+                    repost_count=reposts,
+                    initial_rate=chosen,
                 )
             )
             if fill.censored:
@@ -321,9 +451,74 @@ def run_policy(
     return PolicyOutcome(
         strategy_name=type(strategy).__name__,
         hold_model_name=name,
+        repost_policy_name=repost_policy_name or ("none" if repost_policy is None else "custom"),
         cycles=cycles,
         idle_hours=idle,
         horizon_hours=max(len(candles) - started_at, 0) * candle_hours,
+    )
+
+
+def _wait_with_reposts(
+    candles: Sequence[Dict[str, Any]],
+    from_index: int,
+    rate: float,
+    *,
+    strategy: Any,
+    policy: Optional[RepostPolicy],
+    candle_hours: float,
+):
+    """等成交，中間可以依 `policy` 改掛。回傳 `(結果, 最後掛的利率, 改掛次數)`。
+
+    **`policy` 是 `None` 時必須與 `simulate_fill()` 逐位元相同**——否則
+    「加了重掛政策之後變好了」會分不清是政策的功勞還是基準線被改掉了。
+    有測試釘住這件事（`test_沒有政策時與simulate_fill完全相同`）。
+
+    改掛之後**等待時間不歸零**：錢從掛出那一刻起就沒有在賺，
+    換一個價位不會把已經等掉的時間變不見。
+    **這是這個模擬最重要的一條記帳規則**——歸零的話，一個「每小時都改掛」
+    的政策會顯示成永遠只等半小時。
+    """
+    if policy is None:
+        return simulate_fill(candles, from_index, rate, candle_hours=candle_hours), rate, 0
+
+    current = rate
+    reposts = 0
+    for index in range(from_index, len(candles)):
+        if candles[index]["high"] >= current:
+            return (
+                FillOutcome(
+                    rate=current,
+                    wait_hours=(index - from_index + 0.5) * candle_hours,
+                    censored=False,
+                    hit_index=index,
+                ),
+                current,
+                reposts,
+            )
+        # 這一根沒被掃到 → 走到下一根之前，讓政策看一次。
+        # **候選價位用策略本尊重算**，看得到的 K 線同樣只到 `index` 為止。
+        candidate = strategy.choose_rate(list(candles[: index + 1]))
+        decision = policy(
+            RepostContext(
+                live_rate=current,
+                candidate_rate=candidate,
+                idle_hours=(index - from_index + 1) * candle_hours,
+                index=index,
+            )
+        )
+        if decision is not None and decision != current:
+            current = decision
+            reposts += 1
+
+    return (
+        FillOutcome(
+            rate=current,
+            wait_hours=(len(candles) - from_index) * candle_hours,
+            censored=True,
+            hit_index=None,
+        ),
+        current,
+        reposts,
     )
 
 

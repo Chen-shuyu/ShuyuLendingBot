@@ -644,3 +644,137 @@ def validate_against_real_fills(
         )
 
     return FillValidation(rows=rows, resolution_hours=resolution_hours)
+
+
+# ----------------------------------------------------------------------
+# 「我的單躺太久了」這個訊號（D054）
+# ----------------------------------------------------------------------
+
+
+def stale_ratio(
+    highs: Sequence[float],
+    index: int,
+    rate: float,
+    *,
+    window: int = 168,
+) -> Optional[float]:
+    """到 `index` 為止，這個價位「已經多久沒被掃到」是常態間隔的幾倍。
+
+    `gap ÷ (窗長 ÷ 命中次數)`——分子是距離上一次命中的小時數，
+    分母是這個價位在窗內的平均間隔。
+
+    **為什麼要正規化，而不是直接用閒置小時數**：D046 警告過「不要用閒置時間」，
+    而那個警告是對的——**對「往上調價」而言**。往下調價的方向它自己也寫了
+    「等太久是成交比預期慢的證據，**它支持降價**」。
+    但光看小時數仍然不夠：同樣躺 10 小時，在一個常態間隔 2 小時的價位上是異常，
+    在常態間隔 12 小時的價位上是正常。**除以常態間隔才問得出「這算久嗎」。**
+
+    命中次數是 0 就回 `None`（這個價位在窗內從沒被掃到過，沒有常態可比）。
+    """
+    end = min(index, len(highs) - 1)
+    if end < 0:
+        return None
+    view = highs[max(0, end - window + 1) : end + 1]
+    hits = sum(1 for high in view if high >= rate)
+    if hits == 0:
+        return None
+    gap = 0
+    for position in range(end, -1, -1):
+        if highs[position] >= rate:
+            break
+        gap += 1
+    return gap / (len(view) / hits)
+
+
+def down_when_stale(
+    highs: Sequence[float],
+    threshold: float = 3.0,
+    lookback: int = 24,
+    floor: float = 0.0001,
+) -> RepostPolicy:
+    """躺太久就改掛「最近 `lookback` 小時**真的被掃到過**的最高價」。
+
+    🔴 **這支的偵測很好，但拿它去降價是賠錢的**（D054）。留在程式庫裡是為了
+    讓那個結論可以被重跑、被推翻，**不是給正式環境用的**。
+
+    - **偵測**：`stale_ratio >= threshold` 在 5 段長等待上 5/5 命中、
+      10 段快速成交上 0/10 誤報，而且門檻從 1.5× 到 4× 都是同一個結果。
+    - **獲利**：把相位運氣平均掉之後（43 個起跑點），它比「不重掛」**低 2.16 個百分點**。
+      43 個起跑點裡只贏 13 個。
+
+    **贏很多次、輸很大次**——降價會把一個較差的利率鎖住最多 48 小時，
+    而省下來的只是一段等待。
+    """
+
+    def policy(context: RepostContext) -> Optional[float]:
+        ratio = stale_ratio(highs, context.index, context.live_rate)
+        if ratio is None or ratio < threshold:
+            return None
+        end = min(context.index, len(highs) - 1)
+        recent = highs[max(0, end - lookback + 1) : end + 1]
+        if not recent:
+            return None
+        target = max(recent)
+        if target >= context.live_rate or target < floor:
+            return None
+        return target
+
+    return policy
+
+
+def run_policy_across_starts(
+    strategy_factory: Callable[[], Any],
+    candles: Sequence[Dict[str, Any]],
+    starts: Sequence[int],
+    **kwargs: Any,
+) -> List[PolicyOutcome]:
+    """同一個政策，從許多個不同的起跑點各跑一次。
+
+    🔴 **這支是 D054 最重要的產出，比那個訊號本身重要。**
+
+    D050 與 D049 都是拿**單一起跑點**跑出來的，而在只有十幾次循環的歷史上，
+    **改掛一次就會把後面每一次循環的進場時點整個推移**——於是比較到的
+    有很大一部分是「誰運氣好，剛好踏在好的進場點上」，不是政策本身的好壞。
+
+    實測：`down_when_stale` 在單一起跑點上比基準**高 0.70 個百分點**，
+    把 43 個起跑點平均掉之後變成**低 2.16 個百分點**。**符號是反的。**
+
+    **所以此後比較政策一律要用這支，不要用單一次 `run_policy()`。**
+    `strategy_factory` 收的是工廠不是實例：策略會把「本輪」的評估結果留在
+    成員上（D041 的那四個），跨起跑點共用一個實例等於讓殘留參與下一次。
+    """
+    outcomes: List[PolicyOutcome] = []
+    for start in starts:
+        outcomes.append(
+            run_policy(strategy_factory(), candles, start_index=start, **kwargs)
+        )
+    return outcomes
+
+
+def compare_across_starts(
+    baseline: Sequence[PolicyOutcome], candidate: Sequence[PolicyOutcome]
+) -> Dict[str, Any]:
+    """兩組跨起跑點的結果並排。**平均與勝率要一起看。**
+
+    `down_when_stale(3.0, 12)` 在 43 個起跑點裡**贏 29 個**，
+    但平均**輸 0.37 個百分點**——**贏很多次、輸很大次**。
+    只看勝率會得到相反的結論。
+    """
+    pairs = [
+        (b.realized_annual_pct, c.realized_annual_pct)
+        for b, c in zip(baseline, candidate)
+        if b.realized_annual_pct is not None and c.realized_annual_pct is not None
+    ]
+    if not pairs:
+        return {"samples": 0}
+    base_values = [b for b, _ in pairs]
+    cand_values = [c for _, c in pairs]
+    return {
+        "samples": len(pairs),
+        "baseline_mean": statistics.fmean(base_values),
+        "candidate_mean": statistics.fmean(cand_values),
+        "difference": statistics.fmean(cand_values) - statistics.fmean(base_values),
+        "candidate_wins": sum(1 for b, c in pairs if c > b),
+        "worst_loss": min(c - b for b, c in pairs),
+        "best_gain": max(c - b for b, c in pairs),
+    }

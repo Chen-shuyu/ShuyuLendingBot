@@ -315,3 +315,126 @@ class TestD047的機制不是永遠同一個方向:
         assert 開頭 == pytest.approx(5.88, abs=0.02)
         assert 乾旱32小時後 == pytest.approx(8.14, abs=0.02)
         assert 乾旱32小時後 > 開頭, "這一段的方向與 D047 相反，追記講的就是這件事"
+
+
+class TestD054訊號偵測得很好:
+    """D054 上半場：`stale_ratio` 分得開「長等待」與「快速成交」。"""
+
+    @staticmethod
+    def _cycles():
+        return fs.run_policy(
+            ExpectedValueStrategy(CONFIG),
+            history(),
+            hold_model=fs.empirical_hold(),
+            assumed_hold_hours=48.0,
+        ).cycles
+
+    @staticmethod
+    def _fires(cycle, threshold):
+        highs = [candle["high"] for candle in history()]
+        for hour in range(0, int(cycle.wait_hours) + 1):
+            ratio = fs.stale_ratio(highs, cycle.decided_index + hour, cycle.rate)
+            if ratio is not None and ratio >= threshold:
+                return hour
+        return None
+
+    def test_五段長等待全部發話零誤報(self):
+        cycles = self._cycles()
+        長 = [c for c in cycles if c.wait_hours >= 6]
+        短 = [c for c in cycles if c.wait_hours < 6]
+        assert len(長) == 5 and len(短) == 10
+        assert all(self._fires(c, 3.0) is not None for c in 長)
+        assert all(self._fires(c, 3.0) is None for c in 短)
+
+    def test_門檻不敏感(self):
+        """🔴 **這一條是它與 `target_queue_usd` 的差別**：
+        1.5× 到 4× 都是 5/5 命中、0/10 誤報，**不是挑出來的一個點**。"""
+        cycles = self._cycles()
+        長 = [c for c in cycles if c.wait_hours >= 6]
+        短 = [c for c in cycles if c.wait_hours < 6]
+        for threshold in (1.5, 2.0, 2.5, 3.0, 4.0):
+            assert all(self._fires(c, threshold) is not None for c in 長), threshold
+            assert all(self._fires(c, threshold) is None for c in 短), threshold
+
+    def test_比候選價位快得多(self):
+        """對照組：候選價位在 5 段長等待裡**只有 1 段發話，而且在第 30 小時**。"""
+        from core import backtest
+
+        cycles = [c for c in self._cycles() if c.wait_hours >= 6]
+        候選發話 = 0
+        for cycle in cycles:
+            for hour in range(0, int(cycle.wait_hours) + 1):
+                point = backtest.replay_at(
+                    ExpectedValueStrategy(CONFIG),
+                    history()[: cycle.decided_index + hour + 1],
+                )
+                if point.chosen_rate and (
+                    (cycle.rate - point.chosen_rate) / cycle.rate * 100 > 2
+                ):
+                    候選發話 += 1
+                    break
+        assert 候選發話 == 1
+        assert all(self._fires(c, 3.0) <= 11 for c in cycles)
+
+    def test_命中次數為零時不給數字(self):
+        """這個價位在窗內從沒被掃到過，就沒有「常態」可以比。"""
+        highs = [0.00015] * 168
+        assert fs.stale_ratio(highs, 167, 0.00099) is None
+
+
+class TestD054但拿它降價是賠錢的:
+    """D054 下半場。🔴 **與上半場同等重要，不要只記得上半場。**
+
+    偵測得好 ≠ 知道該做什麼。降價會把一個較差的利率**鎖住最多 48 小時**，
+    而省下來的只是一段等待——**贏很多次、輸很大次**。
+    """
+
+    STARTS = tuple(range(48, 220, 8))
+
+    def _run(self, policy):
+        highs = [candle["high"] for candle in history()]
+        return fs.run_policy_across_starts(
+            lambda: ExpectedValueStrategy(CONFIG),
+            history(),
+            self.STARTS,
+            hold_model=fs.empirical_hold(),
+            assumed_hold_hours=48.0,
+            repost_policy=policy(highs) if policy else None,
+        )
+
+    def test_平均起來比不重掛差(self):
+        baseline = self._run(None)
+        candidate = self._run(lambda highs: fs.down_when_stale(highs, 3.0, 24))
+        result = fs.compare_across_starts(baseline, candidate)
+        assert result["difference"] < 0, result
+
+    def test_單一起跑點會給出相反的答案(self):
+        """🔴 **這一條是這一族存在的理由。**
+
+        同一個政策，單一起跑點看起來**贏**，平均掉相位運氣之後**輸**。
+        D049 與 D050 都是拿單一起跑點跑出來的。
+        """
+        highs = [candle["high"] for candle in history()]
+        single_base = fs.run_policy(
+            ExpectedValueStrategy(CONFIG), history(),
+            hold_model=fs.empirical_hold(), assumed_hold_hours=48.0,
+        ).realized_annual_pct
+        single_cand = fs.run_policy(
+            ExpectedValueStrategy(CONFIG), history(),
+            hold_model=fs.empirical_hold(), assumed_hold_hours=48.0,
+            repost_policy=fs.down_when_stale(highs, 3.0, 24),
+        ).realized_annual_pct
+        assert single_cand > single_base, "單一起跑點上它是贏的"
+
+        result = fs.compare_across_starts(
+            self._run(None), self._run(lambda h: fs.down_when_stale(h, 3.0, 24))
+        )
+        assert result["difference"] < 0, "平均掉相位之後它是輸的"
+
+    def test_勝率與平均會給出相反的結論(self):
+        """`lookback=12` 贏過半數的起跑點，但平均仍然輸——**只看勝率會看錯**。"""
+        result = fs.compare_across_starts(
+            self._run(None), self._run(lambda h: fs.down_when_stale(h, 3.0, 12))
+        )
+        assert result["candidate_wins"] > result["samples"] / 2
+        assert result["difference"] < 0

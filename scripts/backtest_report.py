@@ -5,16 +5,17 @@
 報告，但問的問題不同——前兩份量「已經發生的事」，這一份問「**如果當時不一樣
 會怎樣**」。算法本體在 `core/backtest.py`，那裡也寫著三條刻意的界線。
 
-⚠ **M2 只做完第 1 步。** 這份報告回答「會掛什麼價」，**不回答「賺多少」**
-——成交模擬與實質年化是第 2 步。在那之前，`--sweep` 那張表只能拿來看
-「模型會被推到哪裡去」，**不同 `P` 之間的 `effective` 分母不同，不可以直接比大小**。
+**第 1 步**（`--verify`／`--sweep`）回答「會掛什麼價」，**第 2 步**（`--simulate`）
+接上成交模擬，才回答「**那個選擇值多少**」。
 
 用法：
 
-    python3 scripts/backtest_report.py                    # 用 config.yaml 的設定重播
-    python3 scripts/backtest_report.py --sweep            # 多印一張 P 掃描表（D1 的問題）
-    python3 scripts/backtest_report.py --step 6 --last 20 # 每 6 根重播一次、只印最後 20 點
-    python3 scripts/backtest_report.py --hold-hours 16.93 # 把 P 換掉再重播
+    python3 scripts/backtest_report.py                     # 用 config.yaml 的設定重播
+    python3 scripts/backtest_report.py --verify            # 對照正式紀錄（M2 的驗收）
+    python3 scripts/backtest_report.py --sweep             # P 掃描：模型會選什麼
+    python3 scripts/backtest_report.py --validate-fill     # 成交規則對得上真實成交嗎
+    python3 scripts/backtest_report.py --simulate          # P 掃描：實得年化多少（D1）
+    python3 scripts/backtest_report.py --step 6 --last 20  # 每 6 根重播一次、只印最後 20 點
     BFX_DB_PATH=/path/to/lending.sqlite3 python3 scripts/backtest_report.py
 
 資料庫一律以**唯讀**開啟，理由同前兩份報告：報告不該有副作用，更不該在正式機上
@@ -32,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings  # noqa: E402
 from core import backtest  # noqa: E402
+from core import fill_simulation  # noqa: E402
+from core import wait_time  # noqa: E402
 from db.repository import resolve_db_path  # noqa: E402
 from strategies.expected_value import ExpectedValueStrategy  # noqa: E402
 
@@ -190,6 +193,158 @@ def format_verification(
     return "\n".join(lines)
 
 
+def load_wait_spells(db_path: Path, currency: str, interval_seconds: int):
+    """唯讀讀出掛單／部位／預估值，交給 `core/wait_time.py` 配對成掛單期間。
+
+    **不自己從 `loan_offers` 配一次**：合併規則（同利率、中間沒成交過）與
+    右設限、偵測延遲的處置全在 `wait_time` 裡，抄第二份出來一定會漂
+    ——D045 的實作就是在那一步被一個靜默吃掉樣本的合併 bug 咬過。
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        offers = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM loan_offers WHERE currency = ? AND status = 'submitted' "
+                "ORDER BY created_at",
+                (currency,),
+            )
+        ]
+        positions = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM funding_positions WHERE currency = ? "
+                "ORDER BY COALESCE(opened_at, first_seen_at)",
+                (currency,),
+            )
+        ]
+        forecasts = {
+            str(row["offer_id"]): dict(row)
+            for row in connection.execute("SELECT * FROM offer_wait_forecasts")
+        }
+    finally:
+        connection.close()
+    return wait_time.summarize(
+        offers,
+        positions,
+        forecasts=forecasts,
+        detection_lag_hours=interval_seconds / 3600,
+    ).spells
+
+
+def format_fill_validation(validation) -> str:
+    """成交規則的驗收表。**這是模擬器的驗收，不是策略的驗收。**"""
+    lines = ["", "=== 驗收：成交規則對得上真實成交嗎 ===", ""]
+    comparable = validation.comparable
+    if not comparable:
+        lines.append("  沒有可比對的成交——**這一項無法驗收**，不是通過。")
+        return "\n".join(lines)
+
+    lines.append(
+        _pad("掛出時間", 16)
+        + _pad("年化", 9, right=True)
+        + _pad("實際等待", 11, right=True)
+        + _pad("模擬等待", 11, right=True)
+        + _pad("模擬/實際", 11, right=True)
+    )
+    for row in validation.rows:
+        if row.simulated_hours is None:
+            lines.append(
+                _pad(row.started_at.strftime("%m-%d %H:%M"), 16)
+                + _pad(_pct(row.rate * 365 * 100), 9, right=True)
+                + _pad(_hours(row.actual_hours), 11, right=True)
+                + f"  {row.note}"
+            )
+            continue
+        ratio = f"{row.ratio:.2f}×" if row.ratio is not None else "—"
+        lines.append(
+            _pad(row.started_at.strftime("%m-%d %H:%M"), 16)
+            + _pad(_pct(row.rate * 365 * 100), 9, right=True)
+            + _pad(_hours(row.actual_hours), 11, right=True)
+            + _pad(_hours(row.simulated_hours), 11, right=True)
+            + _pad(ratio, 11, right=True)
+        )
+
+    total = validation.total_ratio()
+    above = validation.above_resolution
+    lines.append("")
+    lines.append(
+        f"  **可比對 {len(comparable)} 筆，總量比 {total:.2f}×**"
+        f"（模擬合計 {sum(r.simulated_hours for r in comparable):.2f}h"
+        f" vs 實際合計 {sum(r.actual_hours for r in comparable):.2f}h）"
+    )
+    if above:
+        lines.append(
+            f"  實際等待 ≥ 1 小時的 {len(above)} 筆：總量比 "
+            f"{validation.total_ratio(above):.2f}×"
+        )
+    lines.append("")
+    lines.append(
+        "  📌 **要讀的是總量比，不是逐筆倍數**：K 線一小時一根，而多數樣本的實際"
+        "等待不到一小時，那些筆的 0.00× 與 — 是解析度雜訊，不是誤差。"
+    )
+    lines.append(
+        "  ✅ 對照組：策略自己的 `estimate_wait()` 在同一批樣本上是 **4.25 倍高估**"
+        "（D045）。**模擬器準了一個數量級**，這是它能拿來當裁判的理由。"
+    )
+    lines.append(
+        "  ⚠ **模擬的成交必然偏快**：`high >= rate` 只說有需求掃到這個價位，"
+        "沒說掃掉的量足夠輪到我們那 345 USD。"
+    )
+    lines.append(
+        "  ⚠ **樣本全落在年化 5.47%～10.95%**——那正是模型自己選出來的帶，"
+        "**帶外沒有驗證過**（與 D045 同一條界線）。"
+    )
+    return "\n".join(lines)
+
+
+def format_simulation(rows, hold_label: str, horizon_hours: float) -> str:
+    """D1 的答案表：策略以為自己會借多久，換掉之後**實得年化**多少。"""
+    lines = ["", "=== 成交模擬：換掉那個 48，實得年化會怎樣 ===", ""]
+    lines.append(
+        f"實際持有用「{hold_label}」／歷史長度約 {horizon_hours / 24:.1f} 天"
+    )
+    lines.append("")
+    lines.append(
+        _pad("策略假設 P", 14, right=True)
+        + _pad("實得年化", 11, right=True)
+        + _pad("循環數", 9, right=True)
+        + _pad("成交率", 9, right=True)
+        + _pad("等待中位", 11, right=True)
+    )
+    for assumed, outcome in rows:
+        lines.append(
+            _pad(f"{assumed:.2f}h", 14, right=True)
+            + _pad(_pct(outcome.realized_annual_pct), 11, right=True)
+            + _pad(str(len(outcome.cycles)), 9, right=True)
+            + _pad(
+                f"{outcome.fill_rate * 100:.0f}%" if outcome.fill_rate is not None else "—",
+                9,
+                right=True,
+            )
+            + _pad(_hours(outcome.median_wait_hours), 11, right=True)
+        )
+
+    lines.append("")
+    lines.append(
+        "  ✅ **分母含空等與空轉**：沒等到成交的每一個小時都以 0% 計入。"
+        "`wait_report` 印的 7.99% 就是因為少了這一塊才偏樂觀。"
+    )
+    lines.append(
+        "  🔴 **不要從這張表挑一個數字去改那個 48。** 相鄰幾列的差距"
+        "（約 0.1～0.3 個百分點）在這個樣本數下是雜訊：歷史只有十幾天、"
+        "循環只有十幾次，而曲線本身不是單調的。**挑最高的那一列就是"
+        "`target_queue_usd` 的死法**（D032）。"
+    )
+    lines.append(
+        "  ⚠ **這張表講的是方向，不是數值**：要拿它下手改參數，"
+        "至少得先有一段「模型沒有參與過」的歷史（現在這段是模型自己選出來的），"
+        "以及跨時段都站得住的結論。"
+    )
+    return "\n".join(lines)
+
+
 def _display_width(text: str) -> int:
     """字串在等寬終端機裡佔幾格（中文全形算兩格）。同 `wait_report`。"""
     return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
@@ -279,7 +434,10 @@ def _replay_caveats(result: backtest.ReplayResult) -> List[str]:
     """
     lines = ["", "--- 這張表能講什麼 ---"]
     lines.append("  ✅ 「當時這個策略會掛什麼價」——重播呼叫的是策略本尊，不是它的副本。")
-    lines.append("  ❌ **不能講「賺多少」**：成交模擬還沒做（M2 第 2 步）。")
+    lines.append(
+        "  ❌ **這張表本身不能講「賺多少」**：它只有「會掛什麼價」。"
+        "實得年化要接上成交模擬（`--simulate`，M2 第 2 步）。"
+    )
     lines.append(
         "  ❌ **不能講「跑了幾輪」**：K 線一小時一根、機器人 600 秒一輪，"
         "同一小時的六輪在這裡是同一點。"
@@ -369,6 +527,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="拿 `pricing_decisions` 的正式紀錄逐點對照重播結果（M2 的驗收標準）",
     )
+    parser.add_argument(
+        "--validate-fill",
+        action="store_true",
+        help="拿真實成交檢驗成交規則（M2 第 2 步的驗收）",
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="接上成交模擬，算出換掉那個 48 之後的**實得年化**（D1）",
+    )
+    parser.add_argument(
+        "--hold-model",
+        default="empirical",
+        help="實際持有時間怎麼給：empirical（實測分佈，預設）或 fixed:<小時>",
+    )
     args = parser.parse_args(argv)
 
     config: Dict[str, Any] = {}
@@ -420,7 +593,59 @@ def main(argv: Optional[List[str]] = None) -> int:
         label = result.points[-1].at.strftime("%m-%d %H:%M") if result.points else "—"
         print(format_sweep(rows, label))
 
+    if args.validate_fill:
+        interval = int(
+            (config.get("engine") or {}).get("interval_seconds", 600) or 600
+        )
+        spells = load_wait_spells(db_path, args.currency, interval)
+        print(
+            format_fill_validation(
+                fill_simulation.validate_against_real_fills(spells, candles)
+            )
+        )
+
+    if args.simulate:
+        try:
+            hold_model, hold_label = _build_hold_model(args.hold_model)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        rows = []
+        for assumed in DEFAULT_SWEEP_HOURS:
+            # **每一次都建一個新的策略實例**：`choose_rate()` 會把「本輪」的
+            # 評估結果留在成員上（D041 的那四個），跨設定共用一個實例
+            # 等於讓上一組設定的殘留參與下一組的結果。
+            rows.append(
+                (
+                    assumed,
+                    fill_simulation.run_policy(
+                        STRATEGIES[args.strategy](config),
+                        candles,
+                        hold_model=hold_model,
+                        hold_model_name=hold_label,
+                        assumed_hold_hours=assumed,
+                    ),
+                )
+            )
+        print(format_simulation(rows, hold_label, len(candles) * 1.0))
+
     return 0
+
+
+def _build_hold_model(spec: str):
+    """`--hold-model` 的字串轉成 `HoldModel`。回傳 `(模型, 給人看的名字)`。"""
+    if spec == "empirical":
+        return (
+            fill_simulation.empirical_hold(),
+            f"實測分佈（{len(fill_simulation.OBSERVED_HOLD_HOURS)} 筆）",
+        )
+    if spec.startswith("fixed:"):
+        try:
+            hours = float(spec.split(":", 1)[1])
+        except ValueError:
+            raise ValueError(f"看不懂的 --hold-model：{spec}（格式是 fixed:<小時>）")
+        return fill_simulation.fixed_hold(hours), f"固定 {hours:g}h"
+    raise ValueError(f"看不懂的 --hold-model：{spec}（可用 empirical 或 fixed:<小時>）")
 
 
 if __name__ == "__main__":

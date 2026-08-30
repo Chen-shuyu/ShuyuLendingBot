@@ -2263,3 +2263,162 @@ class TestRepostComparisonLands:
         assert row["live_queue_ahead"] > row["candidate_queue_ahead"], \
             "掛得越貴，前面排的錢越多"
         assert row["live_queue_truncated"] == 0, "0.00050 那一檔在上面，沒有越界"
+
+
+class Test帳本同步絕對不能影響巡檢:
+    """D052。**這一族是這批改動唯一真正的風險所在。**
+
+    帳本同步被放進 `run_forever()` 的迴圈裡，也就是機器人管錢的那條路上。
+    它自己失敗沒關係——收益統計是事後才看的東西——但它**絕對不能**把
+    放貸機器人弄停。**讓一份報表停掉一台在管真金的機器人，任何理由都不划算。**
+    """
+
+    @staticmethod
+    def _engine(fake_logger, fake_notifier, strategy, repository, **kwargs):
+        """組一台引擎並回傳 `(engine, client)`。"""
+        client = FakeClient(balance=600.0, frr=0.0002)
+        return (
+            make_engine(fake_logger, fake_notifier, strategy, client, repository, **kwargs),
+            client,
+        )
+
+    def test_同步爆炸不會往外拋(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=1
+        )
+
+        def 爆炸(*args, **kwargs):
+            raise RuntimeError("帳本端點整個掛了")
+
+        client.get_funding_ledger = 爆炸
+        # 沒有拋出來就是通過——這一行本身就是斷言。
+        engine._maybe_sync_earnings()
+
+    def test_同步爆炸也不算失敗(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**不可以讓帳本故障去累積 `consecutive_failures`**，
+        否則連續三次就會推一則「機器人可能壞了」的告警，而機器人好得很。"""
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=1
+        )
+        client.get_funding_ledger = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        engine._maybe_sync_earnings()
+        assert engine.failures.consecutive_failures == 0
+
+    def test_寫入DB失敗也吞掉(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """失敗可能發生在交易所那邊，也可能發生在 DB 這邊。"""
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=1
+        )
+        client.get_funding_ledger = lambda *a, **k: [
+            {
+                "id": "1",
+                "currency": "USD",
+                "wallet": "funding",
+                "mts": 1788053421000,
+                "amount": 0.042,
+                "balance": 345.06,
+                "description": "Margin Funding Payment on wallet funding",
+            }
+        ]
+
+        def 寫不進去(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        repository.set_daily_earning = 寫不進去
+        engine._maybe_sync_earnings()
+
+    def test_設成零就完全不打交易所(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """關掉就要真的關掉——不是「打了但不寫」。"""
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=0
+        )
+        called = []
+        client.get_funding_ledger = lambda *a, **k: called.append(1) or []
+        engine._maybe_sync_earnings()
+        assert called == []
+
+    def test_節流_同一個區間內只打一次(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=6
+        )
+        called = []
+        client.get_funding_ledger = lambda *a, **k: called.append(1) or []
+        engine._maybe_sync_earnings()
+        engine._maybe_sync_earnings()
+        engine._maybe_sync_earnings()
+        assert len(called) == 1
+
+    def test_失敗之後也要節流(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """🔴 **一個一直失敗的同步不該變成每 10 分鐘打一次交易所。**
+
+        所以時間戳要在同步**之前**就記下去，不是成功之後才記。
+        """
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=6
+        )
+        called = []
+
+        def 一直失敗(*args, **kwargs):
+            called.append(1)
+            raise RuntimeError("boom")
+
+        client.get_funding_ledger = 一直失敗
+        engine._maybe_sync_earnings()
+        engine._maybe_sync_earnings()
+        assert len(called) == 1
+
+    def test_成功時真的寫進earnings_daily(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=1
+        )
+        client.get_funding_ledger = lambda *a, **k: [
+            {
+                "id": "1",
+                "currency": "USD",
+                "wallet": "funding",
+                "mts": 1788053421000,
+                "amount": 0.04203999,
+                "balance": 345.06379078,
+                "description": "Margin Funding Payment on wallet funding",
+            },
+            {
+                # 混進來的轉帳**不可以**被算成利息（D051）
+                "id": "2",
+                "currency": "USD",
+                "wallet": "funding",
+                "mts": 1788053421000,
+                "amount": 184.3,
+                "balance": 344.3,
+                "description": "Transfer of 184.3 USD from wallet Exchange to Deposit",
+            },
+        ]
+        engine._maybe_sync_earnings()
+        rows = repository.connection.execute(
+            "SELECT date, interest FROM earnings_daily"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == pytest.approx(0.04203999)
+
+    def test_不填本金(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """帳本只看得到餘額，猜一個本金就又變成推論了（D051）。"""
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=1
+        )
+        client.get_funding_ledger = lambda *a, **k: [
+            {
+                "id": "1",
+                "currency": "USD",
+                "wallet": "funding",
+                "mts": 1788053421000,
+                "amount": 0.042,
+                "balance": 345.06,
+                "description": "Margin Funding Payment on wallet funding",
+            }
+        ]
+        engine._maybe_sync_earnings()
+        row = repository.connection.execute(
+            "SELECT principal_avg FROM earnings_daily"
+        ).fetchone()
+        assert row[0] is None

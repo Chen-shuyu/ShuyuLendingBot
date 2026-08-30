@@ -1,0 +1,427 @@
+# -*- coding: utf-8 -*-
+"""歷史重播報告：把時間倒回去，問「當時這個策略會掛什麼價」（M2 第 1 步）。
+
+與 `scripts/hold_report.py`（D040）、`scripts/wait_report.py`（D045）並列的第三份
+報告，但問的問題不同——前兩份量「已經發生的事」，這一份問「**如果當時不一樣
+會怎樣**」。算法本體在 `core/backtest.py`，那裡也寫著三條刻意的界線。
+
+⚠ **M2 只做完第 1 步。** 這份報告回答「會掛什麼價」，**不回答「賺多少」**
+——成交模擬與實質年化是第 2 步。在那之前，`--sweep` 那張表只能拿來看
+「模型會被推到哪裡去」，**不同 `P` 之間的 `effective` 分母不同，不可以直接比大小**。
+
+用法：
+
+    python3 scripts/backtest_report.py                    # 用 config.yaml 的設定重播
+    python3 scripts/backtest_report.py --sweep            # 多印一張 P 掃描表（D1 的問題）
+    python3 scripts/backtest_report.py --step 6 --last 20 # 每 6 根重播一次、只印最後 20 點
+    python3 scripts/backtest_report.py --hold-hours 16.93 # 把 P 換掉再重播
+    BFX_DB_PATH=/path/to/lending.sqlite3 python3 scripts/backtest_report.py
+
+資料庫一律以**唯讀**開啟，理由同前兩份報告：報告不該有副作用，更不該在正式機上
+順手把缺掉的表建回去，把真正的問題蓋掉。
+"""
+
+import argparse
+import sqlite3
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config import settings  # noqa: E402
+from core import backtest  # noqa: E402
+from db.repository import resolve_db_path  # noqa: E402
+from strategies.expected_value import ExpectedValueStrategy  # noqa: E402
+
+# **路徑規則直接用 `db/repository.py` 那一份，不再抄第五份。**
+# `hold_report` 與 `wait_report` 各自有一份拷貝，兩份的 docstring 還各自宣告
+# 「三處必須對齊」卻點名了不同的三處——再抄一份只會讓那句話更難成立。
+# （把那兩份也收掉是另一件事，不混在 M2 這條分支裡改。）
+
+# 🔴 **`orderbook_depth` 刻意不在這裡，而這件事本身是一個發現。**
+#
+# PLAN.md 給 M2 寫的驗收標準是「拿它跑 `orderbook_depth`，要能重現『賣在區間底部』
+# 這個已知結論」。**那個驗收標準在現有資料上跑不起來**，有兩個各自獨立的原因：
+#
+# 1. **`orderbook_depth` 沒有 `choose_rate()`。** 它的定價在 `build_offer_plan()`
+#    裡直接吃訂單簿與成交紀錄，不經過 K 線。重播它要餵的是簿子，不是 K 線。
+# 2. **要餵的簿子不存在。** 「賣在區間底部」是 2026-08-16～17 的結論（D033／D035），
+#    而 `market_snapshots`（M1-a／D042）**2026-08-23 才開始寫第一列**。
+#    那七天的簿子沒有被存下來，而且再也回不來。
+#
+# **驗收標準是 2026-08-17 寫的，比它所依賴的那張表早了六天**——寫的時候
+# 那份資料還不存在，而寫完之後沒有人回頭確認它變得可跑了沒有。
+# 這正是 D036 那個病的另一種長相：**條件寫得很具體，但沒有人驗證條件本身成不成立。**
+#
+# 取代它的驗收標準是 `--verify`：拿 `pricing_decisions` 裡**正式環境真的做過**的
+# 決策逐點對照。它比原本那條弱（只證明工具沒偏離、不證明策略對），
+# 但它**跑得起來**，而跑不起來的驗收標準等於沒有驗收標準。
+STRATEGIES = {
+    "expected_value": ExpectedValueStrategy,
+}
+
+# `--sweep` 的預設掃描點。**不是隨手挑的**：
+#   48.0  = 模型現在寫死的假設（`offer_period` 2 天）
+#   25.84 = 已結束部位的四分之三位數
+#   16.93 = 實測平均持有（hold_report，17 筆）
+#   11.61 = 實測中位持有（同上）
+#   1.84  = 四分之一位數，也就是最短的那一叢
+DEFAULT_SWEEP_HOURS = (48.0, 25.84, 16.93, 11.61, 1.84)
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def load_candles(
+    db_path: Path, currency: str, period: int, timeframe: str
+) -> List[Dict[str, Any]]:
+    """唯讀讀出 K 線，**由舊到新**排序。
+
+    排序不是為了好看：`core/backtest.py` 的「看不到未來」是靠切片
+    `candles[:index + 1]` 達成的，順序錯了就等於讓策略看到未來，
+    而且結果會很好看、完全不像壞掉。
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            "SELECT mts, open, close, high, low, volume FROM market_candles "
+            "WHERE currency = ? AND period = ? AND timeframe = ? ORDER BY mts",
+            (currency, period, timeframe),
+        )
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def load_recorded_decisions(
+    db_path: Path, currency: str, strategy_name: str
+) -> Dict[int, Dict[str, Any]]:
+    """唯讀讀出正式環境**真的做過**的定價決策，以 `candle_latest_mts` 為索引。
+
+    這是 PLAN.md 給 M2 的驗收標準的另一半：「重現不出來就是工具不對，不是策略對」。
+    `pricing_decisions` 每評估一輪一列（D043），而 `candle_latest_mts` 是那一輪
+    窗尾那根 K——**它是重播點與正式輪次之間唯一不會因為時區設定而跑掉的鍵**
+    （同 `market_candles` 的選擇理由）。
+
+    同一根 K 的小時內可能有六輪巡檢，這裡**保留最後一輪**：重播用的窗到那根 K
+    為止，最接近的就是那個小時最後一次評估。
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            "SELECT * FROM pricing_decisions WHERE currency = ? AND strategy = ? "
+            "AND candle_latest_mts IS NOT NULL ORDER BY decided_at",
+            (currency, strategy_name),
+        )
+        return {int(row["candle_latest_mts"]): dict(row) for row in rows}
+    finally:
+        connection.close()
+
+
+def format_verification(
+    result: backtest.ReplayResult, recorded: Dict[int, Dict[str, Any]]
+) -> str:
+    """把重播結果與正式環境的紀錄逐點對照。**這是工具的驗收，不是策略的驗收。**
+
+    對不上有兩種可能，而**它們的意思完全相反**：重播寫錯了，或是 `market_candles`
+    少存了幾根 K（機器人每輪向交易所抓 240 根，DB 只留寫進去的那些）。
+    所以不合的那幾點要把兩邊的數字都印出來，不要只印一個「❌」。
+    """
+    lines = ["", "=== 驗收：重播 vs 正式環境真的做過的決策 ===", ""]
+    if not recorded:
+        lines.append(
+            "  `pricing_decisions` 裡沒有這個策略的紀錄，**這一項無法驗收**"
+            "——不是通過。"
+        )
+        return "\n".join(lines)
+
+    by_mts = {point.mts: point for point in result.points}
+    matched: List[str] = []
+    mismatched: List[str] = []
+    missing = 0
+    for mts, row in sorted(recorded.items()):
+        point = by_mts.get(mts)
+        if point is None:
+            missing += 1
+            continue
+        expected = row["chosen_rate"]
+        actual = point.chosen_rate
+        same = (expected is None and actual is None) or (
+            expected is not None
+            and actual is not None
+            and abs(expected - actual) < 1e-12
+        )
+        label = (
+            f"{point.at.strftime('%m-%d %H:%M')}  "
+            f"正式 {_pct(None if expected is None else expected * 365 * 100)}"
+            f"  重播 {_pct(point.chosen_annual_pct)}"
+        )
+        (matched if same else mismatched).append(label)
+
+    total = len(matched) + len(mismatched)
+    lines.append(
+        f"  正式紀錄 {len(recorded)} 列 → 對得上重播點的 {total} 列"
+        + (f"（另有 {missing} 列在重播範圍外，K 線沒存到那根）" if missing else "")
+    )
+    if total:
+        lines.append(
+            f"  **逐點一致 {len(matched)} 列、不一致 {len(mismatched)} 列**"
+        )
+    if mismatched:
+        lines.append("")
+        lines.append("  ❌ 不一致的點（兩邊的數字都印出來，成因見本函式的說明）：")
+        for label in mismatched[:20]:
+            lines.append(f"     {label}")
+        if len(mismatched) > 20:
+            lines.append(f"     …另有 {len(mismatched) - 20} 點")
+    elif total:
+        lines.append("")
+        lines.append(
+            "  ✅ **全數一致**——重播呼叫的是策略本尊，所以這代表工具沒有偏離正式環境。"
+        )
+        lines.append(
+            "  ⚠ 但這只證明「同一份輸入算出同一個答案」，**不證明策略是對的**。"
+        )
+    return "\n".join(lines)
+
+
+def _display_width(text: str) -> int:
+    """字串在等寬終端機裡佔幾格（中文全形算兩格）。同 `wait_report`。"""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def _pad(text: str, width: int, right: bool = False) -> str:
+    padding = " " * max(width - _display_width(text), 0)
+    return padding + text if right else text + padding
+
+
+def _pct(value: Optional[float]) -> str:
+    """None 就寫「—」，不要印出 0.00 假裝有這個數字（同前兩份報告）。"""
+    return f"{value:.2f}%" if value is not None else "—"
+
+
+def _hours(value: Optional[float]) -> str:
+    return f"{value:.2f}h" if value is not None else "—"
+
+
+def format_replay(result: backtest.ReplayResult, last: Optional[int]) -> str:
+    """重播結果的逐點表 ＋ 一段「這張表能講什麼、不能講什麼」。"""
+    lines: List[str] = []
+    lines.append("=== 歷史重播：當時會掛什麼價 ===")
+    lines.append("")
+    lines.append(
+        f"策略 {result.strategy_name}／窗長 {result.window_hours}h／"
+        f"一根 K = {result.candle_hours}h／假設借出 {result.hold_hours:.2f}h"
+    )
+    lines.append(
+        f"K 線 {result.candles_supplied} 根 → 重播 {len(result.points)} 點："
+        f"選出價位 {len(result.decided)} 點、沒選出 {len(result.skipped)} 點"
+    )
+
+    if not result.points:
+        lines.append("")
+        lines.append("沒有任何重播點——`market_candles` 是空的，或篩選條件沒對上。")
+        return "\n".join(lines)
+
+    shown = result.points[-last:] if last else result.points
+    lines.append("")
+    if last and len(shown) < len(result.points):
+        lines.append(f"--- 逐點（只印最後 {len(shown)} 點，共 {len(result.points)} 點）---")
+    else:
+        lines.append("--- 逐點 ---")
+
+    header = (
+        _pad("時間", 18)
+        + _pad("選中年化", 10, right=True)
+        + _pad("實質年化", 10, right=True)
+        + _pad("W平均", 9, right=True)
+        + _pad("W中位", 9, right=True)
+        + _pad("設限", 8, right=True)
+        + "  候選"
+    )
+    lines.append(header)
+    for point in shown:
+        if point.chosen_rate is None:
+            lines.append(
+                _pad(point.at.strftime("%m-%d %H:%M"), 18)
+                + f"（沒選出價位）{point.skip_reason}"
+            )
+            continue
+        censored = (
+            f"{point.chosen_censored_ratio * 100:.1f}%"
+            if point.chosen_censored_ratio is not None
+            else "—"
+        )
+        lines.append(
+            _pad(point.at.strftime("%m-%d %H:%M"), 18)
+            + _pad(_pct(point.chosen_annual_pct), 10, right=True)
+            + _pad(_pct(point.effective_annual_pct), 10, right=True)
+            + _pad(_hours(point.chosen_wait_mean), 9, right=True)
+            + _pad(_hours(point.chosen_wait_median), 9, right=True)
+            + _pad(censored, 8, right=True)
+            + f"  {point.candidate_count}"
+        )
+
+    lines.extend(_replay_caveats(result))
+    return "\n".join(lines)
+
+
+def _replay_caveats(result: backtest.ReplayResult) -> List[str]:
+    """這張表能講什麼、不能講什麼。**寫在輸出裡，不寫在文件裡。**
+
+    理由與 `hold_report`／`wait_report` 相同：會被拿去下判斷的是終端機上那幾行，
+    不是 DECISIONS.md 裡的某一段。
+    """
+    lines = ["", "--- 這張表能講什麼 ---"]
+    lines.append("  ✅ 「當時這個策略會掛什麼價」——重播呼叫的是策略本尊，不是它的副本。")
+    lines.append("  ❌ **不能講「賺多少」**：成交模擬還沒做（M2 第 2 步）。")
+    lines.append(
+        "  ❌ **不能講「跑了幾輪」**：K 線一小時一根、機器人 600 秒一輪，"
+        "同一小時的六輪在這裡是同一點。"
+    )
+    decided = result.decided
+    if decided:
+        rates = {point.chosen_rate for point in decided}
+        lines.append(
+            f"  ⚠ {len(decided)} 個決策點只選出 **{len(rates)} 個相異價位**"
+            + ("——候選集再大，實際被選中的價位其實很集中。" if len(rates) < 10 else "。")
+        )
+    if result.skipped:
+        first = result.skipped[0]
+        lines.append(
+            f"  ⚠ 有 {len(result.skipped)} 點沒選出價位，第一點的理由："
+            f"{first.skip_reason}"
+        )
+    return lines
+
+
+def format_sweep(rows: List[backtest.HoldSweepRow], at_label: str) -> str:
+    """`P` 掃描表：換一個借出時間假設，模型會被推到哪裡去（D1）。"""
+    lines = ["", f"=== 把 `P` 換掉再選一次（重播點：{at_label}）===", ""]
+    lines.append(
+        _pad("假設借出 P", 14, right=True)
+        + _pad("選中年化", 10, right=True)
+        + _pad("實質年化", 10, right=True)
+        + _pad("W平均", 9, right=True)
+        + _pad("W中位", 9, right=True)
+    )
+    for row in rows:
+        if row.chosen_rate is None:
+            lines.append(
+                _pad(f"{row.hold_hours:.2f}h", 14, right=True)
+                + f"  （沒選出價位）{row.skip_reason}"
+            )
+            continue
+        lines.append(
+            _pad(f"{row.hold_hours:.2f}h", 14, right=True)
+            + _pad(_pct(row.chosen_annual_pct), 10, right=True)
+            + _pad(_pct(row.effective_annual_pct), 10, right=True)
+            + _pad(_hours(row.wait_mean), 9, right=True)
+            + _pad(_hours(row.wait_median), 9, right=True)
+        )
+
+    lines.append("")
+    lines.append("  🔴 **這張表回答「模型會選什麼」，不是「哪個假設賺比較多」。**")
+    lines.append(
+        "     三個假設下的 `effective` 分母不同，**數字不可以直接比大小**"
+        "——同一個陷阱在 `wait_report` 的統計量對照表上已經標過一次。"
+    )
+    lines.append(
+        "  ⚠ **也不要拿它去改那個 48**：實測持有逐筆從 0.50h 到 48.56h，"
+        "換成任何一個常數都只是 `target_queue_usd` 的死法（D032）。"
+    )
+    lines.append("     要回答「該換成什麼」得等 M2 第 2 步（成交模擬）。")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="歷史重播報告（M2 第 1 步）")
+    parser.add_argument("--currency", default="USD", help="幣別（預設 USD）")
+    parser.add_argument("--db", default=None, help="SQLite 檔位置（預設讀 config.yaml）")
+    parser.add_argument("--period", type=int, default=2, help="K 線的天期（預設 2）")
+    parser.add_argument("--timeframe", default="1h", help="K 線時間框架（預設 1h）")
+    parser.add_argument(
+        "--strategy",
+        default="expected_value",
+        choices=sorted(STRATEGIES),
+        help="要重播哪個策略（預設 expected_value）",
+    )
+    parser.add_argument("--step", type=int, default=1, help="每幾根 K 重播一次（預設 1）")
+    parser.add_argument(
+        "--last", type=int, default=24, help="逐點表只印最後幾點（0 = 全印，預設 24）"
+    )
+    parser.add_argument(
+        "--hold-hours",
+        type=float,
+        default=None,
+        help="把假設的借出時間換掉再重播（小時）。不給就用 config.yaml 的 offer_period",
+    )
+    parser.add_argument(
+        "--sweep", action="store_true", help="多印一張 P 掃描表（D1 的問題）"
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="拿 `pricing_decisions` 的正式紀錄逐點對照重播結果（M2 的驗收標準）",
+    )
+    args = parser.parse_args(argv)
+
+    config: Dict[str, Any] = {}
+    try:
+        config_path = settings.resolve_config_path(project_root())
+        config = settings.load_config(str(config_path)) or {}
+    except Exception:
+        # 報告不該因為設定檔讀不到就整支掛掉（同前兩份報告）。
+        config = {}
+
+    configured = args.db or ((config.get("database") or {}).get("path"))
+    db_path = resolve_db_path(configured)
+    if not db_path.exists():
+        print(f"找不到資料庫：{db_path}", file=sys.stderr)
+        return 1
+
+    candles = load_candles(db_path, args.currency, args.period, args.timeframe)
+    if not candles:
+        print(
+            f"`market_candles` 裡沒有 {args.currency}／period={args.period}／"
+            f"timeframe={args.timeframe} 的 K 線。",
+            file=sys.stderr,
+        )
+        return 1
+
+    strategy = STRATEGIES[args.strategy](config)
+    if not hasattr(strategy, "choose_rate"):
+        # 走不到，但留著：`STRATEGIES` 之後一定會有人再加東西進去，
+        # 而那時候的錯誤訊息應該講出原因，不是丟一個 AttributeError。
+        print(
+            f"{type(strategy).__name__} 沒有 `choose_rate()`，這個重播器餵的是 K 線，"
+            "餵不了它——理由見本檔 `STRATEGIES` 上方的說明。",
+            file=sys.stderr,
+        )
+        return 1
+    result = backtest.replay(
+        strategy, candles, hold_hours=args.hold_hours, step=max(args.step, 1)
+    )
+    print(format_replay(result, args.last or None))
+
+    if args.verify:
+        recorded = load_recorded_decisions(
+            db_path, args.currency, type(strategy).__name__
+        )
+        print(format_verification(result, recorded))
+
+    if args.sweep:
+        rows = backtest.sweep_hold_hours(strategy, candles, DEFAULT_SWEEP_HOURS)
+        label = result.points[-1].at.strftime("%m-%d %H:%M") if result.points else "—"
+        print(format_sweep(rows, label))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

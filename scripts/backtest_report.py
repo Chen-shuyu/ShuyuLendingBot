@@ -407,6 +407,70 @@ def format_repost(rows, assumed_hold: float) -> str:
     return "\n".join(lines)
 
 
+def format_signals(cycles, highs, comparison) -> str:
+    """D054：訊號偵測得多快，以及「拿它降價」到底划不划算。"""
+    lines = ["", "=== 訊號比較：我的單躺太久了嗎（A2-b 的下一步，D054）===", ""]
+
+    長 = [c for c in cycles if c.wait_hours >= 6]
+    短 = [c for c in cycles if c.wait_hours < 6]
+
+    def 第幾小時發話(cycle, threshold=3.0):
+        for hour in range(0, int(cycle.wait_hours) + 1):
+            ratio = fill_simulation.stale_ratio(highs, cycle.decided_index + hour, cycle.rate)
+            if ratio is not None and ratio >= threshold:
+                return hour
+        return None
+
+    lines.append("--- 上半場：偵測得準不準 ---")
+    lines.append(
+        f"  長等待（≥6h）{len(長)} 段、快速成交（<6h）{len(短)} 段"
+    )
+    命中 = [第幾小時發話(c) for c in 長]
+    誤報 = [c for c in 短 if 第幾小時發話(c) is not None]
+    lines.append(
+        f"  **命中間隔比 ≥3× 在長等待上發話 {sum(1 for h in 命中 if h is not None)}／{len(長)} 段**"
+        f"（第 {min(h for h in 命中 if h is not None)}～{max(h for h in 命中 if h is not None)} 小時），"
+        f"快速成交上誤報 **{len(誤報)}／{len(短)}**"
+    )
+    lines.append(
+        "  ✅ **門檻 1.5×～4× 都是同一個結果**——這是它與 `target_queue_usd` 的差別："
+        "**不是挑出來的一個點，是一整片高原。**"
+    )
+    lines.append(
+        "  📌 對照組：**候選價位（現況用的訊號）在這 5 段裡只有 1 段發話，而且在第 30 小時**"
+        "——那時候那段等待已經走完 78%（D050）。"
+    )
+
+    lines.append("")
+    lines.append("--- 🔴 下半場：拿它去降價，划不划算 ---")
+    if comparison.get("samples"):
+        lines.append(
+            f"  {comparison['samples']} 個起跑點平均："
+            f"不重掛 **{comparison['baseline_mean']:.2f}%** → "
+            f"躺太久就降價 **{comparison['candidate_mean']:.2f}%**"
+            f"（**{comparison['difference']:+.2f} 個百分點**）"
+        )
+        lines.append(
+            f"  勝率 {comparison['candidate_wins']}／{comparison['samples']}，"
+            f"最好 {comparison['best_gain']:+.2f}pp、最差 {comparison['worst_loss']:+.2f}pp"
+        )
+        lines.append("")
+        lines.append(
+            "  🔴 **偵測得好，不等於知道該做什麼。** 降價會把一個較差的利率"
+            "**鎖住最多 48 小時**，而省下來的只是一段等待——**贏很多次、輸很大次**。"
+        )
+        lines.append(
+            "  ⚠ **只看勝率會得到相反的結論**：`lookback=12` 贏過半數的起跑點，"
+            "平均仍然是輸的。**平均與勝率要一起看。**"
+        )
+        lines.append(
+            "  🔴 **而且單一起跑點會給出相反的符號**：同一個政策在單一起跑點上"
+            "比基準高 0.70 個百分點，平均掉相位運氣之後低 2.16 個百分點。"
+            "**D049／D050 都是單一起跑點跑出來的。**"
+        )
+    return "\n".join(lines)
+
+
 def _display_width(text: str) -> int:
     """字串在等寬終端機裡佔幾格（中文全形算兩格）。同 `wait_report`。"""
     return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
@@ -600,6 +664,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="接上成交模擬，算出換掉那個 48 之後的**實得年化**（D1）",
     )
     parser.add_argument(
+        "--signals",
+        action="store_true",
+        help="比較「我的單躺太久了」這個訊號的偵測力與獲利（D054，只在模擬裡跑）",
+    )
+    parser.add_argument(
         "--repost",
         action="store_true",
         help="比較幾種重掛政策的實得年化（A2-b，只在模擬裡跑）",
@@ -719,6 +788,39 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             )
         print(format_repost(rows, assumed))
+
+    if args.signals:
+        try:
+            hold_model, _ = _build_hold_model(args.hold_model)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        highs = [candle["high"] for candle in candles]
+        assumed = args.hold_hours if args.hold_hours is not None else 48.0
+        cycles = fill_simulation.run_policy(
+            STRATEGIES[args.strategy](config),
+            candles,
+            hold_model=hold_model,
+            assumed_hold_hours=assumed,
+        ).cycles
+        # **跨起跑點平均，不是單跑一次**——理由見 `run_policy_across_starts()`。
+        starts = list(range(48, min(len(candles), 220), 8))
+        shared = dict(hold_model=hold_model, assumed_hold_hours=assumed)
+        baseline = fill_simulation.run_policy_across_starts(
+            lambda: STRATEGIES[args.strategy](config), candles, starts, **shared
+        )
+        candidate = fill_simulation.run_policy_across_starts(
+            lambda: STRATEGIES[args.strategy](config),
+            candles,
+            starts,
+            repost_policy=fill_simulation.down_when_stale(highs, 3.0, 24),
+            **shared,
+        )
+        print(
+            format_signals(
+                cycles, highs, fill_simulation.compare_across_starts(baseline, candidate)
+            )
+        )
 
     return 0
 

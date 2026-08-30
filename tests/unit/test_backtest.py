@@ -136,32 +136,44 @@ class Test不許偷看未來:
 class Test旋鈕轉完要還原:
     def test_assumed_hold_hours離開後還原(self):
         s = strategy()
-        原值 = s.offer_period
+        原值 = s.assumed_hold_hours
         with backtest.assumed_hold_hours(s, 16.93):
-            assert s.offer_period == pytest.approx(16.93 / 24)
-        assert s.offer_period == 原值
+            assert s.assumed_hold_hours == pytest.approx(16.93)
+        assert s.assumed_hold_hours == 原值
+
+    def test_不會動到送給交易所的合約天期(self):
+        """🔴 **D056**：`offer_period` 是合約條款（交易所最短 2 天），
+        `assumed_hold_hours` 是算式裡的估計。**重播只准動後者。**
+
+        在 2026-08-30 拆開之前，這支會把合約天期一起改成小數
+        ——重播時沒事，但那個耦合讓「把假設改成 12 小時」在正式環境做不到。
+        """
+        s = strategy()
+        with backtest.assumed_hold_hours(s, 12.0):
+            assert s.offer_period == 2
+        assert s.offer_period == 2
 
     def test_中途爆掉也要還原(self):
         """`finally` 不是防禦性寫法，是這個設計成立的前提。"""
         s = strategy()
-        原值 = s.offer_period
+        原值 = s.assumed_hold_hours
         with pytest.raises(RuntimeError):
             with backtest.assumed_hold_hours(s, 11.61):
                 raise RuntimeError("模擬策略在重播中途爆掉")
-        assert s.offer_period == 原值
+        assert s.assumed_hold_hours == 原值
 
     def test_None代表不轉這個旋鈕(self):
         s = strategy()
-        原值 = s.offer_period
+        原值 = s.assumed_hold_hours
         with backtest.assumed_hold_hours(s, None):
-            assert s.offer_period == 原值
-        assert s.offer_period == 原值
+            assert s.assumed_hold_hours == 原值
+        assert s.assumed_hold_hours == 原值
 
     def test_replay跑完不留痕跡(self):
         s = strategy()
-        原值 = s.offer_period
+        原值 = s.assumed_hold_hours
         backtest.replay(s, build_candles(BURSTY), hold_hours=16.93)
-        assert s.offer_period == 原值
+        assert s.assumed_hold_hours == 原值
 
     def test_每個重播點都記著當時的假設(self):
         result = backtest.replay(strategy(), build_candles(BURSTY), hold_hours=16.93)
@@ -183,9 +195,9 @@ class TestP掃描:
 
     def test_掃描不改動策略(self):
         s = strategy()
-        原值 = s.offer_period
+        原值 = s.assumed_hold_hours
         backtest.sweep_hold_hours(s, build_candles(BURSTY), [48.0, 16.93, 11.61])
-        assert s.offer_period == 原值
+        assert s.assumed_hold_hours == 原值
 
     def test_每一列都記著自己的假設(self):
         rows = backtest.sweep_hold_hours(

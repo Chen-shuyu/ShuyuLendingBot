@@ -34,7 +34,7 @@
    **偷看未來的回測一定會很好看**，而且看起來完全正常。
 
 3. **唯一被轉動的旋鈕是 `P`，而且轉的是策略自己在讀的那個屬性。**
-   `assumed_hold_hours()` 暫時改寫 `strategy.offer_period` 再還原，
+   `assumed_hold_hours()` 暫時改寫 `strategy.assumed_hold_hours` 再還原，
    **不重寫 `r × P ÷ (W + P)` 那條算式**。
    一旦這裡自己算一次期望值，上面第 1 條就沒了。
 
@@ -123,24 +123,27 @@ class ReplayResult:
 def assumed_hold_hours(strategy: Any, hours: Optional[float]) -> Iterator[None]:
     """暫時把策略假設的借出時間換成 `hours`，離開時還原。
 
-    **為什麼是改 `offer_period` 而不是傳參數進去**：`choose_rate()` 讀的是
-    `self.offer_period * 24.0`，而重播的目的正是要驗證「策略在別的假設下會選什麼」。
+    **為什麼是改屬性而不是傳參數進去**：`choose_rate()` 讀的是
+    `self.assumed_hold_hours`，而重播的目的正是要驗證「策略在別的假設下會選什麼」。
     傳參數就得改策略的簽章，改完之後重播跑的就不再是正式環境跑的那條路徑，
     上面界線 1 立刻失效。
 
-    ⚠ **這會讓 `offer_period` 變成小數**，而它在 `build_offer_plan()` 裡是要送給
-    交易所的天期（整數）。**所以這支只給重播用，而且一定要還原**——
-    `finally` 不是防禦性寫法，是這個設計成立的前提。
+    🔴 **2026-08-30 起改動的是 `assumed_hold_hours`，不再是 `offer_period`**（D056）。
+    在那之前兩者是同一個值，於是這支會把**送給交易所的合約天期**也一起改掉
+    ——重播時無所謂（不會真的下單），但那個耦合本身是錯的，而且它讓
+    「把假設改成 12 小時」這件事在正式環境變成做不到（整數、且低於交易所下限）。
+
+    **一定要還原**——`finally` 不是防禦性寫法，是這個設計成立的前提。
     """
     if hours is None:
         yield
         return
-    original = strategy.offer_period
-    strategy.offer_period = hours / 24.0
+    original = strategy.assumed_hold_hours
+    strategy.assumed_hold_hours = float(hours)
     try:
         yield
     finally:
-        strategy.offer_period = original
+        strategy.assumed_hold_hours = original
 
 
 def _evaluation_for(strategy: Any, rate: Optional[float]) -> Optional[Dict[str, Any]]:
@@ -180,7 +183,7 @@ def replay(
     points: List[ReplayPoint] = []
 
     with assumed_hold_hours(strategy, hold_hours):
-        effective_hold = float(strategy.offer_period) * 24.0
+        effective_hold = float(strategy.assumed_hold_hours)
         for index in range(0, len(candles), step):
             # 界線 2：切窗在這裡發生。`visible` 之後的每一根對策略都不存在。
             visible = list(candles[: index + 1])

@@ -843,3 +843,78 @@ class TestEvaluateRate:
         strategy = self._evaluated()
         assert strategy.evaluate_rate(0) is None
         assert strategy.evaluate_rate(-0.0001) is None
+
+
+class TestD056假設與合約天期是兩件事:
+    """🔴 **2026-08-30 拆開（D056）。這一族擋的是「它們又被綁回去」。**
+
+    `offer_period` 是**送給交易所的合約天期**（Bitfinex 最短 2 天，而且是整數）；
+    `assumed_hold_hours` 是**算式裡的 `P`**（借款人隨時可以提前還款，所以是期望值）。
+
+    綁在一起的後果是：**想修正假設就得改合約條款，而那條路走不通。**
+    """
+
+    @staticmethod
+    def _config(**strategy):
+        base = {
+            "ev_window_hours": 168,
+            "ev_min_hits": 5,
+            "ev_min_candles": 48,
+            "candle_hours": 1.0,
+            "offer_period": 2,
+            "minimum_rate": 0.0001,
+        }
+        base.update(strategy)
+        return {"strategy": base}
+
+    def test_沒設就退回舊行為(self):
+        """**沒設這個鍵的人行為完全不變**——這是拆開時刻意保留的退路。"""
+        from strategies.expected_value import ExpectedValueStrategy
+
+        strategy = ExpectedValueStrategy(self._config())
+        assert strategy.assumed_hold_hours == 48.0
+        assert strategy.offer_period == 2
+
+    def test_設了就用設的值而且不動合約天期(self):
+        from strategies.expected_value import ExpectedValueStrategy
+
+        strategy = ExpectedValueStrategy(self._config(assumed_hold_hours=12))
+        assert strategy.assumed_hold_hours == 12.0
+        assert strategy.offer_period == 2, "合約天期不可以被假設值帶著跑"
+
+    def test_可以是小數而合約天期仍是整數(self):
+        """假設值是期望值，本來就可能不是整數天；合約天期則必須是整數。"""
+        from strategies.expected_value import ExpectedValueStrategy
+
+        strategy = ExpectedValueStrategy(self._config(assumed_hold_hours=11.61))
+        assert strategy.assumed_hold_hours == pytest.approx(11.61)
+        assert isinstance(strategy.offer_period, int)
+
+    def test_假設值真的會改變選出來的價位(self):
+        """不然這個設定就只是裝飾品。"""
+        from strategies.expected_value import ExpectedValueStrategy
+
+        candles = [
+            {"mts": 1_788_000_000_000 + i * 3_600_000, "high": h}
+            for i, h in enumerate(
+                ([0.00015] * 8 + [0.00029879] + [0.00016] * 5 + [0.00031416] + [0.000155] * 5) * 6
+            )
+        ]
+        寬鬆 = ExpectedValueStrategy(self._config(assumed_hold_hours=48)).choose_rate(candles)
+        嚴格 = ExpectedValueStrategy(self._config(assumed_hold_hours=12)).choose_rate(candles)
+        assert 寬鬆 is not None and 嚴格 is not None
+        assert 嚴格 <= 寬鬆, "假設賺錢時間變短，就該更怕等待、選更便宜的價位"
+
+    def test_落帳記的是假設值不是合約天期(self):
+        """`pricing_decisions.hold_hours_assumed` 要記真正用在算式裡的那個數。"""
+        from strategies.expected_value import ExpectedValueStrategy
+
+        candles = [
+            {"mts": 1_788_000_000_000 + i * 3_600_000, "high": h}
+            for i, h in enumerate(
+                ([0.00015] * 8 + [0.00029879] + [0.00016] * 5 + [0.00031416] + [0.000155] * 5) * 6
+            )
+        ]
+        strategy = ExpectedValueStrategy(self._config(assumed_hold_hours=12))
+        strategy.choose_rate(candles)
+        assert strategy.pricing_decision()["hold_hours_assumed"] == 12.0

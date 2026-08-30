@@ -121,7 +121,10 @@ class _策略:
     ev_min_candles = 0
 
     def __init__(self, rate=0.00029, period=2):
+        # `offer_period` 是**送給交易所的合約天期**，
+        # `assumed_hold_hours` 是**算式裡的 `P`**。2026-08-30 拆開（D056）。
         self.offer_period = period
+        self.assumed_hold_hours = period * 24.0
         self.rate = rate
 
     def choose_rate(self, candles):
@@ -208,7 +211,8 @@ class Test資金回來才重新選價:
             assumed_hold_hours=48.0,
         )
         assert outcome.cycles[0].hold_hours == pytest.approx(11.61)
-        # 旋鈕轉完要還原（同第 1 步的 `assumed_hold_hours`）
+        # 旋鈕轉完要還原，而且**沒有動到合約天期**（D056）
+        assert strategy.assumed_hold_hours == pytest.approx(48.0)
         assert strategy.offer_period == 2
 
 

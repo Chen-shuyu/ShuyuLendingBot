@@ -163,6 +163,21 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 要換算成小時才能跟借出期間相加。
         self.candle_hours = float(strategy_config.get("candle_hours", 1.0))
 
+        # **算式裡那個 `P`：我們假設「借出去之後會生息多久」。**
+        #
+        # 🔴 **這件事 2026-08-30 之前與 `offer_period` 是同一個值，而那是個錯誤的耦合**
+        # （D056）。`offer_period` 有兩個完全不同的用途：
+        #   1. **送給交易所的天期**——它是合約條款，而且交易所最短只接受 2 天；
+        #   2. **算式裡的 `P`**——它該是「實際會生息多久」的估計。
+        # 借款人可以隨時還款，所以 (1) 是**上限**、(2) 是**期望值**，兩者本來就不同。
+        # 綁在一起的後果是「想修正假設就得改合約天期」，而那條路是走不通的
+        # （整數、而且低於交易所下限）。
+        #
+        # 預設值刻意退回 `offer_period * 24`——**沒設這個鍵的人行為完全不變**。
+        self.assumed_hold_hours = float(
+            strategy_config.get("assumed_hold_hours", self.offer_period * 24.0)
+        )
+
         # **本輪** `choose_rate()` 的完整評估結果，供迴圈層寫日誌用。
         # **策略層仍然不碰 IO**：這裡只是把算過的東西留下來，不主動輸出。
         #
@@ -308,7 +323,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
             # **這個 48 是已知錯的**（D040：實測完成率 43.6%）。存下來不是因為它對，
             # 而是因為 M2 回測工具要拿它當「當時假設了什麼」——換掉它之後，
             # 舊決策才有辦法跟新決策比較。存的是假設，不是事實。
-            "hold_hours_assumed": self.offer_period * 24.0,
+            "hold_hours_assumed": self.assumed_hold_hours,
             "candle_count": self.last_window.get("candle_count"),
             "candle_latest_mts": self.last_window.get("candle_latest_mts"),
         }
@@ -401,16 +416,12 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 兩邊用同一把尺算出來的實質年化才比得起來。
         self.last_highs = highs
 
-        # **這個假設已知與現實不符，刻意先不改**（TASKS.md D1、DECISIONS.md D040）。
-        # 借款人可以隨時還款，所以 `offer_period` 是上限而不是實際持有時間：
-        # 2026-08-22 的量測是六筆裡五筆提前還款、平均只用掉預定天期的 32%。
-        # 分子被高估時，等待成本在下面那道算式裡的權重被壓縮，選出的價位會偏高。
-        #
-        # 為什麼還不動它：要換成什麼值本身就是策略問題（用中位數？依利率分層？
-        # 直接改成期望持有時間？），而那要在 M2 回測工具上跑過才知道。
-        # 先改參數再建量測正是 D036 記下的錯誤——現在至少量得到它錯多少：
-        # `python3 scripts/hold_report.py`。
-        hold_hours = self.offer_period * 24.0
+        # 算式裡的 `P`。**2026-08-30 起它是獨立的設定，不再等於合約天期**（D056）。
+        # 實測平均持有 16.93h、中位數 11.61h，而合約天期是 48h——
+        # 回測顯示假設值落在 8～20h 這片高原上時實得年化最高（D055）。
+        # ⚠ **它有一部分是在補 `W` 的偏差**（D047 的乾旱回饋圈），
+        # 不是純粹的「持有時間估計」；修了 `W` 之後這個值要重調。
+        hold_hours = self.assumed_hold_hours
         best_rate: Optional[float] = None
         best_effective = 0.0
 
@@ -486,7 +497,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
 
         # 與 `choose_rate()` 完全同一條算式（D034）。**這個 `hold_hours` 是已知
         # 錯的**（D040：實測完成率 51.8%），但兩邊都用它，所以比較仍然公平。
-        hold_hours = self.offer_period * 24.0
+        hold_hours = self.assumed_hold_hours
         return {
             "rate": rate,
             "wait_hours": estimate.mean_hours,

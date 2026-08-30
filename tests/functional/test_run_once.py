@@ -2422,3 +2422,109 @@ class Test帳本同步絕對不能影響巡檢:
             "SELECT principal_avg FROM earnings_daily"
         ).fetchone()
         assert row[0] is None
+
+
+class Test日結收益摘要:
+    """D053。一天最多一則，而且**判準是資料不是時鐘**。"""
+
+    @staticmethod
+    def _engine(fake_logger, fake_notifier, strategy, repository, **kwargs):
+        client = FakeClient(balance=600.0, frr=0.0002)
+        return (
+            make_engine(fake_logger, fake_notifier, strategy, client, repository, **kwargs),
+            client,
+        )
+
+    @staticmethod
+    def _seed(repository, date="2026-08-30", interest=0.04203999):
+        repository.set_daily_earning(date=date, currency="USD", interest=interest)
+
+    def test_有新的結息日就推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository)
+        engine._maybe_send_earnings_digest()
+        assert any("每日收益摘要" in m for m in fake_notifier.sent)
+
+    def test_同一天只推一次(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**額度是每月 200 則**，每輪推一次的話 1.4 天就燒光（D024）。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository)
+        engine._maybe_send_earnings_digest()
+        engine._maybe_send_earnings_digest()
+        engine._maybe_send_earnings_digest()
+        assert sum("每日收益摘要" in m for m in fake_notifier.sent) == 1
+
+    def test_出現新的一天才會再推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "2026-08-30")
+        engine._maybe_send_earnings_digest()
+        self._seed(repository, "2026-08-31")
+        engine._maybe_send_earnings_digest()
+        assert sum("每日收益摘要" in m for m in fake_notifier.sent) == 2
+
+    def test_記錄跨重啟保留(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """🔴 **狀態存在 DB 不是記憶體**：存記憶體的話每次部署都會重推一則。
+
+        08-30 一天部署了五次——那就是五則，而額度一個月只有 200。
+        """
+        self._seed(repository)
+        first, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        first._maybe_send_earnings_digest()
+        # 模擬重啟：換一台全新的引擎，共用同一顆 DB
+        second, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        second._maybe_send_earnings_digest()
+        assert sum("每日收益摘要" in m for m in fake_notifier.sent) == 1
+
+    def test_停機幾天後只補最新的一則(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**不要連發**：停機三天回來推三則，是把額度花在沒人會回頭看的東西上。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        for date in ("2026-08-28", "2026-08-29", "2026-08-30"):
+            self._seed(repository, date)
+        engine._maybe_send_earnings_digest()
+        digests = [m for m in fake_notifier.sent if "每日收益摘要" in m]
+        assert len(digests) == 1
+        assert "2026-08-30" in digests[0]
+
+    def test_沒有收益資料就不推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        engine._maybe_send_earnings_digest()
+        assert not any("每日收益摘要" in m for m in fake_notifier.sent)
+
+    def test_推播失敗不會往外拋也不會重推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**先記再推**：一個推不出去的摘要每 10 分鐘重試一次，一天燒 144 則。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository)
+        calls = []
+
+        def 推不出去(message):
+            calls.append(message)
+            raise RuntimeError("LINE 掛了")
+
+        engine.notifier.send = 推不出去
+        engine._maybe_send_earnings_digest()   # 不可以往外拋
+        engine._maybe_send_earnings_digest()
+        assert len(calls) == 1
+
+    def test_交易通知關掉時日結也關掉(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """它同樣是花額度的推播，總開關要管得到它。"""
+        engine, _ = self._engine(
+            fake_logger, fake_notifier, strategy, repository, push_trade_events=False
+        )
+        self._seed(repository)
+        engine._maybe_send_earnings_digest()
+        assert not any("每日收益摘要" in m for m in fake_notifier.sent)
+
+    def test_餘額取不到就不印年化那一行(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**少一行，好過印一個來歷不明的百分比**（D051 的同一條規矩）。"""
+        engine, client = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository)
+
+        def 查不到(*args, **kwargs):
+            raise RuntimeError("餘額端點掛了")
+
+        client.get_available_balance = 查不到
+        engine._maybe_send_earnings_digest()
+        digest = [m for m in fake_notifier.sent if "每日收益摘要" in m][0]
+        assert "相對錢包餘額的年化" not in digest
+        # 但摘要本身還是要送出去——利息數字仍然有價值
+        assert "當日利息" in digest

@@ -11,7 +11,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from db import models
 from utils import clock
@@ -522,6 +522,41 @@ class Repository:
                 """,
                 (date, currency, float(interest), principal_avg, now_iso()),
             )
+
+    def get_kv(self, key: str) -> Optional[str]:
+        """讀一個狀態值；沒有就回 `None`（見 `db/models.py` 的 `CREATE_BOT_KV`）。"""
+        row = self.connection.execute(
+            "SELECT value FROM bot_kv WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_kv(self, key: str, value: str) -> None:
+        """寫一個狀態值（覆蓋）。"""
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO bot_kv (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now_iso()),
+            )
+
+    def latest_earning(self, currency: str = "USD") -> Optional[Dict[str, Any]]:
+        """最新一天的收益列；`earnings_daily` 是空的就回 `None`。"""
+        row = self.connection.execute(
+            "SELECT * FROM earnings_daily WHERE currency = ? ORDER BY date DESC LIMIT 1",
+            (currency,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def recent_earnings(self, currency: str = "USD", days: int = 7) -> List[Dict[str, Any]]:
+        """最近幾天的收益，由舊到新。"""
+        rows = self.connection.execute(
+            "SELECT * FROM earnings_daily WHERE currency = ? ORDER BY date DESC LIMIT ?",
+            (currency, int(days)),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def set_daily_earning(
         self,

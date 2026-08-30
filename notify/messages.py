@@ -418,3 +418,52 @@ def offer_failed(plan: Any, reason: str, retryable: bool = True) -> str:
         level=LEVEL_ERROR if retryable else LEVEL_CRITICAL,
         action_required=not retryable,
     )
+
+
+# --- 收益面 -----------------------------------------------------------------
+
+
+def daily_earnings_digest(
+    date: str,
+    interest: float,
+    closing_balance: Optional[float] = None,
+    recent: Optional[list] = None,
+    position_summary: Optional[str] = None,
+    currency: str = "USD",
+) -> str:
+    """每日收益摘要（P2-4／D053）。**一天最多一則**，額度算 30 則/月。
+
+    **這是 `CATEGORY_EARNINGS` 的第一個真正用途**——那個分類與 📊 圖示從 D029
+    就定義好了，一直沒有東西可以放，因為 `earnings_daily` 一直是空的。
+
+    ## 為什麼年化是「相對錢包餘額」而不是「相對本金」
+
+    D051 立過一條規矩：**不猜本金**。帳本只看得到餘額，而餘額含已賺到的利息、
+    也含還掛在場上沒借出去的錢——猜一個本金出來，這個數字就變成推論了。
+
+    所以這裡用的分母是**當天收盤的錢包餘額**，那是帳本上的事實。
+    它會讓年化**偏低**（沒借出去的錢也在分母裡），而**偏低是可接受的方向**：
+    這個專案已經有三個數字因為分母少扣東西而偏樂觀（D051）。
+    標籤要把分母講清楚，不能只寫「年化」。
+    """
+    fields: Dict[str, Any] = {
+        "結息日": date,
+        "當日利息": f"{interest:.8f} {currency}",
+    }
+
+    if closing_balance and closing_balance > 0:
+        annual = interest / closing_balance * DAYS_PER_YEAR * 100
+        fields["相對錢包餘額的年化"] = f"{annual:.2f}%（分母 {format_amount(closing_balance, currency)}）"
+
+    if recent:
+        total = sum(float(day.get("interest") or 0) for day in recent)
+        fields[f"近 {len(recent)} 天合計"] = f"{total:.8f} {currency}"
+
+    if position_summary:
+        fields["目前狀態"] = position_summary
+
+    # **刻意不寫「實得年化」四個字。** 那個數字要扣掉沒借出去的時間，
+    # 而這則訊息算不出來——寫了就會被當成實得年化在讀（D051 的那條錨）。
+    fields["完整對照"] = "scripts/sync_earnings.py --since <上線日> --principal <本金>"
+
+    return build(CATEGORY_EARNINGS, "每日收益摘要", fields)

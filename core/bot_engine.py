@@ -1172,6 +1172,79 @@ class BotEngine:
         except Exception as exc:  # noqa: BLE001 - 見 docstring：不能影響巡檢
             self.logger.warning(f"帳本同步失敗，本輪略過（不影響掛單）：{exc}")
 
+    # `bot_kv` 的鍵名。**寫成常數**是因為它同時出現在讀與寫兩處，
+    # 打錯一個字的後果是「每天都重推一次日結」——而那要花掉整月額度的一半才會被發現。
+    DIGEST_STATE_KEY = "last_earnings_digest_date"
+
+    def _maybe_send_earnings_digest(self) -> None:
+        """有新的結息日就推一則日結摘要（D053）。**一天最多一則。**
+
+        **判準是「`earnings_daily` 出現了沒推過的日期」，不是時鐘。**
+        時鐘式的（「每天 10:00 推」）在兩件事上會出錯：機器人那個時間剛好在重啟
+        就整天不推；交易所結息時間漂移的話會推到還沒有資料的一天。
+        事件式的則是**結息一落地就推**，而且停機幾天後只補最新的一則，不會連發。
+
+        🔴 **與 `_maybe_sync_earnings()` 同一條守則：吞掉所有例外。**
+        一則通知不可以把一台在管真金的機器人弄停。
+        """
+        if not self.push_trade_events:
+            # 交易面通知的總開關關掉時，日結也一起關——它同樣是「花額度的推播」。
+            return
+        try:
+            latest = self.repository.latest_earning("USD")
+            if not latest:
+                return
+            already = self.repository.get_kv(self.DIGEST_STATE_KEY)
+            if already == latest["date"]:
+                return
+
+            # **先記再推。** 推播失敗就不要下一輪再推一次——LINE 的額度是每月 200 則，
+            # 一個推不出去的摘要每 10 分鐘重試一次，一天就燒掉 144 則。
+            self.repository.set_kv(self.DIGEST_STATE_KEY, latest["date"])
+
+            self.notifier.send(
+                messages.daily_earnings_digest(
+                    date=latest["date"],
+                    interest=float(latest["interest"]),
+                    closing_balance=self._digest_balance(),
+                    recent=self.repository.recent_earnings("USD", days=7),
+                    position_summary=self._digest_position_summary(),
+                )
+            )
+            self.logger.info(f"已推送 {latest['date']} 的日結收益摘要")
+        except Exception as exc:  # noqa: BLE001 - 見 docstring：不能影響巡檢
+            self.logger.warning(f"日結摘要推送失敗，略過（不影響掛單）：{exc}")
+
+    def _digest_balance(self) -> Optional[float]:
+        """摘要裡當分母的錢包餘額。**取不到就回 `None`，不要猜。**
+
+        取不到時 `daily_earnings_digest()` 會整個略過年化那一行——
+        **少一行，好過印一個來歷不明的百分比**（D051 的同一條規矩）。
+        """
+        try:
+            return float(self.client.get_available_balance("USD"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _digest_position_summary(self) -> Optional[str]:
+        """一句話講「現在錢在哪」。取不到就回 `None`（同上，寧可少一行）。"""
+        try:
+            offers = self.client.get_active_offers("USD")
+            positions = self.client.get_active_positions("USD")
+        except Exception:  # noqa: BLE001
+            return None
+
+        parts = []
+        if positions:
+            total = sum(float(p["amount"]) for p in positions)
+            parts.append(f"借出中 {len(positions)} 筆／{total:,.2f} USD")
+        if offers:
+            rates = [float(o["rate"]) * 365 * 100 for o in offers]
+            parts.append(f"場上掛單 {len(offers)} 筆（年化 {min(rates):.2f}%）")
+        if not parts:
+            parts.append("沒有部位也沒有掛單")
+        return "，".join(parts)
+
     def run_forever(self) -> int:
         """啟動檢查後進入常駐主迴圈，回傳離開碼。"""
         try:
@@ -1211,6 +1284,7 @@ class BotEngine:
                 # 2. **它與掛單完全無關。** 放在迴圈這一層，就算它整個爛掉也碰不到
                 #    定價、重掛、取消、下單任何一條路徑。
                 self._maybe_sync_earnings()
+                self._maybe_send_earnings_digest()
 
                 time.sleep(self.interval_seconds)
         except KeyboardInterrupt:

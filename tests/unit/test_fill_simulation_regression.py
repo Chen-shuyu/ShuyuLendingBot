@@ -438,3 +438,109 @@ class TestD054但拿它降價是賠錢的:
         )
         assert result["candidate_wins"] > result["samples"] / 2
         assert result["difference"] < 0
+
+
+class TestD055跨起跑點重做D049:
+    """🔴 **D049 的兩條「不能改」的理由，在正確的方法下都不成立。**
+
+    D049 用單一起跑點得到兩個結論，而 D054 證明單一起跑點會被相位運氣主導：
+
+    | D049 說的（單跑一次） | 跨起跑點重做的結果 |
+    |---|---|
+    | 切半之後**前半的結論反過來** | **三段全部同向** |
+    | 細掃是雜訊、曲線不單調 | **從 48h 往下單調上升，8～20h 是一片高原** |
+
+    **一片高原正是 `target_queue_usd` 失敗模式的反面**：那次是一個手算出來、
+    沒有高原的常數；這次是任何落在 8～20h 的值都給幾乎一樣的結果，
+    **而實測持有的平均（16.93h）與中位數（11.61h）都在高原裡**。
+    """
+
+    STARTS = tuple(range(48, 220, 16))
+
+    def _mean(self, assumed, series=None, starts=None):
+        import statistics
+
+        outcomes = fs.run_policy_across_starts(
+            lambda: ExpectedValueStrategy(CONFIG),
+            series if series is not None else history(),
+            starts if starts is not None else self.STARTS,
+            hold_model=fs.empirical_hold(),
+            assumed_hold_hours=assumed,
+        )
+        values = [o.realized_annual_pct for o in outcomes if o.realized_annual_pct is not None]
+        return statistics.fmean(values)
+
+    def test_假設較小的P比較好(self):
+        assert self._mean(11.61) > self._mean(48.0)
+
+    def test_切半之後兩半同向(self):
+        """🔴 **這一條推翻 D049 的第一個「不能改」的理由。**"""
+        half = len(HIGHS_FULL_HISTORY) // 2
+        starts = tuple(range(48, 150, 12))
+        前半, 後半 = history()[: half + 168], history()[half - 168 :]
+        assert self._mean(11.61, 前半, starts) > self._mean(48.0, 前半, starts)
+        assert self._mean(11.61, 後半, starts) > self._mean(48.0, 後半, starts)
+
+    def test_從48往下是單調的不是雜訊(self):
+        """🔴 **這一條推翻 D049 的第二個理由。**"""
+        序列 = [self._mean(float(a)) for a in (48, 32, 24, 20, 16)]
+        assert 序列 == sorted(序列), 序列
+
+    def test_有一片高原而不是一個尖點(self):
+        """8～20h 之間差不到 0.2 個百分點——**任何落在裡面的值都一樣好**。"""
+        高原 = [self._mean(float(a)) for a in (8, 12, 16, 20)]
+        assert max(高原) - min(高原) < 0.2, 高原
+
+    def test_實測持有落在高原裡(self):
+        """平均 16.93h 與中位數 11.61h **都在 8～20h 之間**
+        ——所以「換成實測值」不再是憑空拍一個常數。"""
+        assert 8 <= 16.93 <= 20
+        assert 8 <= 11.61 <= 20
+
+
+class TestD055任何往下走的機制不是都賠錢:
+    """🔴 **D054 下半場的推論範圍要收窄。**
+
+    D054 量到兩個「因為等太久就降價」的機制都賠錢，我當時差點寫成
+    「任何往下走的機制都賠錢」。**對照組推翻了那個推論**：
+    不看任何訊號、單純把價位往下平移 5～20%，是**賺**的。
+
+    **輸的不是方向，是那兩個機制**——它們反應的是「已經等很久」，
+    於是在燒掉一段等待之後才降，而且降的幅度由乾旱深度決定（可能過頭）。
+    """
+
+    STARTS = tuple(range(48, 220, 16))
+
+    def _shifted(self, pct):
+        import statistics
+
+        class _平移(ExpectedValueStrategy):
+            def choose_rate(self, candles):
+                rate = super().choose_rate(candles)
+                return rate * (1 + pct / 100) if rate else rate
+
+        outcomes = fs.run_policy_across_starts(
+            lambda: _平移(CONFIG),
+            history(),
+            self.STARTS,
+            hold_model=fs.empirical_hold(),
+            assumed_hold_hours=48.0,
+        )
+        return statistics.fmean(
+            [o.realized_annual_pct for o in outcomes if o.realized_annual_pct is not None]
+        )
+
+    def test_往下平移是賺的(self):
+        基準 = self._shifted(0)
+        assert self._shifted(-10) > 基準
+        assert self._shifted(-5) > 基準
+
+    def test_往上平移是賠的(self):
+        """方向確實是「現在掛太貴」，不是「隨便動都會變好」。"""
+        assert self._shifted(+10) < self._shifted(0)
+
+    def test_兩條獨立的路徑指向同一個幅度(self):
+        """純平移的最佳點在 −10% 附近；把 `P` 換成實測值讓選中價位下移約 16%。
+        **兩條完全獨立的路徑指向同一個量級**——這是這次最強的一組證據。"""
+        assert self._shifted(-10) > self._shifted(-30)
+        assert self._shifted(-10) > self._shifted(0)

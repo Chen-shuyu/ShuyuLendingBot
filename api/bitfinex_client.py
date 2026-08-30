@@ -457,6 +457,81 @@ class BitfinexClient(ExchangeClient):
                 )
         return parsed
 
+    def get_funding_ledger(
+        self,
+        currency: str,
+        limit: int = 500,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """查帳本（`/v2/auth/r/ledgers/{ccy}/hist`），P2-2 的資料源。
+
+        **這是這個專案唯一一個「交易所自己說的錢」**。其他所有績效數字都是推論：
+        成交時間靠利率＋時間配對推出來、還款時間靠巡檢偵測、實得年化是兩者相乘。
+        **帳本是那條推論鏈唯一的錨。**
+
+        **2026-08-30 對正式帳號唯讀實打過**，真實回應抄在
+        `tests/unit/test_bitfinex_client.py` 的 `REAL_LEDGER_ROWS`。三件事與
+        官方文件不同或值得記下來（B6 預測過「ledger 是下一個重災區」，中了）：
+
+        1. **`[2]` 不是 placeholder，是錢包名稱**（實測 `'funding'`／`'exchange'`）。
+           官方文件把 `[2]`、`[4]`、`[7]` 都標成 placeholder，而 `[4]`／`[7]`
+           確實是 `None`。**照文件寫會丟掉唯一能分辨錢包的欄位。**
+        2. **數值全是字串**（`'0.04203999'`）——與 `funding_credits` 同一族（D027）。
+        3. 🔴 **帳本裡混著別的東西**：27 列裡有 6 列錢包轉帳、1 列幣別兌換。
+           **而且同一筆轉帳會出現兩列、正負相反、掛在不同錢包上**
+           ——所以「把金額加總」與「只取正數」**兩種做法都會算錯**。
+           分類一定要看 `description` ＋ `wallet`，見 `core/earnings.py`。
+        """
+        if self.dry_run:
+            return []
+        if self.exchange is None:
+            raise FatalError("交易所客戶端尚未初始化，無法查詢帳本。")
+
+        params: Dict[str, Any] = {"currency": currency, "limit": int(limit)}
+        if start_ms is not None:
+            params["start"] = int(start_ms)
+        if end_ms is not None:
+            params["end"] = int(end_ms)
+
+        try:
+            rows = self.exchange.private_post_auth_r_ledgers_currency_hist(params)
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢帳本逾時或超過速率限制：{exc}") from exc
+        except ccxt.AuthenticationError as exc:
+            raise FatalError(f"查詢帳本認證失敗：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise FatalError(f"查詢帳本時交易所回傳錯誤：{exc}") from exc
+
+        return self._parse_ledger(rows)
+
+    def _parse_ledger(self, rows) -> List[Dict[str, Any]]:
+        """解析帳本列。**欄位對照見 `get_funding_ledger()` 的說明。**
+
+        解析不了的一列不讓整批失敗，但**一定要留下原始內容**——否則就是
+        「成交了卻沒人知道」的翻版，只是換個地方發生（D026）。
+        """
+        parsed: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                if len(row) <= 8:
+                    raise IndexError(f"欄位數只有 {len(row)}，少於預期的 9")
+                parsed.append(
+                    {
+                        "id": str(row[0]),
+                        "currency": row[1],
+                        # `[2]` 官方文件標成 placeholder，實測是錢包名稱。
+                        "wallet": row[2],
+                        "mts": int(row[3]) if row[3] is not None else None,
+                        "amount": float(row[5]),
+                        "balance": float(row[6]) if row[6] is not None else None,
+                        "description": row[8] or "",
+                    }
+                )
+            except (IndexError, ValueError, TypeError) as exc:
+                self.logger.error(f"無法解析帳本列：{exc}；原始回應：{row!r}")
+        return parsed
+
     # 取消是冪等操作（重試時會重新查詢，已取消的單不會再出現在清單裡），可安全重試。
     # 唯一的邊界情況：某筆取消其實已在交易所生效、只是回應逾時，重試後該筆不會被算進
     # 回傳清單，主迴圈因此可能略過「等待餘額釋放」而讀到偏舊的餘額——結果只是本輪少掛

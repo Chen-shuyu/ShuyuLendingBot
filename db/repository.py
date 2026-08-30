@@ -506,8 +506,9 @@ class Repository:
         同一天重複寫入時 `interest` 採累加（同一天可能分多次補入帳），
         `principal_avg` 則直接覆蓋——平均值累加沒有意義。
 
-        注意：目前尚無呼叫端。要填入真實數字需另外查 Bitfinex 的 ledger 端點
-        取得利息入帳紀錄，該項已列入 TASKS.md，本輪只先備妥表結構與介面。
+        ⚠ **帳本同步不要用這一支，用 `set_daily_earning()`**：帳本每次都會給出
+        那一天的**完整**金額，用累加的話重跑一次就把當天的利息變兩倍。
+        這一支保留給「真的只知道增量」的來源（目前仍無呼叫端）。
         """
         with self.connection:
             self.connection.execute(
@@ -516,6 +517,34 @@ class Repository:
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(date, currency) DO UPDATE SET
                     interest      = earnings_daily.interest + excluded.interest,
+                    principal_avg = COALESCE(excluded.principal_avg, earnings_daily.principal_avg),
+                    updated_at    = excluded.updated_at
+                """,
+                (date, currency, float(interest), principal_avg, now_iso()),
+            )
+
+    def set_daily_earning(
+        self,
+        date: str,
+        currency: str,
+        interest: float,
+        principal_avg: Optional[float] = None,
+    ) -> None:
+        """把某一天的收益**設成**這個值（不是累加）。帳本同步專用（P2-2）。
+
+        **為什麼要跟 `upsert_daily_earning()` 分開**：帳本是**完整**的事實
+        ——每次查都會給出那一天的全部利息。用累加的那一支同步，
+        **重跑一次就把當天的利息變兩倍**，而且是靜悄悄地變（D026 那一族）。
+
+        同步要能重跑，是因為它一定會被重跑：補歷史、修 bug、換機器都會重跑。
+        """
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO earnings_daily (date, currency, interest, principal_avg, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(date, currency) DO UPDATE SET
+                    interest      = excluded.interest,
                     principal_avg = COALESCE(excluded.principal_avg, earnings_daily.principal_avg),
                     updated_at    = excluded.updated_at
                 """,

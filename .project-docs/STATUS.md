@@ -39,7 +39,7 @@
 
 - **策略 `expected_value`**（D035／D038）：掛在哪個價位由「利率 × 借出期間 ÷
   (等待 + 借出期間)」最大的那一個決定，等待時間每輪從 1 小時 K 線重估
-- **部署**：Podman ＋ systemd Quadlet，巡檢間隔 600 秒。
+- **部署**：Podman ＋ systemd Quadlet，巡檢間隔 600 秒；帳本每 6 小時同步一次。
   **健康狀態不寫在這裡**（寫下來的當下就開始過期）——隨時可查：
   `podman ps` 或 `podman exec shuyu-lending-bot python3 scripts/healthcheck.py`
 - **三張落地表**（M1 完整了）：`market_snapshots` ＋ `market_candles`（D042，只存

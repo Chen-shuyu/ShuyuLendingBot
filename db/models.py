@@ -363,6 +363,23 @@ CREATE INDEX IF NOT EXISTS idx_repost_comparisons_compared_at
     ON repost_comparisons (compared_at);
 """
 
+# 一張通用的小鍵值表，給「機器人記得自己做過什麼」這類狀態用。
+#
+# **為什麼是新表而不是往 `bot_state` 加欄位**：這個專案沒有 migration 機制，
+# `_create_schema()` 跑的是 `CREATE TABLE IF NOT EXISTS`——**對已經存在的表，
+# 在 CREATE 語句裡新增欄位是完全沒有效果的**，正式環境那顆 DB 不會長出新欄位，
+# 而且不會有任何錯誤訊息（D026 那一族）。新表則天然安全。
+#
+# 目前唯一的用途：記住日結摘要最後推播到哪一天（D053）。
+# **不要把它當成什麼都能塞的抽屜**——會被查詢、會被統計的東西應該有自己的表和欄位。
+CREATE_BOT_KV = """
+CREATE TABLE IF NOT EXISTS bot_kv (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT
+);
+"""
+
 ALL_STATEMENTS = (
     CREATE_LOAN_OFFERS,
     CREATE_LOAN_OFFERS_INDEX,
@@ -378,5 +395,6 @@ ALL_STATEMENTS = (
     CREATE_PRICING_DECISIONS_INDEX,
     CREATE_REPOST_COMPARISONS,
     CREATE_REPOST_COMPARISONS_INDEX,
+    CREATE_BOT_KV,
     INIT_BOT_STATE_ROW,
 )

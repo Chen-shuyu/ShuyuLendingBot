@@ -10,6 +10,26 @@
 
 ## [Unreleased]
 
+### Fixed（2026-09-05，分支 `fix/verify-uses-recorded-config`）
+🟢 **TASKS 0-3：`--verify` 靜默失效了六天，修好了**（D064）。**不改定價行為。**
+
+- 🔴 **現象**：40 列裡 34 列「不一致」，而那 34 列**一列都沒錯**——重播拿**今天的**
+  `config.yaml` 去重跑**當初用別的設定**做的決策。D056 改設定的那一刻起就壞了，
+  **而它報的是「不一致」，跟「工具壞了」長得一模一樣**，所以六天沒人發現。
+- **新欄位 `pricing_decisions.pricing_knobs_json`**：策略自己交代這一輪讀了哪些旋鈕
+  （`ExpectedValueStrategy.PRICING_KNOBS`）。**只有策略知道自己讀了什麼。**
+- **`backtest.pricing_knobs()`**：`assumed_hold_hours()` 的推廣，**只認策略宣告的白名單**
+  ——那一列 JSON 是好幾週前寫的，不可以讓它往策略身上掛任何屬性。
+- **`Repository._ensure_columns()`**：這個專案原本沒有 migration 機制，
+  而 `CREATE TABLE IF NOT EXISTS` 對已存在的表什麼都不做。**只加欄位，不改不刪。**
+  **拿正式 DB 的副本實測過**：197 列不變、只多一個欄位、其他四張表完好。
+- **比欄位更早的列**用「類別預設 ＋ 那一列的 `hold_hours_assumed`／`window_hours`」還原，
+  依據是本專案的慣例「新旋鈕的類別預設＝那個旋鈕不存在時的行為」。
+  ⚠ **報告會把這句話印出來**——不讓「還原得動」看起來跟「那一列自己記得」一樣。
+- **結果：40 列 → 40/40 全數一致。**
+- 測試 887 → **899**。
+
+
 ### Fixed（2026-09-05，分支 `fix/chosen-rate-reporting`）
 🔴 **PR #61 上線當天就咬了一口，幾小時內查出**（資金還鎖在部位裡，**一列壞資料都還沒寫**）。
 

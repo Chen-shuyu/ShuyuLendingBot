@@ -99,6 +99,41 @@ class Repository:
         with self.connection:
             for statement in models.ALL_STATEMENTS:
                 self.connection.execute(statement)
+        self._ensure_columns()
+
+    def _ensure_columns(self) -> None:
+        """把 `models.ADD_COLUMNS` 裡缺掉的欄位補上（既有資料庫用）。
+
+        `CREATE TABLE IF NOT EXISTS` 對**已經存在**的表什麼都不做，所以新欄位
+        只會出現在全新的資料庫裡——正式環境那個從 2026-08-01 跑到現在的檔案
+        永遠等不到它。**這就是為什麼要有這一支。**
+
+        🔴 **只加欄位，不改型別、不刪、不搬資料。** `ALTER TABLE ... ADD COLUMN`
+        在 SQLite 是常數時間、不重寫既有列，而且新欄位對舊列一律是 NULL
+        ——**舊列的 NULL 是「當時沒有這個東西」，不是「當時是 0」**。
+        讀的人要自己決定怎麼處理那個 NULL，而**這一層不替他決定**
+        （`--verify` 的處理寫在 `scripts/backtest_report.py`）。
+
+        用 `PRAGMA table_info` 判斷而不是 try/except：後者會把「欄位已存在」與
+        「表根本不存在」吞成同一件事，而那兩者的意思完全相反。
+        """
+        with self.connection:
+            for table, column, column_type in models.ADD_COLUMNS:
+                existing = {
+                    row["name"]
+                    for row in self.connection.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                }
+                if not existing:
+                    # 表不存在。**不要建它**——建表是 `ALL_STATEMENTS` 的事，
+                    # 在這裡順手補一張空表會把「schema 漏了一張表」蓋掉。
+                    continue
+                if column in existing:
+                    continue
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                )
 
     def record_offer(self, plan, result: Dict[str, Any]) -> None:
         """記錄一筆已送出的掛單。
@@ -363,6 +398,7 @@ class Repository:
 
         candidate_rates = decision.get("candidate_rates")
         candidate_effectives = decision.get("candidate_effectives")
+        knobs = decision.get("pricing_knobs")
         with self.connection:
             cursor = self.connection.execute(
                 """
@@ -373,8 +409,9 @@ class Repository:
                      chosen_censored_ratio,
                      fastest_rate, fastest_mean_hours, fastest_effective,
                      candidate_count, candidate_rates_json, candidate_effectives_json,
-                     window_hours, hold_hours_assumed, candle_count, candle_latest_mts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     window_hours, hold_hours_assumed, candle_count, candle_latest_mts,
+                     pricing_knobs_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now_iso(),
@@ -404,6 +441,12 @@ class Repository:
                     decision.get("hold_hours_assumed"),
                     decision.get("candle_count"),
                     decision.get("candle_latest_mts"),
+                    # **當時那一輪讀了哪些旋鈕**（D064）。存的是設定不是結果，
+                    # 理由與上面那個 `hold_hours_assumed` 相同，只是推廣到全部。
+                    # `sort_keys` 讓兩列的 JSON 可以直接字串比對「設定有沒有變」。
+                    None if knobs is None else json.dumps(
+                        knobs, separators=(",", ":"), sort_keys=True
+                    ),
                 ),
             )
         return cursor.lastrowid

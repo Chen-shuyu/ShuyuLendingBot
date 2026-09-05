@@ -932,3 +932,126 @@ class TestRepostComparisons:
         )
 
         assert dict(self.rows(repository)[0])["action_reason"] is None
+
+
+class TestD064既有資料庫要補上新欄位:
+    """🔴 **`CREATE TABLE IF NOT EXISTS` 對已經存在的表什麼都不做。**
+
+    所以新欄位只會出現在全新的資料庫裡，而正式環境那個從 2026-08-01 跑到現在
+    的檔案永遠等不到它——**這正是為什麼要有 `_ensure_columns()`**。
+    """
+
+    @staticmethod
+    def _table_columns(connection, table):
+        return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def test_舊資料庫重開之後補上欄位而且資料還在(self, tmp_path):
+        db_path = str(tmp_path / "lending.sqlite3")
+        # 先造一個「沒有新欄位」的舊資料庫，並塞一列進去。
+        repo = Repository(db_path)
+        repo.connection.execute(
+            "CREATE TABLE IF NOT EXISTS pricing_decisions_old AS "
+            "SELECT * FROM pricing_decisions"
+        )
+        repo.connection.execute("DROP TABLE pricing_decisions")
+        repo.connection.execute(
+            """
+            CREATE TABLE pricing_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decided_at TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                strategy TEXT,
+                chosen_rate REAL NOT NULL,
+                chosen_effective REAL NOT NULL,
+                candidate_count INTEGER NOT NULL,
+                hold_hours_assumed REAL
+            )
+            """
+        )
+        repo.connection.execute(
+            "INSERT INTO pricing_decisions "
+            "(decided_at, currency, strategy, chosen_rate, chosen_effective, "
+            " candidate_count, hold_hours_assumed) VALUES (?,?,?,?,?,?,?)",
+            (now_iso(), "USD", "ExpectedValueStrategy", 0.00024, 0.0002, 110, 48.0),
+        )
+        repo.connection.commit()
+        assert "pricing_knobs_json" not in self._table_columns(
+            repo.connection, "pricing_decisions"
+        )
+        repo.connection.close()
+
+        # 重開：這一次應該把欄位補上，**而且不能動到既有那一列**。
+        reopened = Repository(db_path)
+        assert "pricing_knobs_json" in self._table_columns(
+            reopened.connection, "pricing_decisions"
+        )
+        rows = list(reopened.connection.execute("SELECT * FROM pricing_decisions"))
+        assert len(rows) == 1
+        assert rows[0]["chosen_rate"] == pytest.approx(0.00024)
+        assert rows[0]["hold_hours_assumed"] == pytest.approx(48.0)
+        # 🔴 **舊列的新欄位是 NULL，而 NULL 是「當時沒有這個東西」**
+        # ——不是「當時是預設值」。這一層不替讀的人決定那件事。
+        assert rows[0]["pricing_knobs_json"] is None
+
+    def test_補欄位是冪等的(self, tmp_path):
+        db_path = str(tmp_path / "lending.sqlite3")
+        Repository(db_path).connection.close()
+        for _ in range(3):
+            repo = Repository(db_path)
+            assert "pricing_knobs_json" in self._table_columns(
+                repo.connection, "pricing_decisions"
+            )
+            repo.connection.close()
+
+    def test_表不存在時不會順手把空表建起來(self, tmp_path):
+        """🔴 **建表是 `ALL_STATEMENTS` 的事。**
+
+        在這裡順手補一張空表，會把「schema 漏了一張表」這件事蓋掉
+        ——而那是一個比缺欄位嚴重得多的問題。
+        """
+        db_path = str(tmp_path / "lending.sqlite3")
+        repo = Repository(db_path)
+        repo.connection.execute("DROP TABLE pricing_decisions")
+        repo.connection.commit()
+        repo._ensure_columns()  # 不該爆炸，也不該建表
+        assert self._table_columns(repo.connection, "pricing_decisions") == set()
+        repo.connection.close()
+
+
+class TestD064定價旋鈕要跟著決策一起落地:
+    def test_旋鈕整組寫進去而且鍵是排序過的(self, tmp_path):
+        repo = Repository(str(tmp_path / "lending.sqlite3"))
+        row_id = repo.record_pricing_decision(
+            "USD",
+            {
+                "strategy": "ExpectedValueStrategy",
+                "chosen_rate": 0.00024,
+                "chosen_effective": 0.0002,
+                "candidate_count": 110,
+                "hold_hours_assumed": 12.0,
+                # 故意不照字母序傳進去。
+                "pricing_knobs": {"ev_plateau_tolerance_pct": 0.5, "assumed_hold_hours": 12.0},
+            },
+        )
+        stored = repo.connection.execute(
+            "SELECT pricing_knobs_json FROM pricing_decisions WHERE id = ?", (row_id,)
+        ).fetchone()[0]
+        # `sort_keys` 讓兩列可以直接字串比對「設定有沒有變」。
+        assert stored == '{"assumed_hold_hours":12.0,"ev_plateau_tolerance_pct":0.5}'
+
+    def test_沒有旋鈕的決策照樣寫得進去(self, tmp_path):
+        """向前相容：不是每個策略都有 `pricing_knobs()`。"""
+        repo = Repository(str(tmp_path / "lending.sqlite3"))
+        row_id = repo.record_pricing_decision(
+            "USD",
+            {
+                "strategy": "SomeOtherStrategy",
+                "chosen_rate": 0.00024,
+                "chosen_effective": 0.0002,
+                "candidate_count": 3,
+            },
+        )
+        stored = repo.connection.execute(
+            "SELECT pricing_knobs_json FROM pricing_decisions WHERE id = ?", (row_id,)
+        ).fetchone()[0]
+        assert stored is None

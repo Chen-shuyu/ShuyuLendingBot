@@ -181,6 +181,84 @@ class Test旋鈕轉完要還原:
         assert all(p.hold_hours == pytest.approx(16.93) for p in result.points)
 
 
+class TestD064整組旋鈕都要能還原:
+    """🔴 **這一組釘的是一份靜默失效了六天的驗收工具。**
+
+    2026-08-30 D056 把 `assumed_hold_hours` 從 48 改成 12 的當下，`--verify`
+    就開始拿**今天的**設定去重跑**當初的**決策——40 列裡 34 列「不一致」，
+    而那 34 列一列都沒錯。**它報的是「不一致」，跟「工具壞了」長得一模一樣**，
+    所以六天沒有人發現（D064）。
+    """
+
+    def test_整組旋鈕轉完全部還原(self):
+        s = strategy()
+        原值 = {name: getattr(s, name) for name in s.PRICING_KNOBS}
+        with backtest.pricing_knobs(
+            s, {"assumed_hold_hours": 48.0, "ev_plateau_tolerance_pct": 3.0}
+        ):
+            assert s.assumed_hold_hours == pytest.approx(48.0)
+            assert s.ev_plateau_tolerance_pct == pytest.approx(3.0)
+        assert {name: getattr(s, name) for name in s.PRICING_KNOBS} == 原值
+
+    def test_中途爆掉也要還原(self):
+        s = strategy()
+        原值 = s.ev_plateau_tolerance_pct
+        with pytest.raises(RuntimeError):
+            with backtest.pricing_knobs(s, {"ev_plateau_tolerance_pct": 3.0}):
+                raise RuntimeError("模擬策略在重播中途爆掉")
+        assert s.ev_plateau_tolerance_pct == 原值
+
+    def test_白名單外的鍵不會被掛上去(self):
+        """🔴 **那一列 JSON 是好幾週前寫的，不可以讓它往策略身上掛任何屬性。**"""
+        s = strategy()
+        with backtest.pricing_knobs(
+            s, {"minimum_rate": 0.9, "任意屬性": 1, "assumed_hold_hours": 24.0}
+        ):
+            assert s.assumed_hold_hours == pytest.approx(24.0)
+            assert s.minimum_rate != 0.9
+            assert not hasattr(s, "任意屬性")
+
+    def test_認不得的鍵要回報而不是吞掉(self):
+        """**「重播對不上」與「重播還原不了」是兩件事**，而它們長得一樣。"""
+        s = strategy()
+        assert backtest.unknown_knobs(s, {"assumed_hold_hours": 12.0}) == []
+        assert backtest.unknown_knobs(
+            s, {"某個未來的旋鈕": 1, "另一個": 2}
+        ) == ["另一個", "某個未來的旋鈕"]
+
+    def test_空的或None都當作不轉(self):
+        s = strategy()
+        原值 = s.assumed_hold_hours
+        for knobs in (None, {}):
+            with backtest.pricing_knobs(s, knobs):
+                assert s.assumed_hold_hours == 原值
+            assert s.assumed_hold_hours == 原值
+
+    def test_策略自己宣告的白名單涵蓋所有會改變答案的旋鈕(self):
+        """🔴 **加旋鈕時漏掉這份清單，`--verify` 就從那天起開始說謊。**
+
+        這一條擋不住「忘了加」，但它擋得住「加了一個名字打錯的」——
+        清單上的每一個都必須真的是策略身上的屬性。
+        """
+        s = strategy()
+        for name in s.PRICING_KNOBS:
+            assert hasattr(s, name), name
+
+    def test_類別預設等於那個旋鈕不存在時的行為(self):
+        """🔴 **這是舊列還原的全部依據**（`_legacy_knobs()`）。
+
+        `pricing_knobs_json` 是 2026-09-05 才加的欄位，比它更早的列只能靠
+        「類別預設＝旋鈕不存在時的行為」這條慣例還原。**這一條把那條慣例
+        變成會紅的測試**——哪天有人加了一個「預設值就改變行為」的旋鈕，
+        這裡不會紅，但下面那一條會提醒他該做什麼。
+        """
+        預設 = ExpectedValueStrategy({}).pricing_knobs()
+        # 容差預設 0 = 嚴格取最大、平手偏便宜 = D061 之前的行為。
+        assert 預設["ev_plateau_tolerance_pct"] == 0.0
+        # `assumed_hold_hours` 預設退回合約天期 = D056 之前的行為。
+        assert 預設["assumed_hold_hours"] == pytest.approx(48.0)
+
+
 class TestP掃描:
     def test_P越小越懲罰等待(self):
         """`eff = r × P ÷ (W + P)`：`P` 很大時等待幾乎不被懲罰（D047／D1）。

@@ -67,13 +67,21 @@ class Test歷史的形狀:
 
 
 class TestD1的方向:
-    """策略假設借滿 48 小時，而實測完成率只有 35.3%（D040）。"""
+    """策略假設借滿 48 小時，而實測完成率只有 47.1%（D040／D057 修正後）。
+
+    🔴 **2026-09-05：這一整組的數字都動了，而動的原因不是策略改了。**
+    `OBSERVED_HOLD_HOURS` 原本混進**三筆 `kind='loan'` 的幽靈樣本**（各 0.50h，
+    見 D057），佔一袋抽籤的 18%。修掉之後同一段歷史的循環數 15 → 13，
+    每個數字都跟著移動。**方向沒有翻**——那才是這一條在釘的東西。
+    """
 
     def test_假設48比假設實測平均差(self):
         寬鬆 = run(history(), 48.0)
         嚴格 = run(history(), 16.93)
-        assert 寬鬆.realized_annual_pct == pytest.approx(6.57, abs=0.02)
-        assert 嚴格.realized_annual_pct == pytest.approx(7.26, abs=0.02)
+        # 修 D057 之前是 6.57 / 7.26。**釘子換值時要寫清楚為什麼**，
+        # 否則下一個人只會看到「有人把期望值調成通過」。
+        assert 寬鬆.realized_annual_pct == pytest.approx(6.89, abs=0.02)
+        assert 嚴格.realized_annual_pct == pytest.approx(7.32, abs=0.02)
         assert 嚴格.realized_annual_pct > 寬鬆.realized_annual_pct
 
     def test_假設48的成交率比較低(self):
@@ -235,15 +243,19 @@ class TestA2b重掛政策在這段歷史上分不出勝負:
         assert max(結果) - min(結果) < 0.05, f"分得出勝負了，要回頭看 D050：{結果}"
 
     def test_不是因為沒有機會作用(self):
-        """等待佔整段歷史的 30%，其中 36% 集中在最長的那一段（38.5h）。
+        """等待佔整段歷史的 27%，其中最長的那一段是 38.5h。
 
         **「沒機會」與「有機會但訊號太慢」的處置完全不同**，
         所以這一條要跟上一條綁在一起。
+
+        🔴 修 D057 之前是 30%。**幽靈樣本讓每一筆看起來借得比較短，
+        於是等待在分母裡的佔比被推高**——那三筆 0.50h 的假持有，
+        正好是「等待佔比」這個量最敏感的方向。
         """
         outcome = self._run(None)
         等待 = sum(cycle.wait_hours for cycle in outcome.cycles)
         持有 = sum(cycle.hold_hours or 0.0 for cycle in outcome.cycles)
-        assert 等待 / (等待 + 持有 + outcome.idle_hours) == pytest.approx(0.30, abs=0.02)
+        assert 等待 / (等待 + 持有 + outcome.idle_hours) == pytest.approx(0.27, abs=0.02)
         assert max(cycle.wait_hours for cycle in outcome.cycles) == pytest.approx(
             38.5, abs=0.1
         )
@@ -318,7 +330,25 @@ class TestD047的機制不是永遠同一個方向:
 
 
 class TestD054訊號偵測得很好:
-    """D054 上半場：`stale_ratio` 分得開「長等待」與「快速成交」。"""
+    """D054 上半場：`stale_ratio` 分得開「長等待」與「快速成交」。
+
+    🔴 **2026-09-05：修掉 D057 的幽靈樣本之後，「零誤報」不成立了。**
+    舊的一袋抽籤裡有三筆假的 0.50h 持有，讓同一段歷史多跑出兩個循環，
+    而那兩個都是安靜的快速成交。拿掉之後：
+
+    | | 修 D057 之前 | 修 D057 之後 |
+    |---|---|---|
+    | 長等待／快速成交 | 5／10 | **4／9** |
+    | 命中 | 5/5 | **4/4** |
+    | 誤報 | **0/10** | **1/9** |
+
+    **門檻不敏感這一半仍然成立**（1.5× 到 4× 完全同一組結果），
+    但「零誤報」要改成「一次誤報」——**而那一次在每個門檻上都發生**，
+    所以它不是門檻挑錯，是訊號本身就會在那一段亮燈。
+
+    ⚠ **D054 的下半場（拿它降價賠 1.97pp）不受影響**，那才是它的結論。
+    這裡動到的是「偵測得多好」，不是「該不該用」。
+    """
 
     @staticmethod
     def _cycles():
@@ -338,23 +368,33 @@ class TestD054訊號偵測得很好:
                 return hour
         return None
 
-    def test_五段長等待全部發話零誤報(self):
+    def test_四段長等待全部發話而快速成交誤報一次(self):
+        """**改名了，因為它釘的事實變了**（見類別 docstring）。
+
+        留著「誤報一次」而不是把它放寬成「誤報 ≤ 1」：**釘子要釘住現況，
+        不是釘住一個容忍區間**——變成 2 次的時候要有人被吵醒。
+        """
         cycles = self._cycles()
         長 = [c for c in cycles if c.wait_hours >= 6]
         短 = [c for c in cycles if c.wait_hours < 6]
-        assert len(長) == 5 and len(短) == 10
+        assert len(長) == 4 and len(短) == 9
         assert all(self._fires(c, 3.0) is not None for c in 長)
-        assert all(self._fires(c, 3.0) is None for c in 短)
+        assert sum(1 for c in 短 if self._fires(c, 3.0) is not None) == 1
 
     def test_門檻不敏感(self):
         """🔴 **這一條是它與 `target_queue_usd` 的差別**：
-        1.5× 到 4× 都是 5/5 命中、0/10 誤報，**不是挑出來的一個點**。"""
+        1.5× 到 4× 都是 4/4 命中、1/9 誤報，**不是挑出來的一個點**。
+
+        **誤報那一次在五個門檻上完全一致**——所以它不是門檻挑錯，
+        是訊號本身就會在那一段亮燈（見類別 docstring）。
+        """
         cycles = self._cycles()
         長 = [c for c in cycles if c.wait_hours >= 6]
         短 = [c for c in cycles if c.wait_hours < 6]
         for threshold in (1.5, 2.0, 2.5, 3.0, 4.0):
             assert all(self._fires(c, threshold) is not None for c in 長), threshold
-            assert all(self._fires(c, threshold) is None for c in 短), threshold
+            誤報 = sum(1 for c in 短 if self._fires(c, threshold) is not None)
+            assert 誤報 == 1, (threshold, 誤報)
 
     def test_比候選價位快得多(self):
         """對照組：候選價位在 5 段長等待裡**只有 1 段發話，而且在第 30 小時**。"""

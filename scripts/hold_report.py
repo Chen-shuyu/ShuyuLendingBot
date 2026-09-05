@@ -71,12 +71,54 @@ def _hours(value: Optional[float]) -> str:
     return f"{value:.2f}h" if value is not None else "—"
 
 
-def format_report(summary: hold_time.HoldSummary, currency: str) -> str:
+def _screen_lines(screen: Optional[hold_time.PositionScreen]) -> List[str]:
+    """把「這份統計是從幾筆裡篩出來的」印在數字旁邊（D057／D063）。
+
+    **兩種重複分開講**，因為處置方式不同：幽靈樣本已經被排除，
+    拆單只是被標記出來——後者仍然留在統計裡，讀的人要自己判斷。
+    """
+    if screen is None:
+        return []
+    lines: List[str] = []
+    if screen.ghosts:
+        lines.append(
+            f"🔴 已排除 {len(screen.ghosts)} 筆 kind='loan' 的幽靈樣本（D057）："
+            f"它們與 credit 是**同一筆錢的兩個狀態**，一起算等於把同一筆生意數兩次。"
+            f"（原始列沒有刪，只是不列入統計。）"
+        )
+    if screen.split_groups:
+        merged = sum(len(group) - 1 for group in screen.split_groups)
+        lines.append(
+            f"⚠ 另有 {len(screen.split_groups)} 組共 "
+            f"{sum(len(group) for group in screen.split_groups)} 筆疑似**同一張掛單被拆開**"
+            f"（同利率、同天期、同時結清，開倉相隔 ≤ "
+            f"{screen.split_window_seconds:.0f} 秒）——**仍然列入統計**，"
+            f"但獨立放貸段數其實只有 {screen.episodes} 段（少 {merged} 段）。"
+        )
+        for group in screen.split_groups:
+            ids = "／".join(str(item.get("position_id")) for item in group)
+            lines.append(f"    · {ids}")
+        lines.append(
+            "    🔴 **刻意不合併**：`funding_positions` 沒有記來源 offer_id，"
+            "而「拆單」與「三張各自成交的同價單」在資料上分不開。"
+            "上一次靠「同利率、時間接近」合併，靜默吃掉了三個校準樣本（D045）。"
+        )
+    return lines
+
+
+def format_report(
+    summary: hold_time.HoldSummary,
+    currency: str,
+    screen: Optional[hold_time.PositionScreen] = None,
+) -> str:
     """把摘要排成給人讀的報告。
 
     版面刻意讓三個誠實度來源（右設限、偵測延遲、近似起算時間）跟數字並排，
     而不是收進腳註——量測值旁邊沒有誤差來源，下一個讀到它的人就會把它
     當成精確值（D040）。
+
+    `screen` 是第四個誠實度來源（D057／D063）：**這份統計是從幾筆裡篩出來的**。
+    篩選本身可以是對的，但**沒有印出來的篩選會讓下一個人以為他看到的是全部**。
     """
     lines: List[str] = []
     lines.append(f"=== {currency} 實際持有時間報告 ===")
@@ -98,6 +140,7 @@ def format_report(summary: hold_time.HoldSummary, currency: str) -> str:
             f"⚠ 其中 {summary.approximate_opened} 筆沒有交易所端的 opened_at，"
             f"改用「第一次看到它」的時間起算，是高估後的近似值。"
         )
+    lines.extend(_screen_lines(screen))
     lines.append("")
 
     lines.append("--- 逐筆 ---")
@@ -259,11 +302,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     positions = load_positions(db_path, args.currency)
+    # 🔴 **先篩再統計**（D057）。篩掉的東西跟著 `screen` 一起走到報告裡，
+    # 不是被 SQL 悄悄濾掉——理由寫在 `hold_time.PositionScreen` 的 docstring。
+    screen = hold_time.screen_positions(positions)
     summary = hold_time.summarize(
-        positions,
+        screen.kept,
         detection_lag_hours=interval_seconds / 3600,
     )
-    print(format_report(summary, args.currency))
+    print(format_report(summary, args.currency, screen=screen))
     return 0
 
 

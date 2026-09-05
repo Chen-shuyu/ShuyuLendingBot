@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings  # noqa: E402
+from core import hold_time  # noqa: E402
 from core import wait_time  # noqa: E402
 
 DEFAULT_DB_PATH = "data/lending.sqlite3"
@@ -235,12 +236,18 @@ def _realized_section(summary: wait_time.WaitSummary) -> List[str]:
     return lines
 
 
-def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
+def format_report(
+    summary: wait_time.WaitSummary,
+    currency: str,
+    screen: Optional[hold_time.PositionScreen] = None,
+) -> str:
     """把摘要排成給人讀的報告。
 
     版面刻意讓四個誠實度來源（右設限、偵測延遲、配對是推的、預估值可能沒有）
     跟數字並排，而不是收進腳註——量測值旁邊沒有誤差來源，下一個讀到它的人
     就會把它當成精確值（D040 的教訓，D045 沿用）。
+
+    `screen` 是第五個：**這些掛單是拿哪一批部位去配對的**（D057）。
     """
     lines: List[str] = []
     lines.append(f"=== {currency} 等待時間校準報告 ===")
@@ -259,6 +266,12 @@ def format_report(summary: wait_time.WaitSummary, currency: str) -> str:
         lines.append(
             f"  （由 {summary.total + summary.merged_offers} 列掛單合併而成——"
             f"連續、同利率、中間沒成交過的重掛算同一段，理由見 core/wait_time.py）"
+        )
+    if screen is not None and screen.ghosts:
+        lines.append(
+            f"🔴 配對用的部位已排除 {len(screen.ghosts)} 筆 kind='loan' 的幽靈樣本（D057）："
+            f"它們與 credit 同利率、`opened_at` 也幾乎相同，但**結清時間不同**"
+            f"——配到哪一筆是撞運氣的，而配到 loan 那筆算出來的持有時間是錯的。"
         )
     if summary.simultaneous:
         lines.append(
@@ -380,13 +393,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     offers, positions, forecasts = load_data(db_path, args.currency, args.since)
+    # 🔴 **配對前先篩掉幽靈樣本**（D057）。`build_spells()` 取「開倉時間最早的
+    # 那一筆」，而 loan 與 credit 的 `opened_at` 常常一模一樣——配到哪一筆
+    # 取決於 SQLite 回列的順序，**而兩者的 `closed_at` 差了 11 小時**。
+    screen = hold_time.screen_positions(positions)
     summary = wait_time.summarize(
         offers,
-        positions,
+        screen.kept,
         forecasts=forecasts,
         detection_lag_hours=interval_seconds / 3600,
     )
-    print(format_report(summary, args.currency))
+    print(format_report(summary, args.currency, screen=screen))
     return 0
 
 

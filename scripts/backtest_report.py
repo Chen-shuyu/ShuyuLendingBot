@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import settings  # noqa: E402
 from core import backtest  # noqa: E402
 from core import fill_simulation  # noqa: E402
+from core import hold_time  # noqa: E402
 from core import wait_time  # noqa: E402
 from db.repository import resolve_db_path  # noqa: E402
 from strategies.expected_value import ExpectedValueStrategy  # noqa: E402
@@ -225,9 +226,13 @@ def load_wait_spells(db_path: Path, currency: str, interval_seconds: int):
         }
     finally:
         connection.close()
+    # 🔴 **先篩掉 D057 的幽靈樣本再配對**，與 `wait_report.py` 同一支函式。
+    # `build_spells()` 取「開倉時間最早的那一筆」，而 `loan` 與 `credit` 的
+    # `opened_at` 常常一模一樣——配到 loan 那筆，算出來的持有時間會少 11 小時。
+    screened = hold_time.screen_positions(positions)
     return wait_time.summarize(
         offers,
-        positions,
+        screened.kept,
         forecasts=forecasts,
         detection_lag_hours=interval_seconds / 3600,
     ).spells

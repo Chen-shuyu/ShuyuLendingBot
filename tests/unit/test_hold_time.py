@@ -31,6 +31,7 @@ def position(
     opened_at="2026-08-21T22:31:00+08:00",
     closed_at=None,
     first_seen_at="2026-08-21T22:33:56+08:00",
+    kind="credit",
 ):
     """一列 `funding_positions`，欄位形狀照 DB 實際存的樣子。"""
     return {
@@ -39,11 +40,129 @@ def position(
         "amount": amount,
         "rate": rate,
         "period": period,
-        "kind": "credit",
+        "kind": kind,
         "opened_at": opened_at,
         "first_seen_at": first_seen_at,
         "closed_at": closed_at,
     }
+
+
+# --- 篩選：幽靈樣本與拆單（D057／D063）-------------------------------------
+#
+# 資料照 2026-08-28 02:07 那一組真實紀錄的形狀：一張 344.87 USD 的單被拆成
+# 150.00／134.10／60.77 三筆 credit（`opened_at` 相隔 14 秒、**同時結清**），
+# 而交易所同時記了三筆同利率的 loan——**六列，其實是一次放貸**。
+
+
+def _split_group():
+    """三筆 credit（拆單）＋ 三筆 loan（幽靈），全部同利率同天期。"""
+    rate = 0.00024959
+    rows = []
+    for pid, amount, opened in (
+        ("464670446", 150.00, "2026-08-28T02:07:35+08:00"),
+        ("464670447", 134.10, "2026-08-28T02:07:46+08:00"),
+        ("464670448", 60.77, "2026-08-28T02:07:49+08:00"),
+    ):
+        rows.append(
+            position(
+                position_id=pid,
+                rate=rate,
+                amount=amount,
+                opened_at=opened,
+                closed_at="2026-08-28T13:44:39+08:00",
+                first_seen_at=opened,
+            )
+        )
+    for pid, amount, opened in (
+        ("61007698", 150.00, "2026-08-28T02:07:35+08:00"),
+        ("61007703", 134.10, "2026-08-28T02:07:46+08:00"),
+        ("61007704", 60.77, "2026-08-28T02:07:49+08:00"),
+    ):
+        rows.append(
+            position(
+                position_id=pid,
+                rate=rate,
+                amount=amount,
+                opened_at=opened,
+                # 🔴 **loan 的 closed_at 比 credit 早了 11 小時**——這就是為什麼
+                # 「配到哪一筆」不是無所謂的：它會讓持有時間從 11.62h 變成 0.50h。
+                closed_at="2026-08-28T02:37:51+08:00",
+                first_seen_at=opened,
+                kind="loan",
+            )
+        )
+    return rows
+
+
+def test_kind_是_loan_的列被排除但原樣回傳():
+    screen = hold_time.screen_positions(_split_group())
+    assert len(screen.kept) == 3
+    assert len(screen.ghosts) == 3
+    # **被篩掉的列要拿得回來**：靜靜地少算幾筆，就是 D026 那個家族的病。
+    assert {row["position_id"] for row in screen.ghosts} == {
+        "61007698",
+        "61007703",
+        "61007704",
+    }
+
+
+def test_排除幽靈樣本會讓持有時間回到正確的那一個():
+    """🔴 這一條釘的是 D057 的實際傷害，不是「有沒有濾掉」。
+
+    幽靈樣本在正式資料裡的持有時間是 0.50h，真實的是 11.62h——**差 23 倍**，
+    而兩者的 `opened_at` 一模一樣，所以配對到哪一筆是撞運氣的。
+    """
+    screen = hold_time.screen_positions(_split_group())
+    summary = hold_time.summarize(screen.kept, now=NOW)
+    assert summary.settled == 3
+    assert all(11.6 < hours < 11.7 for hours in summary.settled_hours)
+
+
+def test_拆單被標記出來但仍然留在統計裡():
+    """**只標記不合併**：上一次靠「同利率、時間接近」合併，
+    靜默吃掉了三個校準樣本（D045）。"""
+    screen = hold_time.screen_positions(_split_group())
+    assert len(screen.split_groups) == 1
+    assert len(screen.split_groups[0]) == 3
+    # 統計照 3 筆算……
+    assert len(screen.kept) == 3
+    # ……但獨立段數是 1，而報告要把這件事印出來。
+    assert screen.episodes == 1
+
+
+def test_結清時間不同就不算同一張單的拆單():
+    """同利率、開倉只差幾秒，**但分開結清**——那是兩次各自成交的單，不是拆單。
+
+    這一條是 D045 那個合併 bug 的反向釘子：**分不出來的時候要偏向不合併。**
+    """
+    rows = [row for row in _split_group() if row["kind"] == "credit"]
+    rows[2] = dict(rows[2], closed_at="2026-08-28T20:00:00+08:00")
+    screen = hold_time.screen_positions(rows)
+    assert len(screen.split_groups) == 1
+    assert len(screen.split_groups[0]) == 2
+    assert screen.episodes == 2
+
+
+def test_開倉相隔超過視窗就不算拆單():
+    rows = [row for row in _split_group() if row["kind"] == "credit"]
+    rows[1] = dict(rows[1], opened_at="2026-08-28T02:20:00+08:00")
+    screen = hold_time.screen_positions(rows, split_window_seconds=60.0)
+    assert screen.split_groups == []
+    assert screen.episodes == 3
+
+
+def test_kind_是_None_的舊列一律留著():
+    """不確定它是什麼，就不要替它決定——**排除是有代價的操作**。"""
+    rows = [position(position_id="1", kind=None), position(position_id="2", kind="")]
+    screen = hold_time.screen_positions(rows)
+    assert len(screen.kept) == 2
+    assert screen.ghosts == []
+
+
+def test_空清單不會爆炸也不會憑空生出組():
+    screen = hold_time.screen_positions([])
+    assert screen.kept == [] and screen.ghosts == [] and screen.split_groups == []
+    assert screen.episodes == 0
 
 
 # --- 算得對不對 -----------------------------------------------------------

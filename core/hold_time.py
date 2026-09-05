@@ -45,6 +45,13 @@ DEFAULT_MATURED_THRESHOLD = 0.9
 # 這個動作本身」的直接應用。
 MIN_SAMPLES_FOR_QUANTILE = 3
 
+# 同一張掛單被交易所拆成多筆部位時，各筆的 `opened_at` 會差幾秒到幾十秒。
+# 超過這個秒數就不再當成同一次放貸。**這是一條人為的線**，所以它會被印出來。
+#
+# 實測（2026-08-28）：一張 344.87 USD 的單被拆成 150.00／134.10／60.77 三筆，
+# `opened_at` 分別是 02:07:35／02:07:46／02:07:49（相隔 14 秒），**同時結清**。
+DEFAULT_SPLIT_WINDOW_SECONDS = 300.0
+
 
 @dataclass(frozen=True)
 class HoldRecord:
@@ -164,6 +171,127 @@ def parse_moment(moment: Optional[str]) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo else None
+
+
+@dataclass(frozen=True)
+class PositionScreen:
+    """篩過的部位，**以及被篩掉的是什麼**——兩者一起回傳。
+
+    ## 為什麼篩選要有回傳值，不能只是少幾列
+
+    `funding_positions` 同時記著**同一筆錢的兩個狀態**：`credit`（我們借出去的
+    這一側）與 `loan`（交易所配對出去的那一側）。兩者的 `amount`／`rate`／
+    `opened_at` 幾乎相同，於是把它們一起丟進統計，等於把同一筆生意數兩次
+    ——這就是 **D057**：17 筆其實是 14 筆，平均持有 16.93h → 20.45h。
+
+    篩掉它們很容易，**難的是不要靜靜地篩掉**。D026 那個家族的病不是「沒講」，
+    是「講了一個不完整的樣本卻不說它不完整」。所以這裡回傳的不只是 `kept`，
+    還有被排除的那些列本身，好讓報告能把它們印出來。
+
+    ## `kind='loan'` 的列不刪、也不在 SQL 裡濾
+
+    - **不刪**：它記錄真實發生過的狀態轉換，而且 B6 還缺 `funding_loans`
+      的真實回應校正。**刪資料不是修法。**
+    - **不在 `Repository.all_positions()` 裡濾**：那支的 docstring 已寫明
+      「刻意不在 SQL 裡過濾，否則上層永遠不會發現自己只看到一部分」。
+      在那裡加條件，正好犯它自己警告的錯。
+    """
+
+    kept: List[Dict[str, Any]]
+    ghosts: List[Dict[str, Any]]
+    split_groups: List[List[Dict[str, Any]]]
+    split_window_seconds: float
+
+    @property
+    def episodes(self) -> int:
+        """獨立放貸段數：`kept` 的筆數，但拆單只算一段。
+
+        ⚠ **這個數字只用來報告，不用來加權統計**——理由見 `screen_positions()`。
+        """
+        merged = sum(len(group) - 1 for group in self.split_groups)
+        return len(self.kept) - merged
+
+
+def screen_positions(
+    positions: List[Dict[str, Any]],
+    split_window_seconds: float = DEFAULT_SPLIT_WINDOW_SECONDS,
+) -> PositionScreen:
+    """篩掉 `kind='loan'` 的幽靈樣本（D057），並**標記**出被拆單的那幾組。
+
+    ## 兩種重複，只處理其中一種
+
+    | | 是什麼 | 這裡怎麼做 |
+    |---|---|---|
+    | `loan`／`credit` | **同一筆錢的兩個狀態** | **排除**（D057，已確認） |
+    | 拆單 | 一張掛單被交易所配對成多筆部位 | **只標記，不合併** |
+
+    ## 🔴 為什麼拆單只標記不合併
+
+    **因為上一次做這種合併，它靜默吃掉了樣本。** `wait_report` 實作時
+    （D045）把「三張各自成交過的 9.50%」併成一段，五個校準樣本剩兩個
+    ——而那次也是拿「同利率、時間接近」當依據的。
+
+    拆單與「三張各自成交的同價單」在資料上長得幾乎一樣，**分不開**：
+    真正的差別在「它們是不是同一張掛單配對出來的」，而 `funding_positions`
+    **沒有記下來源的 `offer_id`**。在那個欄位補上之前，任何合併規則都是猜的。
+
+    所以這裡的選擇是：**把猜的部分交給讀報告的人**。統計照 17 筆算，
+    旁邊印一行「其中 3 筆疑似同一張單的拆單，獨立段數約 15」。
+    **少算幾筆是隱形的，多印一行不是。**
+    """
+    kept: List[Dict[str, Any]] = []
+    ghosts: List[Dict[str, Any]] = []
+    for position in positions:
+        # `kind` 是 None 的舊列一律留著：不確定它是什麼，就不要替它決定。
+        if str(position.get("kind") or "").lower() == "loan":
+            ghosts.append(position)
+        else:
+            kept.append(position)
+
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+
+    def flush() -> None:
+        if len(current) > 1:
+            groups.append(list(current))
+
+    for position in kept:
+        opened = parse_moment(position.get("opened_at")) or parse_moment(
+            position.get("first_seen_at")
+        )
+        if opened is None:
+            flush()
+            current.clear()
+            continue
+        if current:
+            previous = current[-1]
+            previous_opened = parse_moment(previous.get("opened_at")) or parse_moment(
+                previous.get("first_seen_at")
+            )
+            same_terms = (
+                previous.get("rate") == position.get("rate")
+                and previous.get("period") == position.get("period")
+                # 同時結清是拆單最強的訊號：分開成交的單不會剛好一起被還。
+                and previous.get("closed_at") == position.get("closed_at")
+            )
+            within = (
+                previous_opened is not None
+                and abs((opened - previous_opened).total_seconds())
+                <= split_window_seconds
+            )
+            if same_terms and within:
+                current.append(position)
+                continue
+        flush()
+        current = [position]
+    flush()
+
+    return PositionScreen(
+        kept=kept,
+        ghosts=ghosts,
+        split_groups=groups,
+        split_window_seconds=split_window_seconds,
+    )
 
 
 def build_record(

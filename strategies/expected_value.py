@@ -240,6 +240,21 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # **第四個「本輪的狀態」，一樣只在同一處重置**（見上面那段的理由）。
         self.last_highs: List[float] = []
 
+        # **本輪真的被選中的那一列**（不是實質年化最高的那一列）。
+        #
+        # 🔴 **這個成員存在的理由是一個真的發生過的缺陷。** D061 加上高原容差之後，
+        # 選中的不再必然是 `max(effective)` 的那一個，而
+        # `describe_decision()`／`chosen_forecast()`／`pricing_decision()`
+        # **三處各自用 `max(...)` 重算了一次「誰被選中」**。於是機器人掛 8.9279%，
+        # 而日誌、`offer_wait_forecasts`、`pricing_decisions` 三處**一致地**說 8.76%
+        # ——三個都錯成同一個值，看起來完全正常。
+        #
+        # **修法不是把三處各改一次**（那正是這個 bug 的成因），
+        # 是讓「誰被選中」**只有一個來源**：`choose_rate()` 寫，其他人讀。
+        #
+        # **第五個「本輪的狀態」，一樣只在同一處重置。**
+        self.last_chosen: Optional[Dict[str, float]] = None
+
 
     # ------------------------------------------------------------------
     # 小工具
@@ -265,10 +280,14 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         每一輪都印出位元組完全相同的一行，而鄰行寫著「可用餘額 0.01 USD
         低於下限 150.00 USD」。修正見 D041。
         """
-        if not self.last_evaluation:
+        # 🔴 **守門條件是 `last_chosen`，不是 `last_evaluation`。**
+        # 兩者不等價：評估過一輪但沒有選出價位（例如整組候選的實質年化都是 0）
+        # 時，前者是空的、後者不是。**「評估過」不等於「選出來了」**，
+        # 而報告端要講的是後者。
+        if self.last_chosen is None:
             return None
 
-        chosen = max(self.last_evaluation, key=lambda item: item["effective"])
+        chosen = self.last_chosen
         # 拿「最快成交的那個候選」當對照組：它就是舊策略會選的那一類價位，
         # 兩者並列才看得出這一輪的取捨到底換到了什麼。
         fastest = min(self.last_evaluation, key=lambda item: item["wait_hours"])
@@ -302,9 +321,10 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         ——落 DB 這條路今天沒被汙染純屬呼叫順序的巧合（只在掛單成功後才呼叫，
         而那條路必定剛評估過），不是設計上的保證。
         """
-        if not self.last_evaluation:
+        # 守門條件是 `last_chosen`，理由同 `describe_decision()`。
+        if self.last_chosen is None:
             return None
-        chosen = max(self.last_evaluation, key=lambda item: item["effective"])
+        chosen = self.last_chosen
         return {
             "rate": chosen["rate"],
             "mean_hours": chosen["wait_hours"],
@@ -331,10 +351,14 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         110 個候選的完整評估是 17 KB，這兩排是 2.6 KB，而
         **`effective` 就是排序依據——留下它才答得出「為什麼是這個價位」**。
         """
-        if not self.last_evaluation:
+        # 🔴 **守門條件是 `last_chosen`，不是 `last_evaluation`。**
+        # 兩者不等價：評估過一輪但沒有選出價位（例如整組候選的實質年化都是 0）
+        # 時，前者是空的、後者不是。**「評估過」不等於「選出來了」**，
+        # 而報告端要講的是後者。
+        if self.last_chosen is None:
             return None
 
-        chosen = max(self.last_evaluation, key=lambda item: item["effective"])
+        chosen = self.last_chosen
         fastest = min(self.last_evaluation, key=lambda item: item["wait_hours"])
         # 排序過才存：事後要比對兩輪的候選集差在哪一個價位，靠的是這個順序。
         # 不排序的話「111 → 110 少了誰」得先自己排一次，而那正是 D3 的問題。
@@ -435,6 +459,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         self.last_evaluation = []
         self.last_window = {}
         self.last_highs = []
+        self.last_chosen = None
         if len(candles) < self.ev_min_candles:
             return None
 
@@ -489,7 +514,13 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
                 }
             )
 
-        return self._pick_from_plateau(self.last_evaluation)
+        chosen_rate = self._pick_from_plateau(self.last_evaluation)
+        # **唯一的來源。** 三個報告端一律讀這裡，不再各自 `max(...)` 重算。
+        self.last_chosen = next(
+            (item for item in self.last_evaluation if item["rate"] == chosen_rate),
+            None,
+        )
+        return chosen_rate
 
     def _pick_from_plateau(
         self, evaluation: List[Dict[str, float]]
@@ -607,6 +638,7 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         self.last_evaluation = []
         self.last_window = {}
         self.last_highs = []
+        self.last_chosen = None
 
         if balance_usd < self.min_required_usd:
             return self._skip(

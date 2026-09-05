@@ -45,6 +45,7 @@ Bitfinex 每天約 **09:30 CST** 結一次放貸利息，所以按 CST 的日曆
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 from utils import clock
@@ -128,6 +129,63 @@ def daily_earnings(
             )
         )
     return result
+
+
+# Bitfinex 對放貸利息抽的成數。**這個常數只用在對帳，不參與任何定價決策**
+# ——它是利息上的一個常數乘數，所以不改變 `r × P ÷ (W + P)` 的極大點。
+#
+# 值是**量出來的，不是查來的**：2026-09-05 把 `funding_positions` 逐日攤成
+# 推算毛利息，與帳本淨利息相比，合計比值 **81.2%**（D060）。
+# 15% 的抽成對應 85%，兩者的差距落在「利息是結算日入帳、不是權責日」造成的
+# 邊界效應裡。**所以它是一條參考線，不是一個該被拿去精算的係數。**
+FUNDING_FEE_PCT = 15.0
+
+
+def expected_gross_interest(
+    positions: Iterable[Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> float:
+    """從已借出部位推算「照合約應該產生多少毛利息」（D065）。
+
+    **它是對帳用的參考線，不是收益數字。** 帳本才是錢（D051），
+    這一支的用途是回答「帳本少的那些，是抽成，還是真的少了一天」。
+
+    仍在生息中的部位以**現在**為止計算——那是下界，
+    而下界拿來跟「已經入帳的利息」比，方向是保守的。
+
+    ⚠ **它有三個已知的偏差來源**，全部指向同一個方向（推算值偏高）：
+    複利沒有算進去、`closed_at` 是巡檢偵測到的時間（每筆高估最多一個巡檢間隔）、
+    以及**利息是結算日入帳**，所以日對日一定對不齊。**只有多日合計有意義。**
+    """
+    now = now or clock.now()
+    total = 0.0
+    for position in positions:
+        opened = parse_moment(position.get("opened_at")) or parse_moment(
+            position.get("first_seen_at")
+        )
+        if opened is None:
+            continue
+        closed = parse_moment(position.get("closed_at")) or now
+        hours = (closed - opened).total_seconds() / 3600
+        if hours <= 0:
+            continue
+        amount = float(position.get("amount") or 0.0)
+        rate = float(position.get("rate") or 0.0)
+        total += amount * rate * hours / 24
+    return total
+
+
+def parse_moment(moment: Optional[str]) -> Optional[datetime]:
+    """ISO 8601 字串轉 `datetime`；轉不動回 `None`。
+
+    **與 `core/hold_time.py` 那一支同樣的約定**：轉不動就缺席，不要猜。
+    """
+    if not moment:
+        return None
+    try:
+        return datetime.fromisoformat(moment)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

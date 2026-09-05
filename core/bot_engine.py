@@ -135,6 +135,12 @@ class BotEngine:
         # `existing` 每輪都從交易所抓回來，真相一直在手上，只是沒有人去用它。
         self._offers_live = None
 
+        # **已部署資金**：錢包餘額 ＋ 場上掛單 ＋ 借出中的部位（D065）。
+        # 三項都是**這一輪向交易所問到的觀測值**，不是推論。
+        # `None` 代表「還沒觀測過」——啟動後第一輪之前就是這個狀態。
+        self._position_usd = None
+        self._deployed_capital_usd = None
+
     def run_once(self) -> None:
         """執行一輪巡檢：對帳部位、查市場、決定要不要重掛、掛單、落帳、送出通知。
 
@@ -148,6 +154,10 @@ class BotEngine:
         existing = self.client.get_active_offers("USD")
 
         balance_usd = self.client.get_available_balance("USD")
+        # **三個數字到齊就記下來**，放在 FRR 檢查之前（D065）。
+        # 底下有六條提早 return 的路，而**資金總額跟那六條路一個都無關**
+        # ——放在任何一條之後，正式環境幾乎每一輪都會跳過它（D052 踩過同一個坑）。
+        self._observe_deployed_capital(balance_usd, existing)
         frr = self.client.get_frr("USD")
         self.logger.info(f"目前可用 USD 餘額：{balance_usd}")
         self.logger.info(f"目前 FRR：{frr}")
@@ -370,6 +380,10 @@ class BotEngine:
         的事件（TASKS.md P2-4 的額度分配）。
         """
         positions = self.client.get_active_positions("USD")
+        # 借出中的本金總額，給 `_observe_deployed_capital()` 用（D065）。
+        # **在這裡取是因為這一行已經跟交易所要過這份資料了**——為了同一個數字
+        # 再打一次 API，是替報表向定價路徑借風險。
+        self._position_usd = sum(float(item.get("amount") or 0.0) for item in positions)
         changes = self.repository.sync_positions("USD", positions)
 
         opened = changes["opened"]
@@ -1126,6 +1140,46 @@ class BotEngine:
         """
         self._offers_live = bool(existing)
 
+    def _observe_deployed_capital(self, balance_usd, existing) -> None:
+        """記下這一刻**總共有多少錢在這門生意裡**（D065）。
+
+        ## 為什麼要有它
+
+        `earnings_daily.principal_avg` 從 2026-09-01 起全是 NULL，於是
+        「實得年化」——**這個專案唯一一條不靠推論的績效數字**（D051）——
+        只能靠人在命令列手打一個本金，而那個數字還會漂（344.31 → 345.29）。
+
+        ## 🔴 它推翻了 `_maybe_sync_earnings()` 原本寫的一句話
+
+        那支的註解寫著「**本金不填。** 帳本只看得到餘額，而餘額含已賺到的利息、
+        也含還掛在場上沒借出去的錢——猜一個就變成推論」。
+
+        **那句話對「本金」是對的，但實得年化的分母不是本金。**
+        它是**已部署資金**：錢包餘額 ＋ 場上掛單 ＋ 借出中的部位。
+
+        - **含已賺到的利息是對的**：複利滾進去的錢一樣在工作，
+          不把它算進分母，年化就會被高估。
+        - **含還掛在場上沒借出去的錢更是對的**：**空窗正是我們要懲罰的東西**
+          （D034 那條算式的整個重點）。把閒置的錢從分母拿掉，
+          等於把「借不出去」這件事變成免費的。
+
+        **三項都是這一輪向交易所問到的觀測值，不是推論。**
+
+        ⚠ **它是「這一刻」的觀測，不是當天的平均。** 巡檢 600 秒一輪，
+        寫進去的是當天最後一次觀測到的值。實測這個數字一天約漂 0.05%
+        （20 天從 344.31 到 345.29），所以差異遠在帳本本身的雜訊之下
+        ——**但欄位名叫 `principal_avg`，而它裝的不是平均**，這一點要知道。
+        """
+        try:
+            offers = sum(float(item.get("amount") or 0.0) for item in (existing or []))
+            self._deployed_capital_usd = (
+                float(balance_usd or 0.0) + offers + float(self._position_usd or 0.0)
+            )
+        except (TypeError, ValueError):
+            # 算不出來就留 `None`，**不要塞一個 0 進去**：0 會讓實得年化變成
+            # 除以零或無限大，而 `None` 只是讓那一天沒有分母。
+            self._deployed_capital_usd = None
+
     def _maybe_sync_earnings(self) -> None:
         """每隔一段時間把交易所帳本的利息同步進 `earnings_daily`（D052）。
 
@@ -1156,14 +1210,19 @@ class BotEngine:
         try:
             entries = self.client.get_funding_ledger("USD")
             summary = earnings.summarize(entries, currency="USD")
+            today = now.date().isoformat()
             for day in summary.days:
+                # 🔴 **只有今天那一列填得了資金總額**（D065）。
+                # 帳本一次會給出二十幾天，而「已部署資金」是**這一刻的觀測**
+                # ——把今天的數字寫進上個月那一列，就從觀測變成了推論。
+                # 其餘日子維持 NULL：**沒有分母，好過一個編出來的分母。**
                 self.repository.set_daily_earning(
                     date=day.date,
                     currency=day.currency,
                     interest=day.interest,
-                    # **本金不填。** 帳本只看得到餘額，而餘額含已賺到的利息、
-                    # 也含還掛在場上沒借出去的錢——猜一個就變成推論（D051）。
-                    principal_avg=None,
+                    principal_avg=(
+                        self._deployed_capital_usd if day.date == today else None
+                    ),
                 )
             self.logger.info(
                 f"帳本同步完成：{summary.total_rows} 列裡有 {summary.interest_rows} 列利息，"

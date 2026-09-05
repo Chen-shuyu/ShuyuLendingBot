@@ -2265,6 +2265,99 @@ class TestRepostComparisonLands:
         assert row["live_queue_truncated"] == 0, "0.00050 那一檔在上面，沒有越界"
 
 
+class TestD065已部署資金要被觀測下來:
+    """`earnings_daily.principal_avg` 從 2026-09-01 起全是 NULL，於是
+    「實得年化」——**這個專案唯一一條不靠推論的績效數字**——
+    只能靠人在命令列手打一個會漂的本金。
+
+    🔴 **這一組同時釘住那個數字的定義**：分母是**已部署資金**
+    （錢包 ＋ 場上掛單 ＋ 借出中的部位），不是「本金」。
+    **空窗正是我們要懲罰的東西**，把閒置的錢從分母拿掉等於讓「借不出去」變免費。
+    """
+
+    @staticmethod
+    def _engine(fake_logger, fake_notifier, strategy, repository, **kwargs):
+        client = FakeClient(balance=600.0, frr=0.0002)
+        return (
+            make_engine(fake_logger, fake_notifier, strategy, client, repository, **kwargs),
+            client,
+        )
+
+    def test_三項加總才是分母(self, fake_logger, fake_notifier, strategy, repository):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        engine._position_usd = 200.0
+        engine._observe_deployed_capital(
+            100.0, [{"amount": 50.0}, {"amount": 25.0}]
+        )
+        assert engine._deployed_capital_usd == pytest.approx(375.0)
+
+    def test_沒有掛單也沒有部位時就是餘額(self, fake_logger, fake_notifier, strategy, repository):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        engine._position_usd = None
+        engine._observe_deployed_capital(344.31, [])
+        assert engine._deployed_capital_usd == pytest.approx(344.31)
+
+    def test_算不出來時留None而不是塞零(self, fake_logger, fake_notifier, strategy, repository):
+        """🔴 **0 會讓實得年化變成除以零或無限大**，`None` 只是讓那一天沒有分母。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        engine._position_usd = None
+        engine._observe_deployed_capital(100.0, [{"amount": "壞掉的值"}])
+        assert engine._deployed_capital_usd is None
+
+    def test_跑過一輪之後觀測得到(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**觀測點在六條提早 return 的路之前**——放在任何一條之後，
+        正式環境幾乎每一輪都會跳過它（D052 踩過同一個坑）。"""
+        client = FakeClient(balance=600.0, frr=0.0002)
+        engine = make_engine(
+            fake_logger, fake_notifier, strategy, client, repository
+        )
+        try:
+            engine.run_once()
+        except Exception:
+            pass
+        assert engine._deployed_capital_usd is not None
+        assert engine._deployed_capital_usd >= 600.0
+
+    def test_只有今天那一列填得了資金總額(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """🔴 **帳本一次會給出二十幾天，而「已部署資金」是這一刻的觀測。**
+
+        把今天的數字寫進上個月那一列，就從觀測變成了推論。
+        **沒有分母，好過一個編出來的分母。**
+        """
+        from utils import clock
+
+        engine, client = self._engine(
+            fake_logger, fake_notifier, strategy, repository, earnings_sync_hours=1
+        )
+        engine._deployed_capital_usd = 345.29
+        today = clock.now().date().isoformat()
+        當天毫秒 = int(clock.now().timestamp() * 1000)
+        前天毫秒 = 當天毫秒 - 2 * 86400 * 1000
+        client.get_funding_ledger = lambda *a, **k: [
+            {
+                "id": "1", "currency": "USD", "wallet": "funding",
+                "mts": 前天毫秒, "amount": 0.08, "balance": 345.0,
+                "description": "Margin Funding Payment on wallet funding",
+            },
+            {
+                "id": "2", "currency": "USD", "wallet": "funding",
+                "mts": 當天毫秒, "amount": 0.07, "balance": 345.29,
+                "description": "Margin Funding Payment on wallet funding",
+            },
+        ]
+        engine._maybe_sync_earnings()
+
+        rows = {
+            row["date"]: row["principal_avg"]
+            for row in repository.connection.execute(
+                "SELECT date, principal_avg FROM earnings_daily"
+            )
+        }
+        assert rows[today] == pytest.approx(345.29)
+        其他 = [value for date, value in rows.items() if date != today]
+        assert 其他 and all(value is None for value in 其他), rows
+
+
 class Test帳本同步絕對不能影響巡檢:
     """D052。**這一族是這批改動唯一真正的風險所在。**
 

@@ -790,7 +790,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--hold-model",
         default="empirical",
-        help="實際持有時間怎麼給：empirical（實測分佈，預設）或 fixed:<小時>",
+        help=(
+            "實際持有時間怎麼給：empirical（實測分佈，預設，**假設 P 與 r 無關**）"
+            "／rate_dependent（便宜組與昂貴組分開抽，D062）／fixed:<小時>"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -944,7 +947,16 @@ def _build_hold_model(spec: str):
     if spec == "empirical":
         return (
             fill_simulation.empirical_hold(),
-            f"實測分佈（{len(fill_simulation.OBSERVED_HOLD_HOURS)} 筆）",
+            f"實測分佈（{len(fill_simulation.OBSERVED_HOLD_HOURS)} 筆，**假設 P 與 r 無關**）",
+        )
+    if spec == "rate_dependent":
+        pivot = fill_simulation.DEFAULT_HOLD_PIVOT_RATE
+        cheap = sum(1 for rate, _ in fill_simulation.OBSERVED_HOLD_SAMPLES if rate < pivot)
+        pricey = len(fill_simulation.OBSERVED_HOLD_SAMPLES) - cheap
+        return (
+            fill_simulation.rate_dependent_hold(),
+            f"隨利率而不同（便宜組 {cheap} 筆／昂貴組 {pricey} 筆，"
+            f"分界年化 {pivot * 365 * 100:.2f}%，D062）",
         )
     if spec.startswith("fixed:"):
         try:
@@ -952,7 +964,10 @@ def _build_hold_model(spec: str):
         except ValueError:
             raise ValueError(f"看不懂的 --hold-model：{spec}（格式是 fixed:<小時>）")
         return fill_simulation.fixed_hold(hours), f"固定 {hours:g}h"
-    raise ValueError(f"看不懂的 --hold-model：{spec}（可用 empirical 或 fixed:<小時>）")
+    raise ValueError(
+        f"看不懂的 --hold-model：{spec}"
+        "（可用 empirical／rate_dependent／fixed:<小時>）"
+    )
 
 
 if __name__ == "__main__":

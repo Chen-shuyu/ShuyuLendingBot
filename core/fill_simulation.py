@@ -49,7 +49,7 @@
 
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from core import backtest
 
@@ -150,6 +150,41 @@ OBSERVED_HOLD_HOURS = (
     11.62, 11.61, 11.61, 25.84, 1.98, 48.33, 48.19, 1.43,
 )
 
+# 同一批樣本，**帶著它們當初的掛單利率**（日利率，與 `HoldModel` 收到的單位一致）。
+#
+# 🔴 **為什麼要多一份帶利率的**：`OBSERVED_HOLD_HOURS` 把利率丟掉了，
+# 於是任何用它的模擬都**內建了「持有時間與利率無關」這個假設**——
+# 而那正是 D058／D062 要檢驗的那件事。**用一袋丟掉利率的抽籤去檢驗
+# 「持有是不是利率的函式」，是用結論證明結論。**
+#
+# 年化對照（`日利率 × 365 × 100`）：
+#   5.47%→45.08h  8.76%→1.43h  8.93%→48.19h  9.00%→48.33h
+#   9.11%→48.39／48.26／1.28／11.62／11.61／11.61／25.84h
+#   9.12%→1.84h  9.50%→20.97／2.33／48.56h  9.96%→6.87h  10.95%→1.98h
+#
+# ⚠ **9.11% 那一個價位內部就從 1.28h 到 48.39h，差 38 倍。**
+# 組間的訊號比組內的變異小得多——這件事在下面的 `rate_dependent_hold()`
+# 裡會再講一次，因為它決定了那個函式能宣稱什麼。
+OBSERVED_HOLD_SAMPLES = (
+    (0.00024986, 1.84),
+    (0.00014986, 45.08),
+    (0.00027288, 6.87),
+    (0.00026027, 20.97),
+    (0.00026027, 2.33),
+    (0.00026027, 48.56),
+    (0.00024959, 48.39),
+    (0.00024959, 48.26),
+    (0.00024959, 1.28),
+    (0.00024959, 11.62),
+    (0.00024959, 11.61),
+    (0.00024959, 11.61),
+    (0.00024959, 25.84),
+    (0.00030000, 1.98),
+    (0.00024657, 48.33),
+    (0.00024466, 48.19),
+    (0.00024000, 1.43),
+)
+
 # `HoldModel` 拿到「掛出的利率」與「這是第幾次循環」，回答「這一筆會借多久」。
 #
 # 🔴 **簽章必須是無狀態的，這一點是踩到之後才寫下來的。**
@@ -194,6 +229,75 @@ def empirical_hold(
 
     def model(rate: float, cycle_index: int) -> float:
         return ordered[cycle_index % len(ordered)]
+
+    return model
+
+
+# 🔴 **切開便宜組與昂貴組的分界線。**
+#
+# **不能用利率中位數**，而這件事是量出來的：17 筆樣本的利率中位數是年化 9.11%，
+# **而其中 7 筆剛好就等於 9.11%**（同一批資金被連續重掛出去的那一段）。
+# 以中位數切，那 7 筆會整團落進同一側，變成 4 筆對 13 筆——
+# **`hold_time.RateSplit.degenerate` 早就在講這件事**（「中位數同時是眾數」）。
+#
+# 這裡改切在 **9.12% 與 9.50% 之間**：它是候選價位分佈裡一道真的空隙，
+# 而不是一個被樣本堆疊出來的點。切出來是 12 筆對 5 筆。
+DEFAULT_HOLD_PIVOT_RATE = 0.00025500  # 年化 9.31%
+
+
+def rate_dependent_hold(
+    samples: Sequence[Tuple[float, float]] = OBSERVED_HOLD_SAMPLES,
+    pivot_rate: float = DEFAULT_HOLD_PIVOT_RATE,
+) -> HoldModel:
+    """持有時間**隨掛單利率而不同**：便宜的抽便宜組，貴的抽昂貴組（D058／D062）。
+
+    ## 它換掉的是 `empirical_hold()` 的哪一個假設
+
+    `empirical_hold()` 的 docstring 自己寫著「⚠ 它假設 `P` 與 `r` 無關……
+    **真正的修法是換掉這個函式，不是調它的參數**」。**這就是那個函式。**
+
+    量到的方向（2026-09-05，17 筆已結束部位）：`rho(利率, 持有) = −0.383`。
+    機制也說得通：融資是可替換的商品，借款人拿到便宜的錢就抱著，
+    拿到貴的錢一有更便宜的就換掉。**貴的單被提前還款是市場在做它該做的事。**
+
+    ## 🔴 它**不**宣稱自己找到了一條曲線
+
+    | | 便宜組（< 9.31%） | 昂貴組（≥ 9.31%） |
+    |---|---|---|
+    | 筆數 | 12 | **5** |
+    | 中位持有 | 18.73h | 6.87h |
+    | 平均持有 | 25.29h | 16.14h |
+
+    **組內的變異比組間的差距大得多**：光是 9.11% 那一個價位，內部就從
+    1.28h 到 48.39h，**差 38 倍**。所以這個函式做的是**分佈的位移**，
+    不是「利率 r 對應持有 P(r)」——**兩組各自仍然是一袋很散的抽籤**。
+
+    ⚠ **昂貴組只有 5 筆**，而且其中一筆是 9.50% 借滿 48.56h。
+    **拿它去下結論會踩到 D058 已經警告過的那個坑**（分組前要先數相異值）。
+    它現在的用途是**讓「該不該漲價」這個問題第一次算得出來**，不是回答它。
+
+    ## 依序循環，理由同 `empirical_hold()`
+
+    **可重跑**：否則「這次比較好」永遠分不清是模型還是亂數種子。
+    `cycle_index` 在兩組之間**共用**（不各自計數），這樣同一個起跑點
+    換掉 `pivot_rate` 之後，抽到的序列仍然可以逐項對照。
+
+    某一組是空的就退回整袋——**空組要出聲**（`ValueError`）才對，
+    但那會讓一個掃描到極端 `pivot_rate` 的報告整支掛掉，
+    所以這裡選擇退回並在 docstring 講明。**退回的那一刻，它就退化成
+    `empirical_hold()`**，也就是它本來要換掉的那個假設。
+    """
+    if not samples:
+        raise ValueError("沒有持有時間樣本")
+    cheap = [hours for rate, hours in samples if rate < pivot_rate]
+    pricey = [hours for rate, hours in samples if rate >= pivot_rate]
+    everything = [hours for _, hours in samples]
+
+    def model(rate: float, cycle_index: int) -> float:
+        group = cheap if rate < pivot_rate else pricey
+        if not group:
+            group = everything
+        return group[cycle_index % len(group)]
 
     return model
 

@@ -111,6 +111,98 @@ class Test持有模型必須無狀態:
             fs.empirical_hold([])
 
 
+class TestD062持有時間隨利率而不同:
+    """`empirical_hold()` 的 docstring 自己寫著「⚠ 它假設 `P` 與 `r` 無關……
+    **真正的修法是換掉這個函式**」。`rate_dependent_hold()` 就是那個函式。
+
+    ⚠ **這一組釘的是「它有沒有照說的做」，不是「它是對的」。**
+    昂貴組只有 5 筆，而 9.11% 那一個價位內部就差 38 倍——**組內的變異
+    比組間的差距大得多**，所以這個函式做的是分佈的位移，不是一條曲線。
+    """
+
+    SAMPLES = (
+        (0.00024, 48.0),   # 便宜：借滿
+        (0.00024, 24.0),   # 便宜
+        (0.00030, 2.0),    # 昂貴：秒還
+        (0.00030, 6.0),    # 昂貴
+    )
+    PIVOT = 0.000255
+
+    def test_便宜的抽便宜組貴的抽昂貴組(self):
+        model = fs.rate_dependent_hold(self.SAMPLES, self.PIVOT)
+        assert [model(0.00024, i) for i in range(3)] == [48.0, 24.0, 48.0]
+        assert [model(0.00030, i) for i in range(3)] == [2.0, 6.0, 2.0]
+
+    def test_分界線上那一筆算昂貴組(self):
+        """`>=` 而不是 `>`：**邊界要有一個明確的歸屬**，而且要寫成測試，
+        否則下一個人只能去讀實作才知道。"""
+        model = fs.rate_dependent_hold(self.SAMPLES, self.PIVOT)
+        assert model(self.PIVOT, 0) == 2.0
+
+    def test_仍然是無狀態的(self):
+        """理由同 `empirical_hold()`：**可重跑**，否則分不清是模型還是亂數。"""
+        model = fs.rate_dependent_hold(self.SAMPLES, self.PIVOT)
+        assert model(0.00024, 5) == model(0.00024, 5)
+        assert model(0.00024, 0) == model(0.00024, 4)
+
+    def test_索引在兩組之間共用(self):
+        """🔴 **刻意不各自計數。** 共用之後，換掉 `pivot_rate` 再跑一次，
+        抽到的序列仍然可以逐項對照——各自計數就對不起來了。"""
+        model = fs.rate_dependent_hold(self.SAMPLES, self.PIVOT)
+        assert model(0.00024, 1) == 24.0
+        assert model(0.00030, 1) == 6.0
+
+    def test_某一組空了就退回整袋而且那等於退化成empirical(self):
+        """**退回的那一刻，它就退化成它本來要換掉的那個假設。**"""
+        model = fs.rate_dependent_hold(self.SAMPLES, pivot_rate=0.0)
+        整袋 = [hours for _, hours in self.SAMPLES]
+        assert [model(0.00024, i) for i in range(4)] == 整袋
+        assert [model(0.00030, i) for i in range(4)] == 整袋
+
+    def test_空樣本直接拒絕(self):
+        with pytest.raises(ValueError):
+            fs.rate_dependent_hold([])
+
+    def test_正式樣本切出來的兩組方向與假說一致(self):
+        """D058 的方向：**越便宜借越久**。這一條釘的是資料本身，不是實作。
+
+        ⚠ 它只驗方向。**強度不足以下結論**——昂貴組 5 筆，
+        而其中一筆是 9.50% 借滿 48.56h。
+        """
+        import statistics
+
+        pivot = fs.DEFAULT_HOLD_PIVOT_RATE
+        cheap = [h for r, h in fs.OBSERVED_HOLD_SAMPLES if r < pivot]
+        pricey = [h for r, h in fs.OBSERVED_HOLD_SAMPLES if r >= pivot]
+        assert len(cheap) == 12 and len(pricey) == 5
+        assert statistics.median(cheap) > statistics.median(pricey)
+        assert statistics.fmean(cheap) > statistics.fmean(pricey)
+
+    def test_分界線不可以是利率中位數(self):
+        """🔴 **這一條擋的是一個看起來最自然的錯誤選擇。**
+
+        17 筆的利率中位數是年化 9.11%，**而其中 7 筆剛好等於 9.11%**
+        ——以中位數切，那 7 筆整團落進同一側，變成 4 筆對 13 筆。
+        `hold_time.RateSplit.degenerate` 講的就是這件事。
+        """
+        import statistics
+
+        rates = [r for r, _ in fs.OBSERVED_HOLD_SAMPLES]
+        median_rate = statistics.median(rates)
+        assert rates.count(median_rate) == 7, "樣本變了，這一條的前提要重看"
+        assert fs.DEFAULT_HOLD_PIVOT_RATE != median_rate
+
+    def test_兩份樣本講的是同一批部位(self):
+        """`OBSERVED_HOLD_HOURS` 與 `OBSERVED_HOLD_SAMPLES` 必須同步。
+
+        **兩份會漂**——而漂掉的後果是「換個模型結論就不同」，
+        看起來像發現，其實是兩份資料不一樣。
+        """
+        assert sorted(fs.OBSERVED_HOLD_HOURS) == sorted(
+            hours for _, hours in fs.OBSERVED_HOLD_SAMPLES
+        )
+
+
 class _策略:
     """最小的假策略：永遠選同一個價位。
 

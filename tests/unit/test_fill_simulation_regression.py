@@ -584,3 +584,65 @@ class TestD055任何往下走的機制不是都賠錢:
         **兩條完全獨立的路徑指向同一個量級**——這是這次最強的一組證據。"""
         assert self._shifted(-10) > self._shifted(-30)
         assert self._shifted(-10) > self._shifted(0)
+
+
+class TestD062換掉裁判之後結論沒有翻:
+    """🔴 **這一組釘的是一個「否定」的結果，而否定的結果一樣會漂。**
+
+    D062 說回測不能當裁判，因為 `empirical_hold()` 假設 `P ⊥ r`，
+    而漲價正好是 `P(r)` 會影響的那件事——**用一個假設 `P ⊥ r` 的模擬器
+    去檢驗「`P` 是不是 `r` 的函式」，是用結論證明結論**。
+
+    修好之後兩個裁判並排跑，**結論沒有翻**：兩邊都指向同一個方向、
+    最佳的假設 `P` 也是同一個。**這一組把那件事釘住**，
+    因為將來換樣本、換分界線時它可能就翻了，而那時候要有人被吵醒。
+    """
+
+    @staticmethod
+    def _run(hold_model, assumed):
+        return run(history(), assumed, hold_model=hold_model)
+
+    @pytest.mark.parametrize("assumed", [12.0, 16.93])
+    def test_兩個裁判都說假設48比較差(self, assumed):
+        for model in (fs.empirical_hold(), fs.rate_dependent_hold()):
+            寬鬆 = self._run(model, 48.0).realized_annual_pct
+            嚴格 = self._run(model, assumed).realized_annual_pct
+            assert 嚴格 > 寬鬆, (model, assumed)
+
+    def test_兩個裁判的差距小於它們與48的差距(self):
+        """**換裁判動的量，比它要回答的那個問題小一個量級。**
+
+        這一條講的是「為什麼結論沒翻」：不是兩個裁判剛好同分，
+        是它們的分歧遠小於 `P=12` 與 `P=48` 之間的差距。
+
+        🔴 **一定要跨起跑點**（D054 的硬規矩）。這一條第一次寫成單一起跑點時
+        量到「換裁判 0.24pp、換假設 0.36pp」——**看起來兩者同一個量級**，
+        而跨 22 個起跑點平均掉之後是 **0.03pp 對 1.84pp**。
+        **單一起跑點的相位運氣就足以讓這個結論反過來。**
+        """
+        import statistics
+
+        candles = history()
+        starts = list(range(168, len(candles) - 48, 8))
+        assert len(starts) >= 20, "起跑點太少，這一條會被相位運氣主導"
+
+        def mean_for(model, assumed):
+            outcomes = fs.run_policy_across_starts(
+                lambda: ExpectedValueStrategy(CONFIG),
+                candles,
+                starts,
+                hold_model=model,
+                assumed_hold_hours=assumed,
+            )
+            return statistics.fmean(
+                o.realized_annual_pct
+                for o in outcomes
+                if o.realized_annual_pct is not None
+            )
+
+        emp12 = mean_for(fs.empirical_hold(), 12.0)
+        rdh12 = mean_for(fs.rate_dependent_hold(), 12.0)
+        emp48 = mean_for(fs.empirical_hold(), 48.0)
+        換裁判 = abs(rdh12 - emp12)
+        換假設 = abs(emp12 - emp48)
+        assert 換裁判 < 換假設 / 3, (換裁判, 換假設)

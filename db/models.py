@@ -263,7 +263,8 @@ CREATE TABLE IF NOT EXISTS pricing_decisions (
     window_hours              INTEGER,
     hold_hours_assumed        REAL,
     candle_count              INTEGER,
-    candle_latest_mts         INTEGER
+    candle_latest_mts         INTEGER,
+    pricing_knobs_json        TEXT
 );
 """
 
@@ -379,6 +380,20 @@ CREATE TABLE IF NOT EXISTS bot_kv (
     updated_at TEXT
 );
 """
+
+# 既有資料庫要補的欄位。**只加欄位，不改也不刪**（見 `Repository._ensure_columns()`）。
+#
+# 🔴 **為什麼需要這個東西**：2026-09-05 查出 `--verify` 在 D056 改設定的當下
+# 就靜默失效了——40 列裡 34 列不一致，因為重播用**現在的**設定去重跑當初的決策。
+# D043 存 `hold_hours_assumed` 時已經寫過理由：「**當初的預估是不存就永遠消失的
+# 那一半**」。那句話當時只套用在一個旋鈕上，**而它對每一個會改變答案的旋鈕都成立**。
+#
+# `pricing_knobs_json` 是那句話的推廣：**存的是「當時那一輪，策略讀了哪些值」**，
+# 而不是某幾個被挑出來的欄位。這樣下一次加旋鈕不必再動 schema，
+# 也不會再出現「加了旋鈕、驗收工具隔天就開始說謊」。
+ADD_COLUMNS = (
+    ("pricing_decisions", "pricing_knobs_json", "TEXT"),
+)
 
 ALL_STATEMENTS = (
     CREATE_LOAN_OFFERS,

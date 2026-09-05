@@ -387,7 +387,37 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
             "hold_hours_assumed": self.assumed_hold_hours,
             "candle_count": self.last_window.get("candle_count"),
             "candle_latest_mts": self.last_window.get("candle_latest_mts"),
+            "pricing_knobs": self.pricing_knobs(),
         }
+
+    # 會改變 `choose_rate()` 答案的那些設定。**這份清單由策略自己維護**
+    # ——只有它知道自己讀了什麼，而讓別人去猜正是驗收工具失效的原因。
+    #
+    # 🔴 **加旋鈕的時候要一起加進來。** 漏掉的代價不是報錯，是
+    # `--verify` 從那天起開始說謊，而且要好幾天以後才會有人發現（見 D064）。
+    PRICING_KNOBS = (
+        "assumed_hold_hours",
+        "ev_plateau_tolerance_pct",
+        "ev_window_hours",
+        "ev_min_hits",
+        "ev_min_candles",
+        "candle_hours",
+        "rate_decimals",
+    )
+
+    def pricing_knobs(self) -> Dict[str, Any]:
+        """**這一輪的定價讀了哪些值。**
+
+        存下來的理由與 `hold_hours_assumed` 完全相同，而那個理由 D043 已經
+        寫過一次：「**當初的預估是不存就永遠消失的那一半**」。
+        那句話當時只被套用在一個旋鈕上，**而它對每一個會改變答案的旋鈕都成立**。
+
+        2026-09-05 的實例：`--verify` 在 D056 改設定的當下就靜默失效
+        （40 列裡 34 列不一致），因為重播拿**現在的**設定去重跑當初的決策，
+        而**沒有人發現，因為它報的是「不一致」不是「壞掉」**——
+        那兩者長得一模一樣（D064）。
+        """
+        return {name: getattr(self, name) for name in self.PRICING_KNOBS}
 
     # ------------------------------------------------------------------
     # 期望值計算

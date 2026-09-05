@@ -146,6 +146,48 @@ def assumed_hold_hours(strategy: Any, hours: Optional[float]) -> Iterator[None]:
         strategy.assumed_hold_hours = original
 
 
+@contextmanager
+def pricing_knobs(strategy: Any, knobs: Optional[Dict[str, Any]]) -> Iterator[None]:
+    """暫時把策略的定價旋鈕換成 `knobs` 記下的那一組，離開時全部還原。
+
+    **是 `assumed_hold_hours()` 的推廣**，理由也一樣：`choose_rate()` 讀的是
+    `self.<旋鈕>`，改屬性才跑得到正式環境跑的那條路徑（界線 1）。
+
+    🔴 **只認策略自己宣告的那份白名單**（`strategy.PRICING_KNOBS`）。
+    不在名單上的鍵**一律忽略並回報**，不是靜靜地 `setattr` 上去——
+    後者等於讓一列 DB 資料可以往策略身上掛任何屬性，
+    而那一列的內容是好幾週前寫的。
+
+    **一定要還原**——`finally` 不是防禦性寫法，是這個設計成立的前提。
+    """
+    if not knobs:
+        yield
+        return
+    allowed = set(getattr(strategy, "PRICING_KNOBS", ()) or ())
+    applied = {
+        name: value for name, value in knobs.items()
+        if name in allowed and hasattr(strategy, name)
+    }
+    original = {name: getattr(strategy, name) for name in applied}
+    for name, value in applied.items():
+        setattr(strategy, name, value)
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            setattr(strategy, name, value)
+
+
+def unknown_knobs(strategy: Any, knobs: Optional[Dict[str, Any]]) -> List[str]:
+    """`knobs` 裡有哪些鍵是這個策略認不得的。
+
+    **回傳它是為了讓報告印出來**：認不得的旋鈕代表「那一列是另一版程式碼寫的」，
+    而那正是「重播對不上」與「重播壞掉」的分界——**兩者長得一模一樣**（D064）。
+    """
+    allowed = set(getattr(strategy, "PRICING_KNOBS", ()) or ())
+    return sorted(set(knobs or {}) - allowed)
+
+
 def _evaluation_for(strategy: Any, rate: Optional[float]) -> Optional[Dict[str, Any]]:
     """從策略留下的候選集裡找出選中的那一列。
 

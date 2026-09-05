@@ -23,11 +23,12 @@
 """
 
 import argparse
+import json
 import sqlite3
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -127,14 +128,85 @@ def load_recorded_decisions(
         connection.close()
 
 
+def _recorded_knobs(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """讀出那一列記下的定價旋鈕；沒有記就回 `None`。
+
+    🔴 **`None` 是「那一列沒有記」，不是「當時全是預設值」。** 兩者的處置不同，
+    所以這裡不替上層決定——回報上去，由 `format_verification()` 印出來。
+
+    向前相容：`pricing_knobs_json` 是 2026-09-05 才加的欄位（D064），
+    在那之前的每一列都是 NULL。但 `hold_hours_assumed` 從 D043 起就一直有，
+    所以舊列仍然重播得動**那一個**旋鈕——只是其餘的補不回來。
+    """
+    raw = row.get("pricing_knobs_json")
+    if not raw:
+        return None
+    try:
+        knobs = json.loads(raw)
+    except (TypeError, ValueError):
+        # 壞掉的 JSON 與「沒有記」是兩件事，但對重播來說結果一樣：**補不回來**。
+        # 不吞掉的話一列壞資料會讓整份報告掛掉，而報告不該有那種脆弱度。
+        return None
+    return knobs if isinstance(knobs, dict) else None
+
+
+def _legacy_knobs(strategy: Any, row: Dict[str, Any]) -> Dict[str, Any]:
+    """`pricing_knobs_json` 是 NULL 的舊列，盡可能還原它當時的旋鈕。
+
+    **做法：從策略的類別預設出發，再用那一列記下的欄位覆蓋。**
+
+    🔴 **為什麼類別預設是對的起點，而不是今天的 `config.yaml`**：
+    這個專案的慣例是**新旋鈕的類別預設值＝那個旋鈕不存在時的行為**
+    （`assumed_hold_hours` 退回 `offer_period * 24`、`ev_plateau_tolerance_pct`
+    預設 0）。所以「用類別預設重播一列比旋鈕更早寫下的紀錄」，
+    正好還原了那一列當時走的那條路。
+
+    ⚠ **這是一句關於程式碼歷史的陳述，不是猜的**——但它**依賴那條慣例繼續成立**。
+    哪天有人加了一個「預設值就改變行為」的旋鈕，這裡就會開始說謊，
+    而**唯一擋得住的是那時候要一起加 `pricing_knobs_json`**（欄位已經在了，
+    只要記得填）。這是 D064 的整個重點。
+
+    覆蓋回來的兩欄（`hold_hours_assumed`／`window_hours`）從 D043 起就一直存在，
+    所以連比這個欄位更早的紀錄也還原得動**那兩個**。
+    """
+    try:
+        knobs = type(strategy)({}).pricing_knobs()
+    except Exception:
+        # 建不出一個空設定的策略就退回「只還原記得住的那兩個」。
+        # **不要因此讓整份報告掛掉**——報告不該有那種脆弱度。
+        knobs = {}
+    if row.get("hold_hours_assumed") is not None:
+        knobs["assumed_hold_hours"] = row["hold_hours_assumed"]
+    if row.get("window_hours") is not None:
+        knobs["ev_window_hours"] = row["window_hours"]
+    return knobs
+
+
 def format_verification(
-    result: backtest.ReplayResult, recorded: Dict[int, Dict[str, Any]]
+    result: backtest.ReplayResult,
+    recorded: Dict[int, Dict[str, Any]],
+    strategy: Any = None,
+    candles: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """把重播結果與正式環境的紀錄逐點對照。**這是工具的驗收，不是策略的驗收。**
 
     對不上有兩種可能，而**它們的意思完全相反**：重播寫錯了，或是 `market_candles`
     少存了幾根 K（機器人每輪向交易所抓 240 根，DB 只留寫進去的那些）。
     所以不合的那幾點要把兩邊的數字都印出來，不要只印一個「❌」。
+
+    ## 🔴 **每一列都用它自己記下的設定重播**（D064）
+
+    傳了 `strategy` 與 `candles` 就走這條路：**那一列當初用什麼旋鈕，就用什麼重播**。
+
+    **為什麼非這樣不可**：2026-08-30 D056 把 `assumed_hold_hours` 從 48 改成 12
+    的當下，這份驗收就失效了——40 列裡 34 列「不一致」，而那 34 列一列都沒錯，
+    只是拿**今天的設定**去重跑**當初的決策**。
+    **而它報的是「不一致」，跟「工具壞了」長得一模一樣**，所以六天沒有人發現。
+
+    ⚠ **補不回來的那些要講出來**，不要拿預設值填：舊列的
+    `pricing_knobs_json` 是 NULL（欄位 2026-09-05 才加），那些列只重播得動
+    `hold_hours_assumed` 一個旋鈕。**「用預設值補上」與「知道當時是什麼」
+    是兩件事**，而只有後者能拿來驗收。
     """
     lines = ["", "=== 驗收：重播 vs 正式環境真的做過的決策 ===", ""]
     if not recorded:
@@ -145,8 +217,15 @@ def format_verification(
         return "\n".join(lines)
 
     by_mts = {point.mts: point for point in result.points}
+    by_index = (
+        {candle.get("mts"): index for index, candle in enumerate(candles)}
+        if candles
+        else {}
+    )
     matched: List[str] = []
     mismatched: List[str] = []
+    partial = 0
+    unknown: set = set()
     missing = 0
     for mts, row in sorted(recorded.items()):
         point = by_mts.get(mts)
@@ -155,6 +234,17 @@ def format_verification(
             continue
         expected = row["chosen_rate"]
         actual = point.chosen_rate
+        knobs = _recorded_knobs(row)
+        if knobs is None:
+            partial += 1
+            knobs = _legacy_knobs(strategy, row)
+        else:
+            unknown.update(backtest.unknown_knobs(strategy, knobs))
+        if strategy is not None and mts in by_index:
+            with backtest.pricing_knobs(strategy, knobs):
+                actual = backtest.replay_at(
+                    strategy, candles, index=by_index[mts]
+                ).chosen_rate
         same = (expected is None and actual is None) or (
             expected is not None
             and actual is not None
@@ -163,7 +253,7 @@ def format_verification(
         label = (
             f"{point.at.strftime('%m-%d %H:%M')}  "
             f"正式 {_pct(None if expected is None else expected * 365 * 100)}"
-            f"  重播 {_pct(point.chosen_annual_pct)}"
+            f"  重播 {_pct(None if actual is None else actual * 365 * 100)}"
         )
         (matched if same else mismatched).append(label)
 
@@ -175,6 +265,25 @@ def format_verification(
     if total:
         lines.append(
             f"  **逐點一致 {len(matched)} 列、不一致 {len(mismatched)} 列**"
+        )
+    if strategy is not None and candles:
+        lines.append(
+            "  ✅ **每一列都用它自己記下的設定重播**（D064）"
+            "——不是拿今天的 `config.yaml` 去重跑當初的決策。"
+        )
+    if partial:
+        lines.append(
+            f"  ⚠ 其中 **{partial} 列沒有記下整組旋鈕**（`pricing_knobs_json` 是"
+            f" 2026-09-05 才加的欄位，D064）。那幾列用**類別預設 ＋ 那一列記下的"
+            f"`hold_hours_assumed`／`window_hours`** 還原"
+            f"——慣例上類別預設＝「那個旋鈕不存在時的行為」，所以還原得動；"
+            f"**但那是一句關於程式碼歷史的陳述，不是那一列自己說的**。"
+        )
+    if unknown:
+        lines.append(
+            f"  🔴 有 {len(unknown)} 個旋鈕是這一版策略認不得的："
+            f"{'／'.join(sorted(unknown))}。"
+            f"**那代表那些列是另一版程式碼寫的**，重播還原不了它們。"
         )
     if mismatched:
         lines.append("")
@@ -727,7 +836,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         recorded = load_recorded_decisions(
             db_path, args.currency, type(strategy).__name__
         )
-        print(format_verification(result, recorded))
+        print(format_verification(result, recorded, strategy=strategy, candles=candles))
 
     if args.sweep:
         rows = backtest.sweep_hold_hours(strategy, candles, DEFAULT_SWEEP_HOURS)

@@ -918,3 +918,114 @@ class TestD056假設與合約天期是兩件事:
         strategy = ExpectedValueStrategy(self._config(assumed_hold_hours=12))
         strategy.choose_rate(candles)
         assert strategy.pricing_decision()["hold_hours_assumed"] == 12.0
+
+
+class TestD061高原容差:
+    """實質年化曲線在高原上是平的，而原本的平手方向偏向便宜那一邊。
+
+    **正式資料的形狀**（2026-09-05，552 根真實 K）：
+
+        8.7600%  實質 = 7.695058824   <== 舊行為選中
+        8.9279%  實質 = 7.695017700
+
+    差 **4×10⁻⁵ 個百分點**，而同一份資料裡 `W` 的估計誤差是 **4～9 倍**。
+    下面用一段合成的 K 線重現同一個形狀——**合成而不是抄那 552 根**，
+    是因為這一條要釘的是「平手時往哪邊走」，不是那一天的數字。
+    """
+
+    @staticmethod
+    def _plateau_candles():
+        """造出一段 high 分佈，讓兩個相鄰價位的實質年化幾乎相同。
+
+        手法是讓高價位只比低價位多等一點點：`high` 大部分落在低價，
+        少數幾根探到高價，於是 `r × P ÷ (W + P)` 在兩者之間幾乎打平。
+        """
+        低 = daily(9.0)
+        高 = daily(9.2)
+        pattern = [低] * 11 + [高]
+        return [candle(i, h) for i, h in enumerate(pattern * 16)]
+
+    @staticmethod
+    def _config(tolerance):
+        return base_config(
+            assumed_hold_hours=12,
+            ev_min_hits=5,
+            ev_plateau_tolerance_pct=tolerance,
+        )
+
+    def test_容差為零時退回舊行為取最便宜的那一個(self):
+        """**退場鍵要真的能退回去。** 沒有辦法退回去的改動沒有辦法被比較。"""
+        strategy = ExpectedValueStrategy(self._config(0.0))
+        chosen = strategy.choose_rate(self._plateau_candles())
+        best = max(item["effective"] for item in strategy.last_evaluation)
+        同分 = [
+            item["rate"]
+            for item in strategy.last_evaluation
+            if item["effective"] == best
+        ]
+        assert chosen == min(同分)
+
+    def test_容差打開時在同分的那一群裡取最高價(self):
+        strategy = ExpectedValueStrategy(self._config(0.5))
+        chosen = strategy.choose_rate(self._plateau_candles())
+        寬鬆 = ExpectedValueStrategy(self._config(0.0)).choose_rate(
+            self._plateau_candles()
+        )
+        assert chosen is not None and 寬鬆 is not None
+        assert chosen >= 寬鬆, "容差打開只可能往上，不可能往下"
+
+    def test_容差越大選出的價位不會變便宜(self):
+        """單調性：高原只會變寬，不會換一群人。**這一條擋的是實作寫反。**"""
+        candles = self._plateau_candles()
+        picks = [
+            ExpectedValueStrategy(self._config(tol)).choose_rate(candles)
+            for tol in (0.0, 0.5, 1.0, 2.0, 5.0)
+        ]
+        assert all(pick is not None for pick in picks)
+        assert picks == sorted(picks)
+
+    def test_容差不會讓它跳出候選集(self):
+        """高原是從候選集裡切出來的，**不是憑空往上加一階**。"""
+        candles = self._plateau_candles()
+        strategy = ExpectedValueStrategy(self._config(5.0))
+        chosen = strategy.choose_rate(candles)
+        assert chosen in {item["rate"] for item in strategy.last_evaluation}
+
+    def test_全部候選的實質年化都是零時不挑最貴的(self):
+        """🔴 **這一條釘的是一個會靜默選到最貴價位的邊界。**
+
+        `effective` 恆非負，所以最佳值若是 0，「最佳值 ×(1 − 容差)」也是 0，
+        整個候選集都會被判定同分——然後挑出最貴的那一個。
+        **在一份全是 0 的評估上挑最貴的，是最壞的猜。**
+        """
+        strategy = ExpectedValueStrategy(self._config(0.5))
+        strategy.last_evaluation = []
+        assert (
+            strategy._pick_from_plateau(
+                [
+                    {"rate": daily(9.0), "effective": 0.0},
+                    {"rate": daily(20.0), "effective": 0.0},
+                ]
+            )
+            is None
+        )
+
+    def test_只有一個候選時容差不改變任何事(self):
+        strategy = ExpectedValueStrategy(self._config(2.0))
+        only = [{"rate": daily(9.11), "effective": 0.0002}]
+        assert strategy._pick_from_plateau(only) == daily(9.11)
+
+    def test_正式設定檔打開了這個旋鈕(self):
+        """🔴 **類別預設是 0，正式環境的值寫在 `config.yaml`。**
+
+        這一條釘的是「那個值真的有被載進去」——`assumed_hold_hours` 當初就是
+        因為預設值與設定檔各講一套，才需要 D056 把兩件事拆開。
+        """
+        from pathlib import Path
+
+        from config import settings
+
+        root = Path(__file__).resolve().parent.parent.parent
+        config = settings.load_config(str(root / "config.yaml"))
+        assert config["strategy"]["ev_plateau_tolerance_pct"] == 0.5
+        assert ExpectedValueStrategy(base_config()).ev_plateau_tolerance_pct == 0.0

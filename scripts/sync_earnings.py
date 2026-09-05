@@ -23,6 +23,7 @@
 """
 
 import argparse
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from api.bitfinex_client import BitfinexClient  # noqa: E402
 from config import settings  # noqa: E402
 from core import earnings  # noqa: E402
+from core import hold_time  # noqa: E402
 from db.repository import Repository, resolve_db_path  # noqa: E402
 from utils import clock  # noqa: E402
 
@@ -57,6 +59,73 @@ class _Logger:
 
     def error(self, message):
         print(f"  ❌ {message}", file=sys.stderr)
+
+
+def load_positions(db_path: Path, currency: str) -> List[Dict[str, Any]]:
+    """唯讀讀出部位，給毛／淨對帳用（D065）。**篩掉 D057 的幽靈樣本。**"""
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM funding_positions WHERE currency = ?", (currency,)
+            )
+        ]
+    finally:
+        connection.close()
+    return hold_time.screen_positions(rows).kept
+
+
+def format_reconciliation(
+    summary: earnings.LedgerSummary,
+    positions: List[Dict[str, Any]],
+    since: Optional[str],
+) -> List[str]:
+    """帳本淨利息 vs 從部位推算的毛利息，並排（D065）。
+
+    🔴 **為什麼要有這一段**：帳本是唯一的錨（D051），但**沒有任何東西在看它**。
+    2026-09-05 靠人眼發現 `earnings_daily` 在 08-16／08-20／08-21／08-31 缺列
+    ——而缺列與「那天真的沒賺」長得一模一樣。
+
+    這一段給的是**一條參考線**：抽成 15% 對應淨毛比 85%。
+    偏離太多就代表有一天沒入帳、或有一筆部位沒被記到。
+    **它不會自己判斷是哪一種**——判斷需要的資訊不在這兩個數字裡。
+    """
+    if not positions or not summary.days:
+        return []
+    gross = earnings.expected_gross_interest(positions)
+    if gross <= 0:
+        return []
+    ratio = summary.total_interest / gross * 100
+    expected = 100 - earnings.FUNDING_FEE_PCT
+    lines = ["", "--- 毛／淨對帳（帳本是錢，推算是參考線）---"]
+    lines.append(
+        f"  推算毛利息 {gross:.4f} USD ／ 帳本淨利息 {summary.total_interest:.4f} USD"
+        f" → **淨毛比 {ratio:.1f}%**（抽成 {earnings.FUNDING_FEE_PCT:.0f}% 對應 {expected:.0f}%）"
+    )
+    gap = ratio - expected
+    if abs(gap) <= 8:
+        lines.append("  ✅ 落在參考線附近——**沒有明顯缺列**。")
+    elif gap < 0:
+        lines.append(
+            f"  🔴 **比參考線低 {abs(gap):.1f} 個百分點。** 兩種可能而它們的意思完全相反："
+            "有幾天的利息沒有入帳（帳本缺列），或推算把某些部位算多了。"
+        )
+    else:
+        lines.append(
+            f"  ⚠ **比參考線高 {gap:.1f} 個百分點。** 多半是部位沒被記全"
+            "（推算的分母偏小），不是賺得比合約多。"
+        )
+    lines.append(
+        "  ⚠ **只有多日合計有意義**：利息是**結算日**入帳不是權責日，日對日必定對不齊。"
+        "推算值本身也偏高（沒算複利、`closed_at` 被巡檢延遲高估）。"
+    )
+    if not since:
+        lines.append(
+            "  ⚠ 沒給 `--since`，兩邊涵蓋的期間不一定相同——**這個比值會失真**。"
+        )
+    return lines
 
 
 def format_summary(
@@ -184,13 +253,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary = earnings.summarize(entries, currency=args.currency)
     print(format_summary(summary, args.principal, args.since))
 
+    configured = args.db or ((config.get("database") or {}).get("path"))
+    db_path = resolve_db_path(configured)
+
+    # 🔴 **對帳在 `--write` 的分岔之前**：它是唯讀的，而**只看不寫的那條路
+    # 才是最需要它的那條**——「先看一眼對不對」正是不寫的時候要做的事。
+    # 失敗一律吞掉：**報表不可以把「唯一那條會寫帳本的路」弄掉**（D052 的守則）。
+    if db_path.exists():
+        try:
+            reconciliation = format_reconciliation(
+                summary, load_positions(db_path, args.currency), args.since
+            )
+            if reconciliation:
+                print("\n".join(reconciliation))
+        except Exception as exc:  # noqa: BLE001 - 見上
+            print(f"\n（毛／淨對帳算不出來，略過：{exc}）")
+
     if not args.write:
         print("")
         print("  （只看不寫。要真的寫進 `earnings_daily` 請加 `--write`。）")
         return 0
 
-    configured = args.db or ((config.get("database") or {}).get("path"))
-    db_path = resolve_db_path(configured)
     if not db_path.exists():
         print(f"找不到資料庫：{db_path}", file=sys.stderr)
         return 1

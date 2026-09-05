@@ -261,3 +261,120 @@ class Test解析器對得上真實回應:
         rows = client._parse_ledger([壞列, REAL_LEDGER_ROWS[0]])
         assert len(rows) == 1
         assert rows[0]["id"] == "10525396780"
+
+
+class TestD065推算毛利息:
+    """帳本是錢（D051），這一支只是**對帳用的參考線**。
+
+    🔴 **它存在的理由是「沒有任何東西在看帳本」**：2026-09-05 靠人眼發現
+    `earnings_daily` 在 08-16／08-20／08-21／08-31 缺列，
+    **而缺列與「那天真的沒賺」長得一模一樣**。
+    """
+
+    @staticmethod
+    def _position(amount, annual_pct, hours, opened="2026-09-01T00:00:00+08:00"):
+        from datetime import datetime, timedelta
+
+        start = datetime.fromisoformat(opened)
+        return {
+            "amount": amount,
+            "rate": annual_pct / 365 / 100,
+            "opened_at": opened,
+            "closed_at": (start + timedelta(hours=hours)).isoformat(),
+        }
+
+    def test_一筆借滿兩天的部位算得出合約利息(self):
+        # 345 USD、年化 9%、借滿 48 小時 = 345 × 0.09 × 2/365
+        position = self._position(345.0, 9.0, 48.0)
+        assert earnings.expected_gross_interest([position]) == pytest.approx(
+            345.0 * 0.09 * 2 / 365, rel=1e-9
+        )
+
+    def test_仍在生息中的部位以現在為止計算(self):
+        """**下界**——而下界拿來跟已入帳的利息比，方向是保守的。"""
+        from datetime import datetime, timedelta, timezone
+
+        tz = timezone(timedelta(hours=8))
+        now = datetime(2026, 9, 2, 0, 0, 0, tzinfo=tz)
+        position = {
+            "amount": 345.0,
+            "rate": 9.0 / 365 / 100,
+            "opened_at": "2026-09-01T00:00:00+08:00",
+            "closed_at": None,
+        }
+        assert earnings.expected_gross_interest([position], now=now) == pytest.approx(
+            345.0 * 0.09 / 365, rel=1e-9
+        )
+
+    def test_起算時間壞掉的列缺席而不是算成零(self):
+        """與 `core/hold_time.py` 同一個約定：**算不出來就缺席，不要猜。**"""
+        壞掉 = {"amount": 345.0, "rate": 0.00024, "opened_at": None, "first_seen_at": None}
+        好的 = self._position(345.0, 9.0, 24.0)
+        單獨 = earnings.expected_gross_interest([好的])
+        assert earnings.expected_gross_interest([壞掉, 好的]) == pytest.approx(單獨)
+
+    def test_持有時間為負的列被排除(self):
+        壞掉 = {
+            "amount": 345.0,
+            "rate": 0.00024,
+            "opened_at": "2026-09-02T00:00:00+08:00",
+            "closed_at": "2026-09-01T00:00:00+08:00",
+        }
+        assert earnings.expected_gross_interest([壞掉]) == 0.0
+
+    def test_空清單回零而不是爆炸(self):
+        assert earnings.expected_gross_interest([]) == 0.0
+
+    def test_抽成常數是量出來的而不是查來的(self):
+        """🔴 **它只用在對帳，不參與任何定價決策**——利息上的常數乘數
+        不改變 `r × P ÷ (W + P)` 的極大點。"""
+        assert earnings.FUNDING_FEE_PCT == 15.0
+
+
+class TestD065對帳的判讀:
+    """**判讀那條參考線的方向，比那個數字本身重要。**"""
+
+    class _Summary:
+        def __init__(self, total, days=1):
+            self.total_interest = total
+            self.days = [object()] * days
+
+    @staticmethod
+    def _positions(gross_target):
+        """造一組部位，讓推算毛利息剛好是 `gross_target`。"""
+        return [
+            {
+                "amount": gross_target * 365 / 0.09 / 2,
+                "rate": 0.09 / 365,
+                "opened_at": "2026-09-01T00:00:00+08:00",
+                "closed_at": "2026-09-03T00:00:00+08:00",
+            }
+        ]
+
+    def _lines(self, net, gross):
+        from scripts.sync_earnings import format_reconciliation
+
+        return "\n".join(
+            format_reconciliation(
+                self._Summary(net), self._positions(gross), "2026-09-01"
+            )
+        )
+
+    def test_落在參考線附近時說沒有明顯缺列(self):
+        assert "沒有明顯缺列" in self._lines(0.85, 1.0)
+
+    def test_明顯偏低時要講出兩種相反的可能(self):
+        """🔴 **「缺了一天」與「推算算多了」的意思完全相反**，
+        而這兩個數字分不出是哪一種——所以**兩種都要講，不要挑一個**。"""
+        lines = self._lines(0.50, 1.0)
+        assert "沒有入帳" in lines and "算多了" in lines
+
+    def test_明顯偏高時指向部位沒記全而不是賺得比合約多(self):
+        assert "部位沒被記全" in self._lines(1.05, 1.0)
+
+    def test_沒有部位或沒有利息時整段不印(self):
+        """**算不出來就不要印一個看起來像數字的東西。**"""
+        from scripts.sync_earnings import format_reconciliation
+
+        assert format_reconciliation(self._Summary(1.0), [], "2026-09-01") == []
+        assert format_reconciliation(self._Summary(0.0, days=0), self._positions(1.0), None) == []

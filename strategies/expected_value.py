@@ -178,6 +178,43 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
             strategy_config.get("assumed_hold_hours", self.offer_period * 24.0)
         )
 
+        # **高原容差**（D061）：實質年化落在最佳值的這個比例以內的候選，
+        # 一律視為**同分**，然後在同分的那一群裡**取價格最高的那一個**。
+        #
+        # 🔴 **為什麼需要這個東西**：實質年化曲線在 8.3～9.0% 那一段是平的
+        # （`P=12` 之下全部落在 7.50～7.69），而 2026-09-05 正式資料的前兩名是
+        #
+        #     8.7600%  實質 = 7.695058824   <== 選中
+        #     8.9279%  實質 = 7.695017700
+        #
+        # **差 4×10⁻⁵ 個百分點，也就是第 6 位有效數字。**
+        # 同一份資料裡 `W` 的估計誤差是 **4～9 倍**（12 個樣本）——
+        # **拿一個誤差以「倍」計的量，去分辨第 6 位有效數字，是在對雜訊做決策。**
+        #
+        # 🔴 **而且原本的平手方向是錯的。** 候選是升冪掃描、比較是嚴格大於，
+        # 於是平手時保留先到的那個 = **最便宜的那個**。那不是誰寫錯了，
+        # 是「取最大值」的預設寫法**在高原上會有方向**，而沒有人挑過它的方向。
+        #
+        # **為什麼偏高**：高原內的目標函數差是雜訊，**但價差是真的**
+        # ——8.93% 比 8.76% 多 1.9% 的利息，而它落在同一片高原上。
+        #
+        # **為什麼不是隨機挑**：隨機會讓每輪的候選變動變成重掛，而重掛有空窗成本
+        # （D034）。取最高是**確定性的**，同一窗永遠給同一個答案。
+        #
+        # 🔴 **類別預設是 0，正式環境的 1.0 寫在 `config.yaml`。**
+        # 慣例與 `assumed_hold_hours` 相同（**沒設這個鍵的人行為完全不變**），
+        # 而這裡有一個額外的、更重要的理由：
+        #
+        # **回測的迴歸釘子釘的是「當時那個策略會選什麼」**（D049／D050／D054／D055
+        # 共 17 條）。把類別預設改成非零，等於讓那 17 條同時換值——
+        # 於是「D054 的結論還成不成立」與「新旋鈕好不好」變成同一個問題，
+        # **而那正是 D036 記下的那個病**：一次改兩件事，之後分不出是誰造成的。
+        #
+        # 設成 0 就完全退回舊行為（嚴格取最大、平手偏便宜）。
+        self.ev_plateau_tolerance_pct = float(
+            strategy_config.get("ev_plateau_tolerance_pct", 0.0)
+        )
+
         # **本輪** `choose_rate()` 的完整評估結果，供迴圈層寫日誌用。
         # **策略層仍然不碰 IO**：這裡只是把算過的東西留下來，不主動輸出。
         #
@@ -430,8 +467,6 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 當常數去最佳化 `r`，目標函數在定義上就是自我矛盾的**。
         # 要換掉的是 `HoldModel`，不是這個數字。
         hold_hours = self.assumed_hold_hours
-        best_rate: Optional[float] = None
-        best_effective = 0.0
 
         for rate in sorted({self._quantize(high) for high in highs}):
             if rate <= 0:
@@ -453,10 +488,39 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
                     "effective": effective,
                 }
             )
-            if effective > best_effective:
-                best_rate, best_effective = rate, effective
 
-        return best_rate
+        return self._pick_from_plateau(self.last_evaluation)
+
+    def _pick_from_plateau(
+        self, evaluation: List[Dict[str, float]]
+    ) -> Optional[float]:
+        """從評估結果裡挑一個價位：**同分的那一群裡取最高價**（D061）。
+
+        「同分」的定義是 `effective >= 最佳值 × (1 - 容差)`。
+        容差 0 時退回舊行為（嚴格取最大、平手偏便宜）——**而舊行為是可以被
+        重現的**，這一點是刻意的：沒有辦法退回去的改動，沒有辦法被比較。
+
+        ⚠ **最佳值必須是正的才切得出高原**：`effective` 恆非負，若最佳值是 0
+        則「最佳值 × (1 - 容差)」也是 0，整個候選集都會被判定同分，
+        然後挑出最貴的那一個——**在一份全是 0 的評估上挑最貴的，是最壞的猜**。
+        """
+        usable = [item for item in evaluation if item["effective"] > 0]
+        if not usable:
+            return None
+
+        best_effective = max(item["effective"] for item in usable)
+        if self.ev_plateau_tolerance_pct <= 0:
+            # 舊行為：升冪掃描 ＋ 嚴格大於 = 平手取最便宜。
+            # **這裡要明寫出來**，不能靠「剛好 max() 會這樣」——那正是
+            # 這個缺陷當初的長相：方向是實作的副作用，不是誰選的。
+            for item in usable:
+                if item["effective"] == best_effective:
+                    return item["rate"]
+            return None
+
+        floor = best_effective * (1.0 - self.ev_plateau_tolerance_pct / 100.0)
+        plateau = [item for item in usable if item["effective"] >= floor]
+        return max(item["rate"] for item in plateau)
 
     def evaluate_rate(self, rate: float) -> Optional[Dict[str, Any]]:
         """用**本輪那一窗**回答「掛在這個利率會是什麼結果」（M1-c，D046）。

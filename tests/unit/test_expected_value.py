@@ -1137,3 +1137,124 @@ class TestD061選中的是誰只能有一個來源:
         strategy.build_offer_plan(1.0, daily(9.0))
         assert strategy.last_chosen is None
         assert strategy.describe_decision() is None
+
+
+class TestD066W的兩個旋鈕:
+    """D045 第三則追記 ＋ D047。**預設值＝現行行為，行為零變化。**
+
+    🔴 **量出來的答案跟 D045 追記說的相反**：`median` 是**更準的預測值**
+    （12 個樣本每一個都比較準），**卻是更差的決策規則**（跨 114 個起跑點輸 1.0pp）。
+    理由寫在 `test_median比較準卻比較差` 的 docstring 裡。
+    """
+
+    @staticmethod
+    def _config(**overrides):
+        overrides.setdefault("ev_min_hits", 5)
+        return base_config(assumed_hold_hours=12, **overrides)
+
+    @staticmethod
+    def _candles():
+        """真正的陣發：**連中三根，然後乾旱一整段**。
+
+        🔴 **不能用規律的「每 10 根命中一次」**——那樣平均與中位數會完全相等
+        （實測兩者都是 5.0h），於是這一組測試看起來會過，卻什麼都沒釘到。
+        **平均與中位數只有在不規律的分佈上才分得開**，而這正是 D038 的主題。
+        """
+        低, 高 = daily(6.0), daily(9.5)
+        一輪 = [高, 高, 高] + [低] * 37  # 連中三根 ＋ 37 根乾旱
+        return [candle(i, h) for i, h in enumerate(一輪 * 5)]
+
+    def test_預設是mean加window_tail等於現行行為(self):
+        strategy = ExpectedValueStrategy(base_config())
+        assert strategy.ev_wait_statistic == "mean"
+        assert strategy.ev_censoring == "window_tail"
+
+    def test_換統計量會換掉算式吃的那個數字(self):
+        """🔴 **比對的是「選中那一列記下的等待」與「設定選的統計量」是否一致**，
+        不是「換了旋鈕選價就會變」。
+
+        兩者在多數窗上會選到同一個價位（高原很寬），
+        **拿「選價變了」當斷言，就是一條大部分時候會誤紅的測試。**
+        """
+        candles = self._candles()
+        highs = [c["high"] for c in candles]
+        for stat in ("mean", "median", "p75"):
+            strategy = ExpectedValueStrategy(self._config(ev_wait_statistic=stat))
+            chosen = strategy.choose_rate(candles)
+            assert chosen is not None
+            估 = strategy.estimate_wait(highs, chosen)
+            assert strategy.last_chosen["wait_hours"] == 估.statistic(stat)
+
+    def test_陣發分佈上三個統計量真的不一樣(self):
+        """**這一條是上一條的前提。** 三者相等的話，上一條就算實作寫錯也會過。"""
+        strategy = ExpectedValueStrategy(self._config())
+        highs = [c["high"] for c in self._candles()]
+        估 = strategy.estimate_wait(highs, daily(9.5))
+        assert 估.median_hours < 估.mean_hours < 估.p75_hours
+
+    def test_報出來的與算式用的是同一個數字(self):
+        """🔴 **PR #62 的教訓**：`wait_hours` 跟著選定的統計量走，
+        於是日誌、`pricing_decisions`、M1-c 的比較全部講同一個數字。"""
+        strategy = ExpectedValueStrategy(self._config(ev_wait_statistic="median"))
+        strategy.choose_rate(self._candles())
+        用出去的 = strategy.last_chosen["wait_hours"]
+        assert strategy.pricing_decision()["chosen_mean_hours"] == 用出去的
+        assert strategy.chosen_forecast()["mean_hours"] == 用出去的
+
+    def test_認不得的統計量直接拋而不是默默退回mean(self):
+        """🔴 **設定檔打錯一個字，後果會是「換了旋鈕但行為沒變」**
+        ——而那看起來跟「換了沒有用」一模一樣（D064 的同一個形狀）。"""
+        strategy = ExpectedValueStrategy(self._config(ev_wait_statistic="平均"))
+        with pytest.raises(ValueError, match="ev_wait_statistic"):
+            strategy.choose_rate(self._candles())
+
+    def test_三種設限記帳的方向(self):
+        """**三個都是錯的，只是錯的方向不同。**
+
+        🔴 **而「drop 必定最短」是錯的，這是寫這一條時才發現的。**
+        `window_tail` 把設限起點記成「等到窗尾」，而**設限起點必定落在窗的後段**
+        ——於是它們拿到的是 1 到 N 根這種**很短**的等待，把平均往下拉。
+        實測這一組資料：`drop` **46.41h** 對 `window_tail` **40.57h**，
+        **現行的記帳法比丟掉還低估。**
+
+        這是 D047「乾旱會讓等待估計自己變好看」的另一個面貌：
+        **越晚的起點、越沒等到，記下來的等待反而越短。**
+
+        唯一必然成立的是 `full_window ≥ window_tail`（`total ≥ total − start`）。
+        """
+        highs = [daily(6.0)] * 100 + [daily(9.5)] * 10 + [daily(6.0)] * 58
+        rate = daily(9.5)
+        估 = {}
+        for cens in ("drop", "window_tail", "full_window"):
+            strategy = ExpectedValueStrategy(self._config(ev_censoring=cens))
+            估[cens] = strategy.estimate_wait(highs, rate).mean_hours
+        assert 估["window_tail"] < 估["full_window"]
+        # 🔴 現行記帳法比「整批丟掉」還低估——這一條就是釘住那件事。
+        assert 估["window_tail"] < 估["drop"]
+
+    def test_設限比例三種記帳都一樣(self):
+        """**`censored` 數的是「有幾個起點沒等到」，那是事實，不是記帳選擇。**
+
+        三種記帳只改變那些起點被記成多長，不改變有幾個。
+        """
+        highs = [daily(6.0)] * 100 + [daily(9.5)] * 10 + [daily(6.0)] * 58
+        比例 = {
+            cens: ExpectedValueStrategy(self._config(ev_censoring=cens))
+            .estimate_wait(highs, daily(9.5))
+            .censored
+            for cens in ("drop", "window_tail", "full_window")
+        }
+        assert len(set(比例.values())) == 1
+
+    def test_drop把整窗丟光時回None而不是零(self):
+        """一次都沒命中又選 `drop`，就沒有估計值可給。
+        **給 0 會讓那個價位看起來是「秒成交」，也就是最好的候選。**"""
+        strategy = ExpectedValueStrategy(self._config(ev_censoring="drop", ev_min_hits=0))
+        assert strategy.estimate_wait([daily(6.0)] * 60, daily(20.0)) is None
+
+    def test_兩個旋鈕都在PRICING_KNOBS裡(self):
+        """🔴 **D064 的規矩：加旋鈕要一起加進白名單**，
+        漏掉的代價是 `--verify` 從那天起開始說謊。"""
+        knobs = ExpectedValueStrategy(base_config()).PRICING_KNOBS
+        assert "ev_wait_statistic" in knobs
+        assert "ev_censoring" in knobs

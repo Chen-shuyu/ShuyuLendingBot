@@ -121,6 +121,23 @@ class WaitEstimate:
         """
         return self.censored / self.samples if self.samples else 0.0
 
+    def statistic(self, name: str) -> float:
+        """算式裡的 `W` 要用哪一個統計量（`ev_wait_statistic`，D045 追記）。
+
+        🔴 **認不得的名字直接拋**，不要默默退回 `mean`：設定檔打錯一個字，
+        後果會是「換了旋鈕但行為沒變」，而那看起來跟「換了沒有用」一模一樣
+        ——**D064 的同一個形狀**。
+        """
+        if name == "mean":
+            return self.mean_hours
+        if name == "median":
+            return self.median_hours
+        if name == "p75":
+            return self.p75_hours
+        raise ValueError(
+            f"看不懂的 ev_wait_statistic：{name}（可用 mean／median／p75）"
+        )
+
 
 class ExpectedValueStrategy(OrderBookDepthStrategy):
     """以單位時間報酬期望值選擇掛單利率（見 DECISIONS.md D035）。
@@ -214,6 +231,41 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         self.ev_plateau_tolerance_pct = float(
             strategy_config.get("ev_plateau_tolerance_pct", 0.0)
         )
+
+        # **算式裡的 `W` 要用哪一個統計量**（D045 第三則追記）。
+        #
+        # 🔴 **理論上該用平均**：長期年化是更新報酬過程
+        # `E[利息] ÷ E[週期]`，而那兩個期望值要用平均，不是中位數。
+        # **但那條理論要求的是「無偏的平均」，而我們的平均是有偏的**
+        # ——右設限以「等到窗尾」計入（下界），乾旱期還會讓它自己變好看（D047）。
+        #
+        # **實測 12 個樣本，`median` 每一個都比較準**：
+        # `mean` 中位高估 **9.0 倍**、`median` 中位高估 **3.9 倍**。
+        # ⚠ **那 12 個樣本全部是成交的那半**（D047 追記：沒成交那半的偏誤方向會變），
+        # 所以「median 比較準」是在一個被選擇過的子樣本上量到的。
+        #
+        # **預設 `mean` ＝現行行為。** 換掉它是丙-1 的題目，而丙-1 必須與 `P` 一起調
+        # ——D056 的 12 有一部分在補 `W` 的偏差，單獨改 `W` 會拆掉抵銷的一半。
+        self.ev_wait_statistic = str(
+            strategy_config.get("ev_wait_statistic", "mean")
+        ).lower()
+
+        # **右設限（等到窗尾還沒等到的那些起點）怎麼記帳**（D047）。
+        #
+        # | 值 | 做法 | 偏誤方向 |
+        # |---|---|---|
+        # | `window_tail`（現行） | 記成「等到窗尾」 | **下界**，低估等待 |
+        # | `drop` | 整批丟掉 | **更嚴重的低估**——刪掉的正好是最長的那些 |
+        # | `full_window` | 記成「一整個窗」 | 上界，高估等待 |
+        #
+        # 🔴 **三個都是錯的，只是錯的方向不同。** 真正的答案要用存活分析
+        # （Kaplan-Meier／RMST），而那一支有兩條它自己解決不了的界線：
+        # **起點重疊 → 樣本不獨立**；**RMST 仍被窗長夾住**。
+        # **它換掉的是記帳方式，不是「窗外看不到」這件事。**
+        # 所以這裡先給三個可比較的記帳法，KM 等有需要再說。
+        self.ev_censoring = str(
+            strategy_config.get("ev_censoring", "window_tail")
+        ).lower()
 
         # **本輪** `choose_rate()` 的完整評估結果，供迴圈層寫日誌用。
         # **策略層仍然不碰 IO**：這裡只是把算過的東西留下來，不主動輸出。
@@ -398,6 +450,8 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
     PRICING_KNOBS = (
         "assumed_hold_hours",
         "ev_plateau_tolerance_pct",
+        "ev_wait_statistic",
+        "ev_censoring",
         "ev_window_hours",
         "ev_min_hits",
         "ev_min_candles",
@@ -463,11 +517,22 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         for start in range(total):
             target = next_hit[start]
             if target is None:
-                # 右設限：至少等到窗尾，實際更長。
-                waits.append((total - start) * self.candle_hours)
                 censored += 1
+                # **右設限怎麼記帳由 `ev_censoring` 決定**（D047）。
+                # 三個都是錯的，只是錯的方向不同——見 `__init__` 的說明。
+                if self.ev_censoring == "drop":
+                    continue
+                if self.ev_censoring == "full_window":
+                    waits.append(total * self.candle_hours)
+                else:  # window_tail（現行）：至少等到窗尾，實際更長。
+                    waits.append((total - start) * self.candle_hours)
             else:
                 waits.append((target - start + 0.5) * self.candle_hours)
+
+        if not waits:
+            # `drop` 把整窗都丟光了（一次都沒命中）。**這時候沒有估計值可給**
+            # ——回 `None` 讓上層當成「這個價位不可用」，而不是給一個 0。
+            return None
 
         ordered = sorted(waits)
         return WaitEstimate(
@@ -531,11 +596,15 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
                 continue
             # D034 的算式：單位時間報酬。等待期間的年化是 0%，所以利息要攤在
             # 「等待 ＋ 借出」的總時間上，而不是只攤在借出期間。
-            effective = rate * hold_hours / (estimate.mean_hours + hold_hours)
+            # **算式吃的是選定的統計量**（D045 追記）。`wait_hours` 跟著它走，
+            # 於是日誌、`pricing_decisions`、M1-c 的比較全部講同一個數字
+            # ——**PR #62 的教訓：報出來的與用出去的必須是同一個來源。**
+            wait = estimate.statistic(self.ev_wait_statistic)
+            effective = rate * hold_hours / (wait + hold_hours)
             self.last_evaluation.append(
                 {
                     "rate": rate,
-                    "wait_hours": estimate.mean_hours,
+                    "wait_hours": wait,
                     "median_hours": estimate.median_hours,
                     "p75_hours": estimate.p75_hours,
                     "hits": estimate.hits,
@@ -631,14 +700,15 @@ class ExpectedValueStrategy(OrderBookDepthStrategy):
         # 與 `choose_rate()` 完全同一條算式（D034）。**這個 `hold_hours` 是已知
         # 錯的**（D040：實測完成率 51.8%），但兩邊都用它，所以比較仍然公平。
         hold_hours = self.assumed_hold_hours
+        wait = estimate.statistic(self.ev_wait_statistic)
         return {
             "rate": rate,
-            "wait_hours": estimate.mean_hours,
+            "wait_hours": wait,
             "median_hours": estimate.median_hours,
             "p75_hours": estimate.p75_hours,
             "hits": estimate.hits,
             "censored_ratio": estimate.censored_ratio,
-            "effective": rate * hold_hours / (estimate.mean_hours + hold_hours),
+            "effective": rate * hold_hours / (wait + hold_hours),
         }
 
     # ------------------------------------------------------------------

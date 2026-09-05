@@ -1029,3 +1029,111 @@ class TestD061高原容差:
         config = settings.load_config(str(root / "config.yaml"))
         assert config["strategy"]["ev_plateau_tolerance_pct"] == 0.5
         assert ExpectedValueStrategy(base_config()).ev_plateau_tolerance_pct == 0.0
+
+
+class TestD061選中的是誰只能有一個來源:
+    """🔴 **這一組釘的是一個真的被部署出去的缺陷。**
+
+    D061 加上高原容差之後，選中的不再必然是 `max(effective)` 的那一個，而
+    `describe_decision()`／`chosen_forecast()`／`pricing_decision()`
+    **三處各自用 `max(...)` 重算了一次「誰被選中」**。於是機器人會掛 8.9279%，
+    而日誌、`offer_wait_forecasts`、`pricing_decisions` 三處**一致地**說 8.76%
+    ——**三個都錯成同一個值，看起來完全正常**。D026 那個家族的典型長相。
+
+    上線時 879 條測試全綠，**一條都沒有比對過「報出來的」與「掛出去的」是不是
+    同一個數字**——每一條都只驗其中一邊。這一組補的就是那個比對。
+    """
+
+    @staticmethod
+    def _candles():
+        低, 高 = daily(9.0), daily(9.2)
+        return [candle(i, h) for i, h in enumerate(([低] * 11 + [高]) * 16)]
+
+    @staticmethod
+    def _evaluation(rate, effective):
+        """一列 `last_evaluation`，欄位形狀照 `choose_rate()` 產生的樣子。"""
+        return {
+            "rate": rate,
+            "wait_hours": 1.66,
+            "median_hours": 0.5,
+            "p75_hours": 1.5,
+            "hits": 108,
+            "censored_ratio": 0.0,
+            "effective": effective,
+        }
+
+    @staticmethod
+    def _strategy(tolerance):
+        return ExpectedValueStrategy(
+            base_config(
+                assumed_hold_hours=12,
+                ev_min_hits=5,
+                ev_plateau_tolerance_pct=tolerance,
+            )
+        )
+
+    @pytest.mark.parametrize("tolerance", [0.0, 0.5, 2.0, 5.0])
+    def test_三個報告端講的都是真的掛出去那一個(self, tolerance):
+        strategy = self._strategy(tolerance)
+        chosen = strategy.choose_rate(self._candles())
+        assert chosen is not None
+        assert strategy.pricing_decision()["chosen_rate"] == chosen
+        assert strategy.chosen_forecast()["rate"] == chosen
+        assert f"{annual(chosen):.2f}%" in strategy.describe_decision()
+
+    def test_選中的不是最高分那一個時三處仍然講對(self):
+        """🔴 **這一條才是真的釘住那個 bug 的。**
+
+        上一條在合成 K 線上跑，而合成 K 線造不出「選中的 ≠ 最高分的」那種高原
+        ——那樣它就算實作寫錯也會通過。**這裡直接把那個狀態擺出來。**
+
+        數字取自 2026-09-05 正式資料的形狀：兩個候選的實質年化差 4×10⁻⁵ 個
+        百分點，而舊實作會報最高分的 8.76%，實際掛出去的是 8.93%。
+        """
+        strategy = self._strategy(0.5)
+        便宜 = self._evaluation(daily(8.7600), 7.695058824 / 36500)
+        貴 = self._evaluation(daily(8.9279), 7.695017700 / 36500)
+        strategy.last_evaluation = [便宜, 貴]
+        strategy.last_chosen = 貴  # `choose_rate()` 真的會選這一個
+
+        assert 貴["effective"] < 便宜["effective"], "測資沒有重現那個平手"
+        assert strategy.pricing_decision()["chosen_rate"] == 貴["rate"]
+        assert strategy.chosen_forecast()["rate"] == 貴["rate"]
+        # **比對「選中年化」那一段，不是整串**：8.76% 在同一行還會以
+        # 「對照最快成交的候選」的身分合法出現，比對整串會誤判。
+        assert "選中年化 8.93%" in strategy.describe_decision()
+        assert "選中年化 8.76%" not in strategy.describe_decision()
+
+    def test_容差真的會挑到不是最高分的那一個(self):
+        """`_pick_from_plateau()` 本身：**同分那群裡取最高價**，不是取最高分。"""
+        strategy = self._strategy(0.5)
+        便宜 = self._evaluation(daily(8.76), 7.695058824 / 36500)
+        貴 = self._evaluation(daily(8.93), 7.695017700 / 36500)
+        assert strategy._pick_from_plateau([便宜, 貴]) == 貴["rate"]
+        assert self._strategy(0.0)._pick_from_plateau([便宜, 貴]) == 便宜["rate"]
+
+    def test_沒有選出價位時三個報告端一律回_None(self):
+        """🔴 **守門條件是 `last_chosen` 不是 `last_evaluation`。**
+
+        「評估過一輪」與「選出了價位」是兩件事：整組候選的實質年化都是 0 時，
+        前者非空而後者是 None。報告端要講的是後者。
+        """
+        strategy = self._strategy(0.5)
+        strategy.last_evaluation = [{"rate": daily(9.0), "effective": 0.0}]
+        strategy.last_chosen = None
+        assert strategy.pricing_decision() is None
+        assert strategy.chosen_forecast() is None
+        assert strategy.describe_decision() is None
+
+    def test_新的一輪會把選中的那一列清掉(self):
+        """D041 的同一條規矩：**每多一個「本輪的狀態」，就多一個會跨輪殘留的成員。**
+
+        `last_chosen` 是第五個，重置點必須與另外四個在同一處。
+        """
+        strategy = self._strategy(0.5)
+        strategy.choose_rate(self._candles())
+        assert strategy.last_chosen is not None
+        # 餘額不足會在 `choose_rate()` 之前就 return——正是 D041 那條路。
+        strategy.build_offer_plan(1.0, daily(9.0))
+        assert strategy.last_chosen is None
+        assert strategy.describe_decision() is None

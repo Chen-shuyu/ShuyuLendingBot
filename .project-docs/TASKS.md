@@ -21,7 +21,7 @@
 **等更多單子在結構上不會改變答案**，原規劃的探索**檢定力差 20 倍**。
 
 **那六個順位的原始待辦已歸檔**：
-[archive/TASKS-六個順位-2026-09.md](archive/TASKS-六個順位-2026-09.md)。
+[archive/TASKS-priorities-2026-09.md](archive/TASKS-priorities-2026-09.md)。
 現況看 [STATUS.md](STATUS.md)，理由看 [DECISIONS.md](DECISIONS.md) 的 **D060～D067**。
 
 🔴 **要重新開始改，四個條件任一成立**（完整敘述在 D067）：

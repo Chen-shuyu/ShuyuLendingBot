@@ -125,7 +125,15 @@ jobs:
             fi
           fi
 
-          if ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+          # 🔴 **`-c core.quotePath=false` 不是可有可無的。**
+          # `git diff --name-only` 預設會把非 ASCII 路徑**加引號並轉成八進位跳脫**：
+          #
+          #     ".project-docs/archive/TASKS-\345\205\255...-2026-09.md"
+          #
+          # 那個開頭的 `"` 會讓底下的白名單正規式對不上，於是一次
+          # **純文件的推送被判成「有文件以外的變更」而部署、重啟了容器**
+          # （2026-09-06 實際發生，見 DECISIONS.md D068）。
+          if ! CHANGED=$(git -c core.quotePath=false diff --name-only "$BASE" HEAD); then
             echo "::warning::git diff 失敗，照常部署"
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -147,6 +155,11 @@ jobs:
           # 都因為同時動到根目錄的 README.md 而觸發部署、重啟了容器。
           # 兩次都有對照組佐證（同一批推送裡只動 .project-docs/ 的那次沒有重啟），
           # 所以要修的是涵蓋範圍，不是規則本身。
+          #
+          # 🔴 **2026-09-06 第三次踩到，而這次不是涵蓋範圍的問題**：
+          # 檔名裡有中文，`git diff` 把整條路徑加了引號，於是連
+          # `^\.project-docs/` 都對不上。**修法在上面那行的 `core.quotePath=false`**
+          # ——白名單一個字都不用改。**同一個症狀有兩個完全不同的病因。**
           #
           # **維持 fail-open**：上面每一條算不出來的路徑都是 docs_only=false。
           # 多部署一次只是白重啟；少部署一次卻是程式改了但機器人還跑舊版而沒人發現。

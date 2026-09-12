@@ -378,3 +378,191 @@ class TestD065對帳的判讀:
 
         assert format_reconciliation(self._Summary(1.0), [], "2026-09-01") == []
         assert format_reconciliation(self._Summary(0.0, days=0), self._positions(1.0), None) == []
+
+
+class TestD069推算毛利息要吃窗:
+    """🔴 **2026-09-12 之前這一支沒有窗，而呼叫端有。**
+
+    `sync_earnings.py` 把帳本那半用 `--since` 篩過了，卻拿**全期間**的推算毛
+    去比——於是只要窗比全期間短，淨毛比就失真。實測 `--since 2026-09-05`
+    印出 **27.1%**，觸發一句「🔴 比參考線低 57.9 個百分點」的**假警報**
+    （正確值是 85.5%）。
+
+    **它原本只在 `--since` 等於專案起點時才碰巧正確**——而那正是唯一被跑過的用法。
+    這一組釘的是「兩半涵蓋同一段時間」。
+    """
+
+    @staticmethod
+    def _position(amount, annual_pct, opened, closed):
+        return {
+            "amount": amount,
+            "rate": annual_pct / 365 / 100,
+            "opened_at": opened,
+            "closed_at": closed,
+        }
+
+    def test_窗以前結束的部位完全不算(self):
+        from datetime import datetime, timedelta, timezone
+
+        tz = timezone(timedelta(hours=8))
+        position = self._position(
+            345.0, 9.0, "2026-09-01T00:00:00+08:00", "2026-09-02T00:00:00+08:00"
+        )
+        start = datetime(2026, 9, 5, 0, 0, 0, tzinfo=tz)
+        assert earnings.expected_gross_interest([position], start=start) == 0.0
+
+    def test_跨進窗的部位只算窗內那一段(self):
+        """借了 4 天，但窗只蓋到後 1 天 → 只能算 1 天。"""
+        from datetime import datetime, timedelta, timezone
+
+        tz = timezone(timedelta(hours=8))
+        position = self._position(
+            345.0, 9.0, "2026-09-01T00:00:00+08:00", "2026-09-05T00:00:00+08:00"
+        )
+        start = datetime(2026, 9, 4, 0, 0, 0, tzinfo=tz)
+        assert earnings.expected_gross_interest(
+            [position], start=start
+        ) == pytest.approx(345.0 * 0.09 * 1 / 365, rel=1e-9)
+
+    def test_不給窗的行為與加窗之前完全一樣(self):
+        """**沒給 `start`／`end` 就不可以有任何行為變化**——舊呼叫端還在用。"""
+        position = self._position(
+            345.0, 9.0, "2026-09-01T00:00:00+08:00", "2026-09-03T00:00:00+08:00"
+        )
+        assert earnings.expected_gross_interest([position]) == pytest.approx(
+            345.0 * 0.09 * 2 / 365, rel=1e-9
+        )
+
+    def test_end_把還沒結束的部位切在窗尾(self):
+        from datetime import datetime, timedelta, timezone
+
+        tz = timezone(timedelta(hours=8))
+        position = {
+            "amount": 345.0,
+            "rate": 9.0 / 365 / 100,
+            "opened_at": "2026-09-01T00:00:00+08:00",
+            "closed_at": None,
+        }
+        now = datetime(2026, 9, 10, 0, 0, 0, tzinfo=tz)
+        end = datetime(2026, 9, 3, 0, 0, 0, tzinfo=tz)
+        assert earnings.expected_gross_interest(
+            [position], now=now, end=end
+        ) == pytest.approx(345.0 * 0.09 * 2 / 365, rel=1e-9)
+
+
+class TestD069資金利用率:
+    """🔴 **這是唯一能把帳本解釋到 0.2pp 以內的變數**，而它以前得手算。
+
+    2026-09-12 三個窗實測（`--since` 累計）：分解值與帳本實得差 0.00～0.06pp。
+    **名目價格幾乎沒動，變的全是利用率**——所以「這週比較差」要靠這一段
+    才分得出是借不出去還是賣太便宜。
+    """
+
+    @staticmethod
+    def _tz():
+        from datetime import timedelta, timezone
+
+        return timezone(timedelta(hours=8))
+
+    def test_借滿整個窗就是百分之百(self):
+        from datetime import datetime
+
+        tz = self._tz()
+        start = datetime(2026, 9, 1, tzinfo=tz)
+        end = datetime(2026, 9, 3, tzinfo=tz)
+        position = {
+            "amount": 345.0,
+            "rate": 9.0 / 365 / 100,
+            "opened_at": start.isoformat(),
+            "closed_at": end.isoformat(),
+        }
+        got = earnings.capital_utilization([position], 345.0, start, end)
+        assert got["utilization_pct"] == pytest.approx(100.0)
+        assert got["nominal_annual_pct"] == pytest.approx(9.0)
+
+    def test_只借一半的窗就是一半(self):
+        from datetime import datetime
+
+        tz = self._tz()
+        start = datetime(2026, 9, 1, tzinfo=tz)
+        end = datetime(2026, 9, 3, tzinfo=tz)
+        position = {
+            "amount": 345.0,
+            "rate": 9.0 / 365 / 100,
+            "opened_at": start.isoformat(),
+            "closed_at": datetime(2026, 9, 2, tzinfo=tz).isoformat(),
+        }
+        got = earnings.capital_utilization([position], 345.0, start, end)
+        assert got["utilization_pct"] == pytest.approx(50.0)
+
+    def test_拆單併存不會算出超過百分之百(self):
+        """🔴 **這一條是那個 113% 的驗收。**
+
+        2026-08-28 有三張部位併存（150 ＋ 134.1 ＋ 60.77 ≈ 345）。
+        把**時數**直接加總會算出 300% 的利用率；用**金額加權**才是 100%。
+        """
+        from datetime import datetime
+
+        tz = self._tz()
+        start = datetime(2026, 9, 1, tzinfo=tz)
+        end = datetime(2026, 9, 2, tzinfo=tz)
+        三張併存 = [
+            {
+                "amount": amount,
+                "rate": 9.0 / 365 / 100,
+                "opened_at": start.isoformat(),
+                "closed_at": end.isoformat(),
+            }
+            for amount in (150.0, 134.1, 60.9)
+        ]
+        got = earnings.capital_utilization(三張併存, 345.0, start, end)
+        assert got["utilization_pct"] == pytest.approx(100.0)
+
+    def test_名目是金額加權而不是算術平均(self):
+        """大筆的低利率要壓過小筆的高利率。"""
+        from datetime import datetime
+
+        tz = self._tz()
+        start = datetime(2026, 9, 1, tzinfo=tz)
+        end = datetime(2026, 9, 2, tzinfo=tz)
+        兩張 = [
+            {
+                "amount": 300.0,
+                "rate": 8.0 / 365 / 100,
+                "opened_at": start.isoformat(),
+                "closed_at": end.isoformat(),
+            },
+            {
+                "amount": 45.0,
+                "rate": 20.0 / 365 / 100,
+                "opened_at": start.isoformat(),
+                "closed_at": end.isoformat(),
+            },
+        ]
+        got = earnings.capital_utilization(兩張, 345.0, start, end)
+        # 算術平均會是 14%；金額加權是 (300×8 + 45×20) / 345 = 9.57%
+        assert got["nominal_annual_pct"] == pytest.approx(
+            (300 * 8 + 45 * 20) / 345, rel=1e-6
+        )
+
+    def test_窗裡沒有任何部位就回None(self):
+        from datetime import datetime
+
+        tz = self._tz()
+        start = datetime(2026, 9, 1, tzinfo=tz)
+        end = datetime(2026, 9, 2, tzinfo=tz)
+        assert earnings.capital_utilization([], 345.0, start, end) is None
+
+    def test_本金是零就回None而不是除以零(self):
+        from datetime import datetime
+
+        tz = self._tz()
+        start = datetime(2026, 9, 1, tzinfo=tz)
+        end = datetime(2026, 9, 2, tzinfo=tz)
+        position = {
+            "amount": 345.0,
+            "rate": 9.0 / 365 / 100,
+            "opened_at": start.isoformat(),
+            "closed_at": end.isoformat(),
+        }
+        assert earnings.capital_utilization([position], 0.0, start, end) is None

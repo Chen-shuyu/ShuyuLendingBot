@@ -25,7 +25,7 @@
 import argparse
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -77,6 +77,127 @@ def load_positions(db_path: Path, currency: str) -> List[Dict[str, Any]]:
     return hold_time.screen_positions(rows).kept
 
 
+def load_deployed_capital(
+    db_path: Path, currency: str, since: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """唯讀讀出「已部署資金」當實得年化的分母（D065 落地、D069 接上）。
+
+    🔴 **這一支存在的理由是一個錯了一週的數字。** D065 讓機器人每輪把觀測到的
+    已部署資金寫進當天那一列，而 STATUS 因此寫下「本金不必再手打了」
+    ——**但這支報告從來沒讀回來過**。`format_summary()` 只在 `principal` 有值時
+    才印實得年化，於是照維運指令跑（不給 `--principal`）**什麼都不會印**，
+    人就自己手算，然後用了「有入帳的天數」當分母，算出 7.75%
+    （誠實的數字是 6.83%）。詳見 D069 第一節。
+
+    👉 **教訓是「少印一行」比「印錯一行」更危險**：印錯的會被看到，
+    少印的會被人用腦內算式補上，而腦內算式不會留下它用了什麼分母。
+
+    **取平均而不是取最新一列**：分母該是「這段期間平均部署了多少錢」。
+    只有機器人跑過的日子有值（舊日子是 NULL），所以回傳時一併帶上
+    `days` 讓呼叫端能說清楚這個平均是幾天算出來的——**不能假裝它涵蓋全期間**。
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        sql = (
+            "SELECT date, principal_avg FROM earnings_daily "
+            "WHERE currency = ? AND principal_avg IS NOT NULL"
+        )
+        params: List[Any] = [currency]
+        if since:
+            sql += " AND date >= ?"
+            params.append(since)
+        rows = [dict(row) for row in connection.execute(sql + " ORDER BY date", params)]
+    except sqlite3.Error:
+        # **失敗一律吞掉**：報表不可以把「唯一那條會寫帳本的路」弄掉（D052 的守則）。
+        return None
+    finally:
+        connection.close()
+
+    values = [float(row["principal_avg"]) for row in rows if row["principal_avg"]]
+    if not values:
+        return None
+    return {
+        "value": sum(values) / len(values),
+        "days": len(values),
+        "first": rows[0]["date"],
+        "last": rows[-1]["date"],
+    }
+
+
+def format_utilization(
+    summary: earnings.LedgerSummary,
+    positions: List[Dict[str, Any]],
+    since: Optional[str],
+    capital: Optional[Dict[str, Any]],
+) -> List[str]:
+    """資金利用率，並排「利用率 × 名目 × 0.85」與帳本實得（D069）。
+
+    🔴 **為什麼這一段值得存在**：帳本告訴你賺了多少，**但不告訴你為什麼**。
+    而 2026-09-12 量到利用率乘上名目利率之後，三週都能把帳本解釋到 0.2pp 以內
+    ——**名目價格幾乎沒動，變的全是利用率**。
+
+    這一段就是把那個分解印出來，讓「這週比較差」當場分得出是
+    **借不出去**（利用率掉）還是**賣太便宜**（名目掉）。在它之前得手算。
+    """
+    if not positions or not summary.days or not capital:
+        return []
+    last = datetime.strptime(summary.days[-1].date, "%Y-%m-%d").replace(
+        tzinfo=clock.get_timezone()
+    )
+    start = (
+        datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=clock.get_timezone())
+        if since
+        else datetime.strptime(summary.days[0].date, "%Y-%m-%d").replace(
+            tzinfo=clock.get_timezone()
+        )
+    )
+    # 含頭含尾：最後一天整天都算（同 `format_summary()` 的曆日數）。
+    end = last + timedelta(days=1)
+    got = earnings.capital_utilization(positions, capital["value"], start, end)
+    if not got:
+        return []
+
+    util = got["utilization_pct"]
+    nominal = got["nominal_annual_pct"]
+    expected = util / 100 * nominal * (100 - earnings.FUNDING_FEE_PCT) / 100
+    days = got["window_hours"] / 24
+    actual = summary.realized_annual_pct(capital["value"], max(round(days), 1))
+
+    lines = ["", "--- 為什麼是這個數字：利用率 × 名目 ---"]
+    lines.append(
+        f"  資金利用率 **{util:.1f}%**"
+        f"（{days:.0f} 天裡有 {days * util / 100:.1f} 天的錢在借出去）"
+        f" ／ 金額加權名目年化 **{nominal:.2f}%**"
+    )
+    lines.append(
+        f"  → 利用率 × 名目 × {(100 - earnings.FUNDING_FEE_PCT) / 100:.2f} = "
+        f"**{expected:.2f}%**"
+        + (f"，帳本實得 **{actual:.2f}%**" if actual is not None else "")
+    )
+    if actual is not None:
+        gap = actual - expected
+        if abs(gap) <= 0.5:
+            lines.append(
+                "  ✅ 兩邊對得上——**所以這個期間的績效是利用率與名目共同決定的**，"
+                "沒有第三個東西在吃錢。"
+            )
+        else:
+            lines.append(
+                f"  🔴 **差 {gap:+.2f} 個百分點。** 對不上就代表有第三個因素"
+                "——先看毛／淨對帳那一段是不是也偏了（缺列會同時讓兩邊都偏）。"
+            )
+    lines.append(
+        "  📌 **利用率一定要用金額加權**：拆單的日子（三張部位併存）"
+        "把時數直接加總會算出超過 100% 的利用率。分子是「USD × 小時」。"
+    )
+    lines.append(
+        "  ⚠ **名目是「借出去的那些錢的平均利率」**，不是「掛單價」"
+        "——沒成交的掛單不在裡面，那部分的代價算在利用率上。"
+    )
+    return lines
+
+
 def format_reconciliation(
     summary: earnings.LedgerSummary,
     positions: List[Dict[str, Any]],
@@ -94,7 +215,12 @@ def format_reconciliation(
     """
     if not positions or not summary.days:
         return []
-    gross = earnings.expected_gross_interest(positions)
+    # 🔴 **兩半必須涵蓋同一段時間。** 帳本那半已經被 `--since` 篩過了，
+    # 所以推算那半也要裁到同一個窗——不裁的後果見 `expected_gross_interest` 的說明。
+    start = None
+    if since:
+        start = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=clock.get_timezone())
+    gross = earnings.expected_gross_interest(positions, start=start)
     if gross <= 0:
         return []
     ratio = summary.total_interest / gross * 100
@@ -132,7 +258,14 @@ def format_summary(
     summary: earnings.LedgerSummary,
     principal: Optional[float],
     since: Optional[str],
+    capital: Optional[Dict[str, Any]] = None,
 ) -> str:
+    """把帳本摘要排版成人看的報告。
+
+    `principal` 是 `--principal` 給的（呼叫端說了算）；`capital` 是從
+    `earnings_daily.principal_avg` 讀回來的觀測值（D065／D069）。
+    **給了 `--principal` 就用它**——使用者明確說的話勝過我們自己觀測到的。
+    """
     lines = ["=== 帳本同步：交易所自己說的錢 ===", ""]
     lines.append(
         f"帳本共 {summary.total_rows} 列 → "
@@ -160,22 +293,54 @@ def format_summary(
     lines.append("")
     lines.append(f"  **合計 {summary.total_interest:.8f} USD**（{len(summary.days)} 天）")
 
-    if principal and summary.days:
-        first = datetime.strptime(summary.days[0].date, "%Y-%m-%d")
-        last = datetime.strptime(summary.days[-1].date, "%Y-%m-%d")
-        # 🔴 **分母的起點是「期間的開始」，不是「第一筆入帳」。**
-        # 用第一筆入帳當起點，會把「錢已經進來但還沒借出去」的那段時間
-        # 從分母裡刪掉——而那正是這個專案一路踩過來的同一個坑
-        # （`wait_report` 的 7.99% 就是這樣偏樂觀的）。
-        # 給了 `--since` 就從那天算起：使用者說期間從哪裡開始，就從哪裡開始。
-        start = datetime.strptime(since, "%Y-%m-%d") if since else first
-        elapsed = max((last - start).days, 1)
-        annual = summary.realized_annual_pct(principal, elapsed)
+    first = datetime.strptime(summary.days[0].date, "%Y-%m-%d")
+    last = datetime.strptime(summary.days[-1].date, "%Y-%m-%d")
+    # 🔴 **分母的起點是「期間的開始」，不是「第一筆入帳」。**
+    # 用第一筆入帳當起點，會把「錢已經進來但還沒借出去」的那段時間
+    # 從分母裡刪掉——而那正是這個專案一路踩過來的同一個坑
+    # （`wait_report` 的 7.99% 就是這樣偏樂觀的）。
+    # 給了 `--since` 就從那天算起：使用者說期間從哪裡開始，就從哪裡開始。
+    start = datetime.strptime(since, "%Y-%m-%d") if since else first
+    # 🔴 **`+ 1`：曆日數是「含頭含尾」，不是兩個日期相減。**
+    # 2026-09-12 之前這裡是 `(last - start).days`，而同一個函式裡的空白日判斷
+    # 用的卻是 `elapsed + 1`——**同一份報告裡兩種天數**。
+    # 09-05 → 09-12 其實是 8 天，算成 7 天會讓年化高估 14%（6.87% 印成 7.86%）。
+    # D069 那個錯數字是「用入帳列數當分母」，這一條是它的鄰居：**差一天也是差**。
+    elapsed = max((last - start).days + 1, 1)
+
+    # 🔴 **這一段以前躲在 `if principal:` 裡面，那是 D069 第一節那個錯數字的根因。**
+    # 分母是**曆日**，而「合計 N 天」印的是入帳列數——兩者在有空白日時不一樣。
+    # 空白日常常是最重要的訊號（沒借出去、或錢不在 funding 錢包），
+    # **所以它不該依賴呼叫端有沒有給本金**。
+    有入帳 = {day.date for day in summary.days}
+    # `elapsed` 現在自己就是含頭含尾的曆日數了，所以這裡不再 `+ 1`。
+    空白 = elapsed - len(有入帳)
+    lines.append(
+        f"  📌 **分母是曆日：{start.strftime('%m-%d')} → {last.strftime('%m-%d')} 共 "
+        f"{elapsed} 天**，而上面那個「{len(summary.days)} 天」是**入帳列數**。"
+    )
+    if 空白 > 0:
+        lines.append(
+            f"  ⚠ **期間內有 {空白} 天完全沒有利息入帳**"
+            "——可能是沒借出去，也可能是錢不在 funding 錢包。"
+            "**它們在分母裡，這是對的**，但值得看一眼是哪幾天。"
+        )
+        lines.append(
+            "  🔴 **不要拿「入帳列數」當分母**：利息是按每筆單子的 24 小時結算點"
+            "入帳，不是按日曆日，所以空白日與「那天真的沒賺」長得一樣。"
+            "拿列數當分母會系統性高估（D069 那次高估了 0.9 個百分點）。"
+        )
+
+    # 本金：`--principal` 勝過觀測值（使用者明確說的話算數），
+    # 但**兩者都沒有時要講出來為什麼印不出年化**——少印一行比印錯一行更危險（D069）。
+    分母 = principal if principal else (capital["value"] if capital else None)
+    if 分母:
+        annual = summary.realized_annual_pct(分母, elapsed)
         if annual is not None:
             lines.append("")
             lines.append(
                 f"  **實得年化 {annual:.2f}%**"
-                f"（本金 {principal:.2f} USD、{start.strftime('%m-%d')} → "
+                f"（本金 {分母:.2f} USD、{start.strftime('%m-%d')} → "
                 f"{last.strftime('%m-%d')} 共 {elapsed} 天）"
             )
             if not since:
@@ -184,22 +349,30 @@ def format_summary(
                     "——那會把「錢進來了但還沒借出去」的時間從分母裡刪掉，"
                     "**數字偏樂觀**。要誠實的數字請給 `--since <期間起點>`。"
                 )
-            lines.append(
-                "  ⚠ **本金是呼叫端給的，不是算出來的**：帳本只看得到餘額，"
-                "而餘額含已賺到的利息、也含還掛在場上沒借出去的錢。"
-                "猜一個本金出來，這個數字就又變成推論了。"
-            )
-
-        # 期間內完全沒有利息入帳的日子。**空白的日子一樣在分母裡**，
-        # 而且它們常常是最重要的訊號（沒借出去、或錢根本不在 funding 錢包）。
-        有入帳 = {day.date for day in summary.days}
-        空白 = elapsed + 1 - len(有入帳)
-        if 空白 > 0:
-            lines.append(
-                f"  ⚠ **期間內有 {空白} 天完全沒有利息入帳**"
-                "——可能是沒借出去，也可能是錢不在 funding 錢包。"
-                "**它們在分母裡，這是對的**，但值得看一眼是哪幾天。"
-            )
+            if principal:
+                lines.append(
+                    "  ⚠ **本金是呼叫端給的，不是算出來的**：帳本只看得到餘額，"
+                    "而餘額含已賺到的利息、也含還掛在場上沒借出去的錢。"
+                    "猜一個本金出來，這個數字就又變成推論了。"
+                )
+            else:
+                lines.append(
+                    f"  ✅ **本金是機器人自己觀測的已部署資金**（D065）："
+                    f"{capital['days']} 天的平均（{capital['first']} → {capital['last']}），"
+                    "不是手打的。"
+                )
+                if capital["days"] < elapsed:
+                    lines.append(
+                        f"  ⚠ **只有 {capital['days']} 天有觀測值，期間卻有 {elapsed} 天**"
+                        "——D065 之前的日子是 NULL，那些天的部署金額沒有被平均進去。"
+                    )
+    else:
+        lines.append("")
+        lines.append(
+            "  🔴 **算不出實得年化**：`earnings_daily.principal_avg` 一列都沒有"
+            "（D065 之前的資料），而你也沒給 `--principal`。"
+            "**不要自己拿合計去除入帳列數**——那正是 D069 第一節那個錯數字的來源。"
+        )
     if since:
         lines.append(f"  （只算 {since} 之後）")
     return "\n".join(lines)
@@ -251,19 +424,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.currency, limit=args.limit, start_ms=start_ms
     )
     summary = earnings.summarize(entries, currency=args.currency)
-    print(format_summary(summary, args.principal, args.since))
 
     configured = args.db or ((config.get("database") or {}).get("path"))
     db_path = resolve_db_path(configured)
+
+    # 🔴 **本金要在排版之前讀出來。** 以前 `db_path` 是在 `format_summary()`
+    # 之後才算的，於是報告根本拿不到 D065 落地的觀測值——而那就是 D069 第一節
+    # 那個錯了一週的數字的機械原因。**吞掉失敗**：讀不到本金只是少印一行年化，
+    # 不可以讓報表整支掛掉（D052 的守則，同下面的對帳）。
+    capital = None
+    if db_path.exists():
+        try:
+            capital = load_deployed_capital(db_path, args.currency, args.since)
+        except Exception as exc:  # noqa: BLE001 - 見上
+            print(f"（讀不到已部署資金，實得年化改用 --principal：{exc}）")
+
+    print(format_summary(summary, args.principal, args.since, capital))
 
     # 🔴 **對帳在 `--write` 的分岔之前**：它是唯讀的，而**只看不寫的那條路
     # 才是最需要它的那條**——「先看一眼對不對」正是不寫的時候要做的事。
     # 失敗一律吞掉：**報表不可以把「唯一那條會寫帳本的路」弄掉**（D052 的守則）。
     if db_path.exists():
         try:
-            reconciliation = format_reconciliation(
-                summary, load_positions(db_path, args.currency), args.since
+            positions = load_positions(db_path, args.currency)
+            utilization = format_utilization(
+                summary, positions, args.since, capital
             )
+            if utilization:
+                print("\n".join(utilization))
+            reconciliation = format_reconciliation(summary, positions, args.since)
             if reconciliation:
                 print("\n".join(reconciliation))
         except Exception as exc:  # noqa: BLE001 - 見上

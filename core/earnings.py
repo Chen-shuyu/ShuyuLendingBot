@@ -144,6 +144,8 @@ FUNDING_FEE_PCT = 15.0
 def expected_gross_interest(
     positions: Iterable[Dict[str, Any]],
     now: Optional[datetime] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> float:
     """從已借出部位推算「照合約應該產生多少毛利息」（D065）。
 
@@ -153,9 +155,18 @@ def expected_gross_interest(
     仍在生息中的部位以**現在**為止計算——那是下界，
     而下界拿來跟「已經入帳的利息」比，方向是保守的。
 
+    🔴 **`start`／`end` 是 2026-09-12 補的（D069），在那之前這一支沒有窗**
+    ——它把**所有**部位無條件加總，而呼叫端（`sync_earnings.py`）卻把帳本那半
+    用 `--since` 篩過了。於是只要窗比全期間短，淨毛比就是拿「一週的淨」除「全期間的毛」：
+    `--since 2026-09-05` 時印出 **27.1%**，觸發一句「🔴 比參考線低 57.9 個百分點」
+    的**假警報**。而它原本只在 `--since` 等於專案起點時才碰巧正確。
+    **每個部位的生息區間會被裁切到 `[start, end]`**，只算落在窗內的那一段。
+
     ⚠ **它有三個已知的偏差來源**，全部指向同一個方向（推算值偏高）：
     複利沒有算進去、`closed_at` 是巡檢偵測到的時間（每筆高估最多一個巡檢間隔）、
     以及**利息是結算日入帳**，所以日對日一定對不齊。**只有多日合計有意義。**
+    ⚠ 加窗之後多一個同方向的邊界效應：**窗的尾端已經生息但還沒結算**的那一段
+    算進毛、還沒進淨。窗越短它越明顯（結算約一天一次）。
     """
     now = now or clock.now()
     total = 0.0
@@ -166,6 +177,10 @@ def expected_gross_interest(
         if opened is None:
             continue
         closed = parse_moment(position.get("closed_at")) or now
+        if start is not None and opened < start:
+            opened = start
+        if end is not None and closed > end:
+            closed = end
         hours = (closed - opened).total_seconds() / 3600
         if hours <= 0:
             continue
@@ -173,6 +188,61 @@ def expected_gross_interest(
         rate = float(position.get("rate") or 0.0)
         total += amount * rate * hours / 24
     return total
+
+
+def capital_utilization(
+    positions: Iterable[Dict[str, Any]],
+    capital: float,
+    start: datetime,
+    end: datetime,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, float]]:
+    """窗內的資金利用率與金額加權名目利率（D069）。
+
+    🔴 **這是唯一能把帳本數字解釋到 0.2pp 以內的變數。** 2026-09-12 量到：
+
+        期間          利用率   加權名目   利用率×名目×0.85   帳本實得
+        08-22～08-28   99.2%     9.22%          7.77%          7.96%
+        08-29～09-04   81.6%     8.98%          6.23%          6.24%
+        09-05～09-11   90.2%     8.96%          6.87%          6.83%
+
+    **名目價格三週幾乎沒動，變的全是利用率。** 在這之前它得從
+    `funding_positions` 手算，於是沒人在看它——而它才是那個會動的東西。
+
+    ⚠ **一定要用金額加權，不能把時數直接加總**：拆單的日子（例如 08-28 的
+    三張併存部位）時數相加會算出 **113%** 的利用率。分子是「USD × 小時」。
+    """
+    now = now or clock.now()
+    window_hours = (end - start).total_seconds() / 3600
+    if window_hours <= 0 or capital <= 0:
+        return None
+
+    usd_hours = 0.0
+    rate_weighted = 0.0
+    for position in positions:
+        opened = parse_moment(position.get("opened_at")) or parse_moment(
+            position.get("first_seen_at")
+        )
+        if opened is None:
+            continue
+        closed = parse_moment(position.get("closed_at")) or now
+        opened = max(opened, start)
+        closed = min(closed, end)
+        hours = (closed - opened).total_seconds() / 3600
+        if hours <= 0:
+            continue
+        amount = float(position.get("amount") or 0.0)
+        rate = float(position.get("rate") or 0.0)
+        usd_hours += amount * hours
+        rate_weighted += amount * hours * rate * 365 * 100
+
+    if usd_hours <= 0:
+        return None
+    return {
+        "utilization_pct": usd_hours / (window_hours * capital) * 100,
+        "nominal_annual_pct": rate_weighted / usd_hours,
+        "window_hours": window_hours,
+    }
 
 
 def parse_moment(moment: Optional[str]) -> Optional[datetime]:

@@ -68,6 +68,23 @@ class TestProjectConfig:
         """
         assert config["engine"]["dry_run"] is False
 
+    def test_天期與旋鈕釘的是刻意選定的值(self, config):
+        """🔴 **D069：`offer_period` 與 `assumed_hold_hours` 必須一起看。**
+
+        釘住的理由跟上面那條 `dry_run` 一樣：要防的不是某個值本身，而是
+        **沒有人注意到它被改了**。而這兩個值**特別容易被單獨改壞**：
+
+        - 只把 `offer_period` 改成 30、`assumed_hold_hours` 留在 12
+          → 策略會選 8.994%，**比改之前的 9.125% 還低**，等於鎖了 30 天卻沒收好處；
+        - 只把 `assumed_hold_hours` 往上調到 720
+          → 會選到窗內只被掃到 7 次的 11.268%，正是 `ev_min_hits` 要擋的尾端。
+
+        48 是掃描出來的**高原**（24／36／48 選出同一個價、命中 46 次），不是最大值
+        ——挑最大值是 `target_queue_usd` 的死法（D032）。
+        """
+        assert config["strategy"]["offer_period"] == 30
+        assert config["strategy"]["assumed_hold_hours"] == 48
+
     def test_ships_without_credentials(self, config, monkeypatch):
         monkeypatch.delenv("BFX_API_KEY", raising=False)
         monkeypatch.delenv("BFX_API_SECRET", raising=False)

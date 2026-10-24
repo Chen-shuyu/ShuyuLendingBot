@@ -2621,3 +2621,186 @@ class Test日結收益摘要:
         assert "相對錢包餘額的年化" not in digest
         # 但摘要本身還是要送出去——利息數字仍然有價值
         assert "當日利息" in digest
+
+
+class Test閒置通知:
+    """D074／待改⑧：錢超過 `idle_alert_hours` 沒借出去就推一則，**每段閒置只推一次**。
+
+    它存在的理由是 2026-10-08～10-24：錢閒了大半個月，容器 healthy、LINE 一則都沒推，
+    而日結摘要要「有新入帳」才推——**沒賺錢就連摘要都停了**（D072／D073）。
+    """
+
+    @staticmethod
+    def _engine(fake_logger, fake_notifier, strategy, repository, offers=None, **kwargs):
+        client = FakeClient(balance=0.0, frr=0.0002, active_offers=offers)
+        return (
+            make_engine(fake_logger, fake_notifier, strategy, client, repository, **kwargs),
+            client,
+        )
+
+    @staticmethod
+    def _seed(repository, position_id, closed_hours_ago, held_hours=24.0, utc_text=False):
+        """放一筆部位進 DB。`closed_hours_ago=None` 代表還在借出中。
+
+        `utc_text=True`：時間戳寫成 `+00:00`——舊列真的長這樣（D028 之前寫進去的）。
+        """
+        from datetime import timedelta, timezone
+
+        from utils import clock
+
+        now = clock.now()
+        closed = None if closed_hours_ago is None else now - timedelta(hours=closed_hours_ago)
+        opened = (closed or now) - timedelta(hours=held_hours)
+        if utc_text:
+            opened = opened.astimezone(timezone.utc)
+            closed = closed.astimezone(timezone.utc) if closed else None
+        with repository.connection:
+            repository.connection.execute(
+                "INSERT INTO funding_positions (position_id, currency, amount, rate, period, kind,"
+                " opened_at, first_seen_at, closed_at) VALUES (?, 'USD', 347.93, 0.000185, 2,"
+                " 'credit', ?, ?, ?)",
+                (position_id, opened.isoformat(), opened.isoformat(),
+                 closed.isoformat() if closed else None),
+            )
+
+    @staticmethod
+    def _alerts(fake_notifier):
+        return [m for m in fake_notifier.sent if "資金已閒置" in m]
+
+    def test_閒置超過門檻就推一則(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "p1", closed_hours_ago=13)
+        engine._maybe_alert_idle()
+        alerts = self._alerts(fake_notifier)
+        assert len(alerts) == 1
+        assert alerts[0].startswith("🟡【交易】資金已閒置 13 小時")
+
+    def test_未到門檻不推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "p1", closed_hours_ago=11)
+        engine._maybe_alert_idle()
+        assert self._alerts(fake_notifier) == []
+
+    def test_有部位在借出中就不推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """閒置＝**沒有任何**借出中的部位。舊的那筆收回很久了，但新的那筆還在生息。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "old", closed_hours_ago=40)
+        self._seed(repository, "live", closed_hours_ago=None)
+        engine._maybe_alert_idle()
+        assert self._alerts(fake_notifier) == []
+
+    def test_同一段閒置只推一次(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**額度是每月 200 則**，每輪推一次的話 1.4 天就燒光（D024）。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "p1", closed_hours_ago=13)
+        engine._maybe_alert_idle()
+        engine._maybe_alert_idle()
+        engine._maybe_alert_idle()
+        assert len(self._alerts(fake_notifier)) == 1
+
+    def test_下一段閒置會再推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "p1", closed_hours_ago=60)
+        engine._maybe_alert_idle()
+        # 後來又借出去一次、又收回來——那是新的一段閒置，起點不同
+        self._seed(repository, "p2", closed_hours_ago=13, held_hours=20)
+        engine._maybe_alert_idle()
+        assert len(self._alerts(fake_notifier)) == 2
+
+    def test_重啟不重推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """🔴 **狀態存在 DB 不是記憶體**：存記憶體的話每次部署都會重推一則（同 D053）。"""
+        self._seed(repository, "p1", closed_hours_ago=13)
+        first, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        first._maybe_alert_idle()
+        second, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        second._maybe_alert_idle()
+        assert len(self._alerts(fake_notifier)) == 1
+
+    def test_從沒借出過不推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """沒有起點可算——**不猜**。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        engine._maybe_alert_idle()
+        assert self._alerts(fake_notifier) == []
+
+    def test_比的是時間不是字串(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """🔴 舊列帶 `+00:00`、新列帶 `+08:00`：拿字串取最大值會取到比較舊的那一筆。
+
+        這裡 2 小時前收回的那筆寫成 UTC、6 小時前的寫成 CST——字串上 6 小時前那筆比較「大」。
+        門檻 4 小時：照時間是閒置 2 小時（不推），照字串會變成 6 小時（誤推）。
+        """
+        engine, _ = self._engine(
+            fake_logger, fake_notifier, strategy, repository, idle_alert_hours=4
+        )
+        self._seed(repository, "older", closed_hours_ago=6)
+        self._seed(repository, "newer", closed_hours_ago=2, utc_text=True)
+        engine._maybe_alert_idle()
+        assert self._alerts(fake_notifier) == []
+
+    def test_推播失敗不會往外拋也不會重推(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """**先記再推**：一則推不出去的通知每 10 分鐘重試一次，一天燒 144 則。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        self._seed(repository, "p1", closed_hours_ago=13)
+        calls = []
+
+        def 推不出去(message):
+            calls.append(message)
+            raise RuntimeError("LINE 掛了")
+
+        engine.notifier.send = 推不出去
+        engine._maybe_alert_idle()   # 不可以往外拋
+        engine._maybe_alert_idle()
+        assert len(calls) == 1
+
+    def test_交易通知關掉時也關掉(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(
+            fake_logger, fake_notifier, strategy, repository, push_trade_events=False
+        )
+        self._seed(repository, "p1", closed_hours_ago=13)
+        engine._maybe_alert_idle()
+        assert self._alerts(fake_notifier) == []
+
+    def test_門檻設0就關掉(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        engine, _ = self._engine(
+            fake_logger, fake_notifier, strategy, repository, idle_alert_hours=0
+        )
+        self._seed(repository, "p1", closed_hours_ago=500)
+        engine._maybe_alert_idle()
+        assert self._alerts(fake_notifier) == []
+
+    def test_場上有掛單就是在等市場_無需處理(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """頁尾看手上唯一有的證據：場上有沒有我們的單（D023：頁尾只有兩種）。"""
+        engine, _ = self._engine(
+            fake_logger, fake_notifier, strategy, repository,
+            offers=[live_offer(amount=347.93, rate=0.000185, period=2)],
+        )
+        self._seed(repository, "p1", closed_hours_ago=13)
+        engine._maybe_alert_idle()
+        alert = self._alerts(fake_notifier)[0]
+        assert "場上掛單：1 筆" in alert
+        assert "天期 2 天" in alert
+        assert alert.splitlines()[-1] == "——— 無需處理"
+
+    def test_場上沒有掛單就要人看(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """沒在掛 ≠ 在等。D072 的 49 小時就是這個樣子，而當時沒有任何東西出聲。"""
+        engine, _ = self._engine(fake_logger, fake_notifier, strategy, repository)
+        repository.save_state(last_action="本輪未掛單：近期成交樣本不足，算不出常態成交價")
+        self._seed(repository, "p1", closed_hours_ago=13)
+        engine._maybe_alert_idle()
+        alert = self._alerts(fake_notifier)[0]
+        assert "場上掛單：沒有" in alert
+        assert "最近一輪：本輪未掛單：近期成交樣本不足" in alert
+        assert alert.splitlines()[-1] == "——— 需人工介入"
+
+    def test_查不到掛單就說查不到_也要人看(self, fake_logger, fake_notifier, strategy, repository, no_sleep):
+        """「不知道」不能講成「沒有」——寧可多叫一次。"""
+        engine, client = self._engine(fake_logger, fake_notifier, strategy, repository)
+
+        def 端點掛了(*args, **kwargs):
+            raise RuntimeError("offers 端點逾時")
+
+        client.get_active_offers = 端點掛了
+        self._seed(repository, "p1", closed_hours_ago=13)
+        engine._maybe_alert_idle()
+        alert = self._alerts(fake_notifier)[0]
+        assert "場上掛單：查不到" in alert
+        assert alert.splitlines()[-1] == "——— 需人工介入"

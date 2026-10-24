@@ -99,6 +99,7 @@ class BotEngine:
         rate_tolerance_pct: float = 2.0,
         queue_clear_usd_per_hour: float = 540_000.0,
         earnings_sync_hours: float = 6.0,
+        idle_alert_hours: float = 12.0,
     ):
         self.logger = logger
         self.notifier = notifier
@@ -116,6 +117,9 @@ class BotEngine:
         # **只存在記憶體裡**：重啟後多同步一次沒有代價（冪等，D051），
         # 而那比為它加一個 `bot_state` 欄位便宜。
         self._last_earnings_sync_at: Optional[datetime] = None
+        # 錢超過幾小時沒借出去就推一則（D074／待改⑧，使用者 2026-10-24 選 12）。
+        # 0 或負數 = 關掉。理由與判準見 `_maybe_alert_idle()`。
+        self.idle_alert_hours = float(idle_alert_hours)
         # 排隊的錢被吃掉的速率，用來把「前方多少錢」換算成「要等多久」
         # （見 `_cheaper_repost_is_not_worth_it`）。**只有一個校準樣本**，
         # 目前僅用於分母差異不大的比較，敏感度低；D032 會把它換成每輪自己算。
@@ -1274,6 +1278,87 @@ class BotEngine:
         except Exception as exc:  # noqa: BLE001 - 見 docstring：不能影響巡檢
             self.logger.warning(f"日結摘要推送失敗，略過（不影響掛單）：{exc}")
 
+    IDLE_ALERT_STATE_KEY = "idle_alert_sent_for"
+
+    def _maybe_alert_idle(self) -> None:
+        """錢超過 `idle_alert_hours` 沒借出去就推一則（D074／待改⑧）。**每段閒置只推一次。**
+
+        ## 為什麼要有它
+
+        2026-10-08～10-24 錢閒了大半個月，容器一直 healthy、LINE 一則都沒推（D072 第三節），
+        而日結摘要的觸發是「有新入帳」——**沒賺錢就連摘要都停了**（D073 第四節）。
+        **這是第一個「錢沒有在做事」就會出聲的東西。**
+
+        ## 「閒置」怎麼判
+
+        - **閒置**＝ DB 裡**沒有任何借出中的部位**；
+        - **起點**＝**最後一筆部位收回的時間**（`closed_at` 的最大值）。
+
+        兩者都是 `run_once()` 每輪向交易所對帳後寫進 DB 的觀測值（`sync_positions()`），
+        所以這裡**不另存「閒置從何時開始」**——再存一份就會有兩個真相，而它們遲早會不一樣。
+        **從沒借出過就不推**：沒有起點可算，不猜。
+
+        🔴 **比的是時間，不是字串**：舊列的 `closed_at` 帶 `+00:00`、新列帶 `+08:00`
+        （D028），拿字串取最大值會取錯那一筆。
+
+        ## 每段只推一次
+
+        「推過了沒」記在 `bot_kv`，值是那一段閒置的起點：**重啟不會重推**（D053 的做法），
+        下一段閒置有新的起點，自然會再推。**先記再推**：推不出去也不要每 10 分鐘重試一次燒額度。
+
+        🔴 **與 `_maybe_send_earnings_digest()` 同一條守則：吞掉所有例外**，而且放在迴圈層、
+        不在 `run_once()` 裡（D052）——它整個爛掉也碰不到定價、重掛、取消、下單任何一條路。
+        """
+        if not self.push_trade_events or self.idle_alert_hours <= 0:
+            # 交易面通知的總開關關掉時一起關——它同樣是花額度的推播（同日結摘要）。
+            return
+        try:
+            if self.repository.open_positions("USD"):
+                return
+            closed = [
+                moment
+                for moment in (
+                    hold_time.parse_moment(row.get("closed_at"))
+                    for row in self.repository.all_positions("USD")
+                )
+                if moment is not None
+            ]
+            if not closed:
+                return
+            since = max(closed)
+            idle_hours = (clock.now() - since).total_seconds() / 3600
+            if idle_hours < self.idle_alert_hours:
+                return
+            episode = since.isoformat()
+            if self.repository.get_kv(self.IDLE_ALERT_STATE_KEY) == episode:
+                return
+
+            self.repository.set_kv(self.IDLE_ALERT_STATE_KEY, episode)
+            state = self.repository.get_state() or {}
+            self.notifier.send(
+                messages.funds_idle(
+                    idle_hours,
+                    since=since,
+                    threshold_hours=self.idle_alert_hours,
+                    offers=self._idle_alert_offers(),
+                    last_action=state.get("last_action"),
+                )
+            )
+            self.logger.info(
+                f"已推送閒置通知：資金已閒置 {idle_hours:.1f} 小時"
+                f"（自 {since.astimezone(clock.get_timezone()):%m-%d %H:%M} 最後一筆部位收回）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 見 docstring：不能影響巡檢
+            self.logger.warning(f"閒置通知失敗，略過（不影響掛單）：{exc}")
+
+    def _idle_alert_offers(self) -> Optional[list]:
+        """場上我們的掛單——閒置通知的頁尾靠它判斷。**查不到回 `None`，不回空清單**：
+        「不知道」與「沒有」要分開講（`messages.funds_idle()` 會把 `None` 寫成「查不到」）。"""
+        try:
+            return list(self.client.get_active_offers("USD"))
+        except Exception:  # noqa: BLE001
+            return None
+
     def _digest_balance(self) -> Optional[float]:
         """摘要裡當分母的錢包餘額。**取不到就回 `None`，不要猜。**
 
@@ -1344,6 +1429,8 @@ class BotEngine:
                 #    定價、重掛、取消、下單任何一條路徑。
                 self._maybe_sync_earnings()
                 self._maybe_send_earnings_digest()
+                # 閒置通知同一層、同一條守則（D074／待改⑧）：它讀的是本輪剛對完帳的部位。
+                self._maybe_alert_idle()
 
                 time.sleep(self.interval_seconds)
         except KeyboardInterrupt:

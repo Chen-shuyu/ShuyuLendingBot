@@ -420,6 +420,66 @@ def offer_failed(plan: Any, reason: str, retryable: bool = True) -> str:
     )
 
 
+def funds_idle(
+    idle_hours: float,
+    since=None,
+    threshold_hours: float = 12.0,
+    offers: Optional[list] = None,
+    last_action: Optional[str] = None,
+) -> str:
+    """錢已經 N 小時沒借出去（D074／待改⑧）。**每段閒置只推一次**——那由呼叫端負責。
+
+    ## 為什麼要有這一則
+
+    2026-10-08～10-24 錢閒了大半個月，**容器一直是 healthy、LINE 一則都沒推**
+    ——健康檢查檢查的是「有在跑」，不是「有在做事」（D072 第三節）。更糟的是，
+    日結摘要的觸發是「有新入帳」（D053），**沒賺錢就連摘要都停了**（D073 第四節）：
+    閒得越久，機器人越安靜。
+
+    ## 頁尾怎麼決定（只有兩種，D023）
+
+    這則訊息分不出「市場低於地板」與「機器人出了狀況」——D072 第四節講的正是這件事。
+    所以頁尾**看手上唯一有的證據：場上有沒有我們的掛單**。
+
+    - **有掛單** → 機器人在做它該做的事（掛著等市場到價）→「無需處理」
+    - **沒有掛單、或查不到** → 這段時間機器人沒在掛 →「需人工介入」，看「最近一輪」的原因
+
+    `offers` 是 `None` 代表**查不到**（端點失敗），跟「查到了、是空的」分開寫：
+    寧可多叫一次，也不要把「不知道」講成「沒有」。
+    """
+    duration = _format_duration(idle_hours)
+    fields: Dict[str, Any] = {
+        "已閒置": f"{duration}（自 {format_timestamp(since)} 最後一筆部位收回）" if since else duration,
+        "通知門檻": f"{threshold_hours:g} 小時",
+    }
+    if offers is None:
+        fields["場上掛單"] = "查不到（交易所端點失敗）"
+    elif not offers:
+        fields["場上掛單"] = "沒有"
+    else:
+        rates = [float(offer["rate"]) for offer in offers]
+        periods = sorted({int(offer["period"]) for offer in offers if offer.get("period")})
+        total = sum(float(offer.get("amount") or 0) for offer in offers)
+        rate_text = format_rate(min(rates)) if len(set(rates)) == 1 else (
+            f"{format_rate(min(rates))} ～ {format_rate(max(rates))}"
+        )
+        period_text = f"、天期 {'／'.join(str(p) for p in periods)} 天" if periods else ""
+        fields["場上掛單"] = f"{len(offers)} 筆、{format_amount(total)}、{rate_text}{period_text}"
+    fields["最近一輪"] = last_action
+    fields["後續"] = (
+        "掛單在等市場到價；機器人照常每 10 分鐘重新定價。這段閒置只通知這一次，借出去時會有成交通知"
+        if offers
+        else "看「最近一輪」的原因：市場整個低於地板屬預期內，其他情況要檢查。這段閒置只通知這一次"
+    )
+    return build(
+        CATEGORY_TRADE,
+        f"資金已閒置 {duration} 沒有借出",
+        fields,
+        level=LEVEL_WARNING,
+        action_required=not offers,
+    )
+
+
 # --- 收益面 -----------------------------------------------------------------
 
 

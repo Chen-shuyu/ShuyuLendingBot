@@ -91,6 +91,9 @@ def main() -> int:
         # 每隔幾小時把交易所帳本的利息同步進 `earnings_daily`（D052）。
         # 設 0 就關掉。**它不影響掛單**——同步整個爛掉也只是收益統計晚一點更新。
         earnings_sync_hours=float(engine_config.get("earnings_sync_hours", 6.0)),
+        # 錢超過幾小時沒借出去就推一則（D074／待改⑧）。跟 `push_trade_events` 一樣放在 line: 底下
+        # ——它管的是「要不要推播」。設 0 就關掉；**它不影響掛單**（放在迴圈層，D052）。
+        idle_alert_hours=float(config.get("line", {}).get("idle_alert_hours", 12.0)),
     )
 
     logger.info("開始執行 Bitfinex 放貸機器人")

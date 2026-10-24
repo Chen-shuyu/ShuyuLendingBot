@@ -291,3 +291,43 @@ class TestOffersGoneAfterFillDetection:
 
         assert "不是成交" in text
         assert "餘額被移走" in text
+
+
+class TestFundsIdle:
+    """D074／待改⑧：錢閒著沒借出去。**頁尾由「場上有沒有我們的單」決定**（D023 只有兩種）。"""
+
+    OFFER = {"id": 1, "amount": 347.93, "rate": 0.000185, "period": 2}
+
+    def test_first_line_says_how_long_and_is_a_warning(self):
+        text = messages.funds_idle(13.0, offers=[self.OFFER])
+        assert text.splitlines()[0] == "🟡【交易】資金已閒置 13 小時 0 分 沒有借出"
+
+    def test_waiting_on_the_book_needs_no_action(self):
+        text = messages.funds_idle(13.0, offers=[self.OFFER])
+        assert text.splitlines()[-1] == messages.FOOTER_NO_ACTION
+        assert "場上掛單：1 筆、347.93 USD" in text
+
+    def test_nothing_on_the_book_needs_a_human(self):
+        text = messages.funds_idle(13.0, offers=[], last_action="本輪未掛單：低於地板")
+        assert text.splitlines()[-1] == messages.FOOTER_ACTION_REQUIRED
+        assert "場上掛單：沒有" in text
+        assert "最近一輪：本輪未掛單：低於地板" in text
+
+    def test_unknown_is_not_the_same_as_none(self):
+        """`None`＝查不到，`[]`＝查到了、是空的。兩者不可以印成同一句。"""
+        unknown = messages.funds_idle(13.0, offers=None)
+        empty = messages.funds_idle(13.0, offers=[])
+        assert "場上掛單：查不到" in unknown
+        assert "場上掛單：沒有" in empty
+        assert unknown.splitlines()[-1] == messages.FOOTER_ACTION_REQUIRED
+
+    def test_since_carries_the_offset(self):
+        since = clock.now() - timedelta(hours=13)
+        text = messages.funds_idle(13.0, since=since, offers=[self.OFFER])
+        assert "+0800" in [line for line in text.splitlines() if line.startswith("已閒置")][0]
+
+    def test_missing_last_action_drops_the_line(self):
+        """寧可少一行，也不要印「最近一輪：None」（`build()` 的規矩）。"""
+        text = messages.funds_idle(13.0, offers=[self.OFFER], last_action=None)
+        assert "最近一輪" not in text
+

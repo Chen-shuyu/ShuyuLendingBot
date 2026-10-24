@@ -407,7 +407,8 @@ class TestMarketFloor:
     def test_absolute_floor_still_wins_over_the_market_floor(self, make_strategy):
         """兩道下限的分工：成交價下限把價位拉起來，`minimum_rate` 再決定賣不賣。
 
-        正式設定是 `minimum_rate` = 0.00021918（年化 8.00%，使用者指定）。
+        值沿用 2026-08-16～10-24 的正式設定 `minimum_rate` = 0.00021918（年化 8.00%，使用者指定；
+        D074 起正式設定改成 5%）——這條釘的是兩道下限的分工，不是正式設定的值。
         事故那種簿子下，成交價下限只拉得到年化 7.76%，仍低於地板 → **整輪不掛單**。
         """
         strategy = make_strategy(minimum_rate=0.00021918)

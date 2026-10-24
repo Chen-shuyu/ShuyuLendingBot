@@ -81,9 +81,24 @@ class TestProjectConfig:
 
         48 是掃描出來的**高原**（24／36／48 選出同一個價、命中 46 次），不是最大值
         ——挑最大值是 `target_queue_usd` 的死法（D032）。
+
+        🔴 **2026-10-24 改回天期 2 ＋ P12（D074）**：長天期判定 🟡（D073）。反方向的陷阱一樣存在
+        ——只把天期改回 2、P 留在 48，天期 2 下全期實得會從 6.33% 掉到 5.16%（模型挑太貴、等太久）。
         """
-        assert config["strategy"]["offer_period"] == 30
-        assert config["strategy"]["assumed_hold_hours"] == 48
+        assert config["strategy"]["offer_period"] == 2
+        assert config["strategy"]["assumed_hold_hours"] == 12
+
+    def test_地板釘的是使用者選定的值(self, config):
+        """🔴 **D074：`minimum_rate` 是使用者的生意決定，不是校準題。**
+
+        2026-08-16 使用者定「年化 8% 以下不借」；2026-10-24 看完兩個多月的實測後改成 5%
+        ——8% 是依當時的成交帶（8.68%～10.00%）定的，10 月市場常態約 5%，它讓錢八成時間閒著。
+        釘住它的理由同上：**要防的是沒有人注意到它被改了**，不論往哪個方向。
+        真正擋賤賣的是 `market_floor_pct`（D033），那一條不在這次的改動裡。
+        """
+        assert config["strategy"]["minimum_rate"] == 0.00013699
+        assert config["strategy"]["minimum_rate"] * 365 * 100 == pytest.approx(5.0, abs=0.001)
+        assert config["strategy"]["market_floor_pct"] == 0.85
 
     def test_ships_without_credentials(self, config, monkeypatch):
         monkeypatch.delenv("BFX_API_KEY", raising=False)

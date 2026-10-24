@@ -32,6 +32,6 @@
    curl -s "https://api-pub.bitfinex.com/v2/candles/trade:1h:fUSD:p2/hist?start=<ms>&end=<ms>&limit=10000&sort=1" -o dl2/candles_p2.json
    ```
    先拿重疊段跟 DB 的 `market_candles` 對過再用（10-24 那次：天期 30 872 根 0 不一致）。
-3. `hold_samples.json`、`market_rate_by_hour.json`：由 DB 副本產生（產生方式見 D074 第二節與 `sim.py` 的說明）。
+3. `hold_samples.json`、`market_rate_by_hour.json`：`python3 make_inputs.py`（從 DB 副本產生）。
 
 ⚠ **天期 30 的模擬會把等待算快約 3 倍**（排隊看不到）——只能當上限。天期 2 才驗得過。

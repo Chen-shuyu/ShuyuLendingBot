@@ -55,3 +55,16 @@ POLICY_SIM_CANDLES=dl3 POLICY_SIM_MR=w1101/market_rate_by_hour.json python3 w110
 持有樣本預設用 **D074 凍結的那一袋**（`hold_samples_20261024.json`），`POLICY_SIM_BAG` 可換。
 K 線要**重抓到當天**，並先跟 DB 的 `market_candles` 比對過；`market_rate_by_hour.json` 用 `make_inputs.py` 的做法從新的 DB 副本重建。
 ⚠ `make_inputs.py` 會用當下的 DB 重建 `hold_samples.json`（已含 10-24 之後的新樣本），那**不是**凍結袋。
+
+## 逐筆成交引擎（D075）：`w1102/`
+
+重播真金掛單天期 2、天期 30 都是 1.00×（K 線規則 0.61×）。**丙-4 要做工具時，引擎從這裡拿，不要再用上面 K 線那版。**
+
+執行順序（工作目錄就是本目錄，資料不進版控）：
+
+1. `python3 -I w1102/fetch_trades.py`：抓公開逐筆成交進 `dl_trades/trades.sqlite3`（可續傳，每 5 秒一頁，約 50 分鐘；改日期在檔案開頭）
+2. 放 `snap/lending-latest.sqlite3`（正式 DB 的 backup 副本）、`dl_stats/a.json`（早期 FRR，`funding/stats/fUSD/hist`）、`hold_samples.json`（凍結袋）
+3. `python3 -I w1102/build_cache.py`：把成交分成真掃單／FRR 管道／正號，存 `w1102/cache/`
+4. `python3 -I w1102/validate3.py`：**先驗收**（兩個天期都要 1.00×）
+5. `python3 -I w1102/accept.py`：整段歷史重現實際報酬
+6. `python3 -I w1102/prices.py`、`run_periods.py`、`show_periods.py`、`paired_periods.py`：各天期比較

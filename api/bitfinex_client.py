@@ -8,7 +8,7 @@ Bitfinex funding 相關操作一律走 ccxt 的 raw/implicit API，統一方法�
 bitfinex 實作裡從未存在過（見 DECISIONS.md D010）。
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from api.base import ExchangeClient
 from api.rate_limiter import RetrySettings, with_retry
@@ -268,8 +268,49 @@ class BitfinexClient(ExchangeClient):
 
     # 純讀取且冪等，可安全重試。
     @with_retry()
+    def get_trades_page(
+        self, currency: str, start_ms: int, end_ms: int, limit: int = 10_000
+    ) -> List[Tuple[int, int, float, float, int]]:
+        """一頁公開成交，依時間由舊到新，**金額保留正負號**（D075）。
+
+        回傳 `(id, mts, amount, rate, period)`。跟 `get_recent_trades()` 不同的地方：
+        那支把金額取絕對值，因為常態價不在乎方向；而對帳要分得出「掛單被吃」（負號）。
+        """
+        exchange = self._public_exchange()
+        symbol = f"f{currency}"
+        try:
+            rows = exchange.public_get_trades_symbol_hist(
+                {
+                    "symbol": symbol,
+                    "start": int(start_ms),
+                    "end": int(end_ms),
+                    "limit": limit,
+                    "sort": 1,
+                }
+            )
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            raise RetryableError(f"查詢 {symbol} 逐筆成交逾時或超過速率限制：{exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise RetryableError(f"查詢 {symbol} 逐筆成交時交易所回傳錯誤：{exc}") from exc
+
+        try:
+            # 五欄全是字串（B6），一律自己轉型。
+            return [
+                (int(row[0]), int(row[1]), float(row[2]), float(row[3]), int(row[4]))
+                for row in rows
+            ]
+        except (IndexError, ValueError, TypeError) as exc:
+            raise RetryableError(f"無法解析 {symbol} 逐筆成交回應：{exc}") from exc
+
+    # 純讀取且冪等，可安全重試。
+    @with_retry()
     def get_rate_candles(
-        self, currency: str, period: int = 2, timeframe: str = "1h", limit: int = 5_000
+        self,
+        currency: str,
+        period: int = 2,
+        timeframe: str = "1h",
+        limit: int = 5_000,
+        end_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """取得放貸利率 K 線（公開端點，不需簽章），依時間升冪排序。
 
@@ -283,20 +324,25 @@ class BitfinexClient(ExchangeClient):
         端點是 `/v2/candles/trade:{timeframe}:f{ccy}:p{period}/hist`。
         **`p{period}` 這一段不能省**：不指定天期會把所有天期混在一起，
         而 2 天期佔了 86% 的供給、價格結構與長天期不同（見 D030 的天期分析）。
+
+        `end_ms` 給對帳工具用（D076）：取到那一刻為止最新的 `limit` 根，機器人不傳。
+        ⚠ **一定要用 `sort=-1`**：`sort=1` 沒帶起點會拿到歷史上最舊的那幾根
+        （2026-11-01 試算第一輪時踩到，算出 62% 的假價格）。
         """
         exchange = self._public_exchange()
         symbol = f"f{currency}"
+        params: Dict[str, Any] = {
+            "timeframe": timeframe,
+            "symbol": symbol,
+            "period": f"p{int(period)}",
+            "section": "hist",
+            "limit": limit,
+            "sort": -1,
+        }
+        if end_ms is not None:
+            params["end"] = int(end_ms)
         try:
-            rows = exchange.public_get_candles_trade_timeframe_symbol_period_section(
-                {
-                    "timeframe": timeframe,
-                    "symbol": symbol,
-                    "period": f"p{int(period)}",
-                    "section": "hist",
-                    "limit": limit,
-                    "sort": -1,
-                }
-            )
+            rows = exchange.public_get_candles_trade_timeframe_symbol_period_section(params)
         except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
             raise RetryableError(f"查詢 {symbol} 利率 K 線逾時或超過速率限制：{exc}") from exc
         except ccxt.ExchangeError as exc:

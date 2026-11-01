@@ -483,6 +483,34 @@ def funds_idle(
 # --- 收益面 -----------------------------------------------------------------
 
 
+def weekly_report(
+    headline: str,
+    fields: Dict[str, Any],
+    level: str = LEVEL_INFO,
+    action_required: bool = False,
+) -> str:
+    """每週對帳（D076）。**一週一則**，額度算 4～5 則/月。
+
+    內容由 `core/weekly.py` 算好，這裡只決定分類與長相。判準都過就是 📊 ＋「無需處理」：
+    這則訊息大部分的週都應該長這樣，而不是每週都在喊。
+    """
+    return build(CATEGORY_EARNINGS, headline, fields, level=level, action_required=action_required)
+
+
+def weekly_report_failed(week: str, reason: str) -> str:
+    """週報算不出來。**每週最多一則**（呼叫端負責）；定時器每天會再試，算出來就照常推。"""
+    return build(
+        CATEGORY_EARNINGS,
+        f"週報 {week} 算不出來",
+        {
+            "原因": reason,
+            "後續": "每天 18:35 會自動再試。看 journalctl --user -u shuyu-lending-bot-weekly",
+        },
+        level=LEVEL_ERROR,
+        action_required=True,
+    )
+
+
 def daily_earnings_digest(
     date: str,
     interest: float,

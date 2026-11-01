@@ -121,6 +121,48 @@ def trades():
         pytest.skip(f"連不上 Bitfinex 公開端點，略過連線測試：{exc}")
 
 
+class TestWeeklyReportContract:
+    """週報依賴的兩支公開端點語意（D076）。
+
+    兩件事都是踩過才知道的：逐筆要看**負號**（D075）；K 線 `sort=1` 不帶起點會拿到
+    歷史上最舊的那幾根（2026-11-01 算出 62% 的假價格），所以一定要 `sort=-1` ＋ `end`。
+    """
+
+    # 2026-10-14 那批 FRR 大單前後，資料不會再變。
+    START_MS = 1_791_993_420_000
+    END_MS = 1_791_993_480_000
+
+    @pytest.fixture(scope="class")
+    def client(self):
+        return BitfinexClient({}, FakeLogger(), dry_run=True)
+
+    @pytest.fixture(scope="class")
+    def page(self, client):
+        try:
+            return client.get_trades_page("USD", self.START_MS, self.END_MS, limit=500)
+        except (RetryableError, OSError) as exc:
+            pytest.skip(f"連不上 Bitfinex 公開端點，略過連線測試：{exc}")
+
+    def test_窗內而且由舊到新(self, page):
+        moments = [row[1] for row in page]
+        assert moments and moments == sorted(moments)
+        assert self.START_MS <= moments[0] and moments[-1] <= self.END_MS
+
+    def test_那筆900萬的FRR大單是負號(self, page):
+        assert (1_791_993_427_000, -9_000_000.0, 30) in {(row[1], row[2], row[4]) for row in page}
+
+    def test_K線指定窗尾會拿到窗尾之前最新的那幾根(self, client):
+        try:
+            candles = client.get_rate_candles("USD", period=2, limit=24, end_ms=self.END_MS)
+        except (RetryableError, OSError) as exc:
+            pytest.skip(f"連不上 Bitfinex 公開端點，略過連線測試：{exc}")
+        assert candles
+        assert candles[-1]["mts"] <= self.END_MS
+        # 不是歷史上最舊的那幾根：離窗尾不到兩天。
+        assert self.END_MS - candles[-1]["mts"] < 48 * 3_600_000
+        assert [candle["mts"] for candle in candles] == sorted(candle["mts"] for candle in candles)
+
+
 class TestRecentTradesContract:
     """守住 `get_recent_trades()` 依賴的回應格式（D033）。
 

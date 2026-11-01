@@ -151,6 +151,89 @@ def test_開倉相隔超過視窗就不算拆單():
     assert screen.episodes == 3
 
 
+def test_沒有雙胞胎的loan是真的放貸要留下():
+    """🔴 **D076／待改③**：10-11 的 61946224 沒有 credit，帳本 10-12 卻入帳 0.0073 USD。"""
+    rows = [
+        position(
+            position_id="61946224",
+            kind="loan",
+            amount=347.73,
+            rate=0.0003,
+            period=30,
+            opened_at="2026-10-11T22:59:49+08:00",
+            closed_at="2026-10-12T00:59:13+08:00",
+            first_seen_at="2026-10-11T23:07:57+08:00",
+        )
+    ]
+    screen = hold_time.screen_positions(rows)
+    assert [row["position_id"] for row in screen.kept] == ["61946224"]
+    assert [row["position_id"] for row in screen.orphans] == ["61946224"]
+    assert screen.ghosts == []
+
+
+def test_孤兒與旁邊有雙胞胎的loan各走各的():
+    """10-30 那種有雙胞胎的照排除；同一批裡的孤兒不會被順手帶走。"""
+    opened = "2026-10-30T23:03:20+08:00"
+    rows = [
+        position(position_id="468000001", amount=348.11, rate=0.00015997, opened_at=opened),
+        position(
+            position_id="62333142", kind="loan", amount=348.11, rate=0.00015997, opened_at=opened
+        ),
+        position(
+            position_id="61668514",
+            kind="loan",
+            amount=346.58,
+            rate=0.000279,
+            period=30,
+            opened_at="2026-09-25T01:59:42+08:00",
+        ),
+    ]
+    screen = hold_time.screen_positions(rows)
+    assert [row["position_id"] for row in screen.ghosts] == ["62333142"]
+    assert [row["position_id"] for row in screen.orphans] == ["61668514"]
+    assert {row["position_id"] for row in screen.kept} == {"468000001", "61668514"}
+
+
+@pytest.mark.parametrize(
+    "credit_changes",
+    [
+        {"amount": 347.11},
+        {"rate": 0.00016997},
+        {"opened_at": "2026-10-30T23:09:00+08:00"},
+    ],
+    ids=["金額不同", "利率不同", "開倉相隔超過視窗"],
+)
+def test_條件差一項就不算雙胞胎(credit_changes):
+    credit = dict(amount=348.11, rate=0.00015997, opened_at="2026-10-30T23:03:20+08:00")
+    credit.update(credit_changes)
+    rows = [
+        position(position_id="1", **credit),
+        position(
+            position_id="2",
+            kind="loan",
+            amount=348.11,
+            rate=0.00015997,
+            opened_at="2026-10-30T23:03:20+08:00",
+        ),
+    ]
+    screen = hold_time.screen_positions(rows)
+    assert screen.ghosts == []
+    assert [row["position_id"] for row in screen.orphans] == ["2"]
+
+
+def test_一筆credit只能配一筆loan():
+    """同一筆錢的兩個狀態是一對一的：兩筆一樣的 loan 配一筆 credit，多出來的那筆是孤兒。"""
+    opened = "2026-10-30T23:03:20+08:00"
+    rows = [
+        position(position_id="1", amount=348.11, opened_at=opened),
+        position(position_id="2", kind="loan", amount=348.11, opened_at=opened),
+        position(position_id="3", kind="loan", amount=348.11, opened_at=opened),
+    ]
+    screen = hold_time.screen_positions(rows)
+    assert len(screen.ghosts) == 1
+    assert len(screen.orphans) == 1
+
+
 def test_kind_是_None_的舊列一律留著():
     """不確定它是什麼，就不要替它決定——**排除是有代價的操作**。"""
     rows = [position(position_id="1", kind=None), position(position_id="2", kind="")]

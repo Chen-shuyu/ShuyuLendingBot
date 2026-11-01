@@ -86,6 +86,11 @@ def _screen_lines(screen: Optional[hold_time.PositionScreen]) -> List[str]:
             f"它們與 credit 是**同一筆錢的兩個狀態**，一起算等於把同一筆生意數兩次。"
             f"（原始列沒有刪，只是不列入統計。）"
         )
+    if screen.orphans:
+        lines.append(
+            f"⚠ 另有 {len(screen.orphans)} 筆 kind='loan' **沒有 credit 雙胞胎**，"
+            f"那段時間只有這一列，所以當成真實部位**列入統計**（D076）。"
+        )
     if screen.split_groups:
         merged = sum(len(group) - 1 for group in screen.split_groups)
         lines.append(

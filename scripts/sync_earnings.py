@@ -14,6 +14,10 @@
     python3 scripts/sync_earnings.py --write          # 真的寫進 earnings_daily
     python3 scripts/sync_earnings.py --principal 344.31 --since 2026-08-15
     python3 scripts/sync_earnings.py --write --currency USD
+    python3 scripts/sync_earnings.py --since 2026-10-25 --until 2026-10-31 --earned
+
+`--earned`（看哪天賺的，D072 第五節）：`--since`／`--until` 講的是**賺錢的日子**，
+入帳日整個往後平移一天。**跨設定比較、週報一律用它。**
 
 ## 為什麼這件事重要
 
@@ -25,9 +29,10 @@
 import argparse
 import sqlite3
 import sys
+from datetime import date as Date
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -77,8 +82,65 @@ def load_positions(db_path: Path, currency: str) -> List[Dict[str, Any]]:
     return hold_time.screen_positions(rows).kept
 
 
+def _parse_day(text: str) -> Date:
+    return datetime.strptime(text, "%Y-%m-%d").date()
+
+
+def _midnight(day: Date) -> datetime:
+    return datetime(day.year, day.month, day.day, tzinfo=clock.get_timezone())
+
+
+def report_days(
+    summary: earnings.LedgerSummary,
+    since: Optional[str],
+    until: Optional[str],
+    earned: bool = False,
+) -> Tuple[Date, Date]:
+    """這份報告涵蓋的第一天與最後一天（含頭含尾的曆日），**三段都用這一組**。
+
+    🔴 **帳本、利用率、毛／淨對帳必須涵蓋同一段時間**（D069 追記的教訓）。
+    沒給 `--since`／`--until` 就從帳本的第一列、最後一列推；
+    `earned=True` 時帳本日期要減一天才是賺錢的日子。
+    """
+    shift = timedelta(days=1) if earned else timedelta(0)
+    first = _parse_day(since) if since else _parse_day(summary.days[0].date) - shift
+    last = _parse_day(until) if until else _parse_day(summary.days[-1].date) - shift
+    return first, last
+
+
+def report_window(
+    summary: earnings.LedgerSummary,
+    since: Optional[str],
+    until: Optional[str],
+    earned: bool = False,
+    now: Optional[datetime] = None,
+) -> Tuple[datetime, datetime]:
+    """算部位時用的窗：開頭那天 00:00 到 `min(最後一天 + 1 天, 現在)`（D071 第五節①）。
+
+    🔴 **窗尾不能超過「現在」。** 以前窗尾固定是最後入帳日 + 1 天，而部位只算到現在，
+    於是白天跑的時候分母比分子多了半天，利用率偏低——**被固定住的參數是「跑的時刻」**。
+    """
+    first, last = report_days(summary, since, until, earned)
+    return _midnight(first), min(_midnight(last) + timedelta(days=1), now or clock.now())
+
+
+def select_entries(
+    entries: List[Dict[str, Any]],
+    since: Optional[str],
+    until: Optional[str],
+    earned: bool = False,
+) -> List[Dict[str, Any]]:
+    """把帳本裁到窗內。`earned=True` 時窗是賺錢的日子，要讀的入帳日往後平移一天。"""
+    first = _parse_day(since) if since else None
+    last = _parse_day(until) if until else None
+    if earned:
+        first = first + timedelta(days=1) if first else None
+        last = last + timedelta(days=1) if last else None
+    return earnings.entries_within(entries, first, last)
+
+
 def load_deployed_capital(
-    db_path: Path, currency: str, since: Optional[str]
+    db_path: Path, currency: str, since: Optional[str], until: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """唯讀讀出「已部署資金」當實得年化的分母（D065 落地、D069 接上）。
 
@@ -107,6 +169,9 @@ def load_deployed_capital(
         if since:
             sql += " AND date >= ?"
             params.append(since)
+        if until:
+            sql += " AND date <= ?"
+            params.append(until)
         rows = [dict(row) for row in connection.execute(sql + " ORDER BY date", params)]
     except sqlite3.Error:
         # **失敗一律吞掉**：報表不可以把「唯一那條會寫帳本的路」弄掉（D052 的守則）。
@@ -130,6 +195,9 @@ def format_utilization(
     positions: List[Dict[str, Any]],
     since: Optional[str],
     capital: Optional[Dict[str, Any]],
+    until: Optional[str] = None,
+    earned: bool = False,
+    now: Optional[datetime] = None,
 ) -> List[str]:
     """資金利用率，並排「利用率 × 名目 × 0.85」與帳本實得（D069）。
 
@@ -142,19 +210,9 @@ def format_utilization(
     """
     if not positions or not summary.days or not capital:
         return []
-    last = datetime.strptime(summary.days[-1].date, "%Y-%m-%d").replace(
-        tzinfo=clock.get_timezone()
-    )
-    start = (
-        datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=clock.get_timezone())
-        if since
-        else datetime.strptime(summary.days[0].date, "%Y-%m-%d").replace(
-            tzinfo=clock.get_timezone()
-        )
-    )
-    # 含頭含尾：最後一天整天都算（同 `format_summary()` 的曆日數）。
-    end = last + timedelta(days=1)
-    got = earnings.capital_utilization(positions, capital["value"], start, end)
+    now = now or clock.now()
+    start, end = report_window(summary, since, until, earned, now)
+    got = earnings.capital_utilization(positions, capital["value"], start, end, now=now)
     if not got:
         return []
 
@@ -162,7 +220,10 @@ def format_utilization(
     nominal = got["nominal_annual_pct"]
     expected = util / 100 * nominal * (100 - earnings.FUNDING_FEE_PCT) / 100
     days = got["window_hours"] / 24
-    actual = summary.realized_annual_pct(capital["value"], max(round(days), 1))
+    # 帳本那半用含頭含尾的曆日（同 `format_summary()`）；窗尾被「現在」裁掉的那幾小時不扣，
+    # 因為最後一列入帳本來就是前一天賺的。
+    first, last = report_days(summary, since, until, earned)
+    actual = summary.realized_annual_pct(capital["value"], max((last - first).days + 1, 1))
 
     lines = ["", "--- 為什麼是這個數字：利用率 × 名目 ---"]
     lines.append(
@@ -202,6 +263,9 @@ def format_reconciliation(
     summary: earnings.LedgerSummary,
     positions: List[Dict[str, Any]],
     since: Optional[str],
+    until: Optional[str] = None,
+    earned: bool = False,
+    now: Optional[datetime] = None,
 ) -> List[str]:
     """帳本淨利息 vs 從部位推算的毛利息，並排（D065）。
 
@@ -217,10 +281,11 @@ def format_reconciliation(
         return []
     # 🔴 **兩半必須涵蓋同一段時間。** 帳本那半已經被 `--since` 篩過了，
     # 所以推算那半也要裁到同一個窗——不裁的後果見 `expected_gross_interest` 的說明。
-    start = None
-    if since:
-        start = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=clock.get_timezone())
-    gross = earnings.expected_gross_interest(positions, start=start)
+    now = now or clock.now()
+    window_start, window_end = report_window(summary, since, until, earned, now)
+    gross = earnings.expected_gross_interest(
+        positions, now=now, start=window_start if since else None, end=window_end
+    )
     if gross <= 0:
         return []
     ratio = summary.total_interest / gross * 100
@@ -259,6 +324,8 @@ def format_summary(
     principal: Optional[float],
     since: Optional[str],
     capital: Optional[Dict[str, Any]] = None,
+    until: Optional[str] = None,
+    earned: bool = False,
 ) -> str:
     """把帳本摘要排版成人看的報告。
 
@@ -293,14 +360,17 @@ def format_summary(
     lines.append("")
     lines.append(f"  **合計 {summary.total_interest:.8f} USD**（{len(summary.days)} 天）")
 
-    first = datetime.strptime(summary.days[0].date, "%Y-%m-%d")
-    last = datetime.strptime(summary.days[-1].date, "%Y-%m-%d")
+    if earned:
+        lines.append(
+            "  📌 **看哪天賺的**：入帳日 D 的利息算 D-1 賺的（D072 第五節），"
+            "所以上面列的是入帳日，下面的期間是賺錢的日子。"
+        )
     # 🔴 **分母的起點是「期間的開始」，不是「第一筆入帳」。**
     # 用第一筆入帳當起點，會把「錢已經進來但還沒借出去」的那段時間
     # 從分母裡刪掉——而那正是這個專案一路踩過來的同一個坑
     # （`wait_report` 的 7.99% 就是這樣偏樂觀的）。
     # 給了 `--since` 就從那天算起：使用者說期間從哪裡開始，就從哪裡開始。
-    start = datetime.strptime(since, "%Y-%m-%d") if since else first
+    start, last = report_days(summary, since, until, earned)
     # 🔴 **`+ 1`：曆日數是「含頭含尾」，不是兩個日期相減。**
     # 2026-09-12 之前這裡是 `(last - start).days`，而同一個函式裡的空白日判斷
     # 用的卻是 `elapsed + 1`——**同一份報告裡兩種天數**。
@@ -373,8 +443,8 @@ def format_summary(
             "（D065 之前的資料），而你也沒給 `--principal`。"
             "**不要自己拿合計去除入帳列數**——那正是 D069 第一節那個錯數字的來源。"
         )
-    if since:
-        lines.append(f"  （只算 {since} 之後）")
+    if since or until:
+        lines.append(f"  （只算 {since or '最早'} → {until or '最新'}）")
     return "\n".join(lines)
 
 
@@ -385,6 +455,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--limit", type=int, default=500, help="一次抓幾列帳本")
     parser.add_argument(
         "--since", default=None, help="只算這個日期之後的入帳（YYYY-MM-DD）"
+    )
+    parser.add_argument("--until", default=None, help="算到這個日期為止（YYYY-MM-DD，含當天）")
+    parser.add_argument(
+        "--earned",
+        action="store_true",
+        help="看哪天賺的：--since／--until 講賺錢的日子，入帳日往後平移一天（D072）",
     )
     parser.add_argument(
         "--principal", type=float, default=None, help="算實得年化用的本金（USD）"
@@ -409,20 +485,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("交易所客戶端沒有初始化——請確認 API 金鑰。", file=sys.stderr)
         return 1
 
+    for text in (args.since, args.until):
+        if text:
+            try:
+                _parse_day(text)
+            except ValueError:
+                print(f"看不懂的日期：{text}（格式是 YYYY-MM-DD）", file=sys.stderr)
+                return 1
+    if args.since and args.until and args.until < args.since:
+        print(f"--until {args.until} 早於 --since {args.since}", file=sys.stderr)
+        return 1
+
+    # 賺錢窗要讀的入帳日往後平移一天；本金也讀同一段入帳日。
+    shift = timedelta(days=1) if args.earned else timedelta(0)
+    ledger_first = (_parse_day(args.since) + shift).isoformat() if args.since else None
+    ledger_last = (_parse_day(args.until) + shift).isoformat() if args.until else None
+
     start_ms = None
-    if args.since:
-        try:
-            since = datetime.strptime(args.since, "%Y-%m-%d").replace(
-                tzinfo=clock.get_timezone()
-            )
-        except ValueError:
-            print(f"看不懂的日期：{args.since}（格式是 YYYY-MM-DD）", file=sys.stderr)
-            return 1
-        start_ms = int(since.timestamp() * 1000)
+    if ledger_first:
+        start_ms = int(_midnight(_parse_day(ledger_first)).timestamp() * 1000)
 
     entries = client.get_funding_ledger(
         args.currency, limit=args.limit, start_ms=start_ms
     )
+    entries = select_entries(entries, args.since, args.until, args.earned)
     summary = earnings.summarize(entries, currency=args.currency)
 
     configured = args.db or ((config.get("database") or {}).get("path"))
@@ -435,11 +521,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     capital = None
     if db_path.exists():
         try:
-            capital = load_deployed_capital(db_path, args.currency, args.since)
+            capital = load_deployed_capital(db_path, args.currency, ledger_first, ledger_last)
         except Exception as exc:  # noqa: BLE001 - 見上
             print(f"（讀不到已部署資金，實得年化改用 --principal：{exc}）")
 
-    print(format_summary(summary, args.principal, args.since, capital))
+    print(format_summary(summary, args.principal, args.since, capital, args.until, args.earned))
 
     # 🔴 **對帳在 `--write` 的分岔之前**：它是唯讀的，而**只看不寫的那條路
     # 才是最需要它的那條**——「先看一眼對不對」正是不寫的時候要做的事。
@@ -448,11 +534,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             positions = load_positions(db_path, args.currency)
             utilization = format_utilization(
-                summary, positions, args.since, capital
+                summary, positions, args.since, capital, args.until, args.earned
             )
             if utilization:
                 print("\n".join(utilization))
-            reconciliation = format_reconciliation(summary, positions, args.since)
+            reconciliation = format_reconciliation(
+                summary, positions, args.since, args.until, args.earned
+            )
             if reconciliation:
                 print("\n".join(reconciliation))
         except Exception as exc:  # noqa: BLE001 - 見上

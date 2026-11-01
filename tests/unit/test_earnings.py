@@ -14,6 +14,8 @@
    但如果這裡沒先合併，同一天的兩筆會互相覆蓋，只留下最後一筆。
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from core import earnings
@@ -337,7 +339,8 @@ class TestD065對帳的判讀:
     class _Summary:
         def __init__(self, total, days=1):
             self.total_interest = total
-            self.days = [object()] * days
+            # 最後入帳日決定窗尾（D076）：09-02 → 窗到 09-03 00:00，剛好涵蓋下面的部位。
+            self.days = [SimpleNamespace(date="2026-09-02")] * days
 
     @staticmethod
     def _positions(gross_target):

@@ -1,0 +1,219 @@
+{
+"note": "2026-10-25～10-31 的真實帳本與部位，答案在 D074 第九節。",
+"earnings": [
+{
+"date": "2026-10-20",
+"interest": 0.08287464,
+"principal_avg": 347.88054228
+},
+{
+"date": "2026-10-21",
+"interest": 0.04967137,
+"principal_avg": 347.93021365
+},
+{
+"date": "2026-10-25",
+"interest": 0.00355212,
+"principal_avg": 347.93376577
+},
+{
+"date": "2026-10-27",
+"interest": 0.03811042,
+"principal_avg": 347.97187619
+},
+{
+"date": "2026-10-28",
+"interest": 0.05336933,
+"principal_avg": 348.02524552
+},
+{
+"date": "2026-10-29",
+"interest": 0.0453057,
+"principal_avg": 348.07055121999997
+},
+{
+"date": "2026-10-30",
+"interest": 0.04927603,
+"principal_avg": 348.11982724999996
+},
+{
+"date": "2026-10-31",
+"interest": 0.03614892,
+"principal_avg": 348.15597617000003
+},
+{
+"date": "2026-11-01",
+"interest": 0.04995719,
+"principal_avg": 348.20593336
+}
+],
+"positions": [
+{
+"position_id": "468244200",
+"currency": "USD",
+"amount": 347.93,
+"rate": 0.000177,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-25T00:10:33+08:00",
+"first_seen_at": "2026-10-25T00:15:51+08:00",
+"closed_at": "2026-10-25T01:56:47+08:00"
+},
+{
+"position_id": "468320350",
+"currency": "USD",
+"amount": 347.93,
+"rate": 0.000168,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-26T09:51:06+08:00",
+"first_seen_at": "2026-10-26T09:57:22+08:00",
+"closed_at": "2026-10-26T21:54:57+08:00"
+},
+{
+"position_id": "468359331",
+"currency": "USD",
+"amount": 347.93,
+"rate": 0.000168,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-26T22:30:53+08:00",
+"first_seen_at": "2026-10-26T22:35:20+08:00",
+"closed_at": "2026-10-28T22:46:19+08:00"
+},
+{
+"position_id": "468485052",
+"currency": "USD",
+"amount": 348.02,
+"rate": 0.00015997,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-28T22:50:43+08:00",
+"first_seen_at": "2026-10-28T22:56:29+08:00",
+"closed_at": "2026-10-30T22:58:30+08:00"
+},
+{
+"position_id": "62333142",
+"currency": "USD",
+"amount": 348.11,
+"rate": 0.00015997,
+"period": 2,
+"kind": "loan",
+"opened_at": "2026-10-30T23:03:20+08:00",
+"first_seen_at": "2026-10-30T23:08:39+08:00",
+"closed_at": "2026-10-30T23:18:45+08:00"
+},
+{
+"position_id": "468616489",
+"currency": "USD",
+"amount": 348.11,
+"rate": 0.00015997,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-30T23:03:20+08:00",
+"first_seen_at": "2026-10-30T23:18:45+08:00",
+"closed_at": "2026-10-30T23:38:58+08:00"
+},
+{
+"position_id": "468621555",
+"currency": "USD",
+"amount": 348.11,
+"rate": 0.00015997,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-31T01:10:41+08:00",
+"first_seen_at": "2026-10-31T01:20:07+08:00",
+"closed_at": "2026-10-31T01:40:19+08:00"
+},
+{
+"position_id": "468628334",
+"currency": "USD",
+"amount": 348.11,
+"rate": 0.00015997,
+"period": 2,
+"kind": "credit",
+"opened_at": "2026-10-31T04:30:43+08:00",
+"first_seen_at": "2026-10-31T04:31:58+08:00",
+"closed_at": null
+}
+],
+"offers": [
+{
+"created_at": "2026-10-24T20:11:09+08:00",
+"rate": 0.000185,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-25T00:05:50+08:00",
+"rate": 0.000177,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-25T01:56:52+08:00",
+"rate": 0.000177,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-25T02:07:04+08:00",
+"rate": 0.0001847,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-25T06:09:47+08:00",
+"rate": 0.000177,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-26T03:03:11+08:00",
+"rate": 0.000168,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-26T21:55:02+08:00",
+"rate": 0.000168,
+"duration": 2,
+"amount": 347.93,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-28T22:46:27+08:00",
+"rate": 0.00015997,
+"duration": 2,
+"amount": 348.02,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-30T22:58:38+08:00",
+"rate": 0.00015997,
+"duration": 2,
+"amount": 348.11,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-30T23:39:06+08:00",
+"rate": 0.00015997,
+"duration": 2,
+"amount": 348.11,
+"status": "submitted"
+},
+{
+"created_at": "2026-10-31T01:40:25+08:00",
+"rate": 0.00015997,
+"duration": 2,
+"amount": 348.11,
+"status": "submitted"
+}
+]
+}

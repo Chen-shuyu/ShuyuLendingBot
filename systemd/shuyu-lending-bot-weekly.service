@@ -1,0 +1,10 @@
+[Unit]
+Description=Shuyu Bitfinex Lending Bot 每週對帳（沒有新的一週就什麼都不做）
+
+[Service]
+Type=oneshot
+# 跑在容器裡：要用線上那份策略程式、DB 也掛在容器裡（/app/data）。容器沒在跑就失敗，隔天再試；
+# 容器掛掉本來就有主單元的告警，所以這裡不掛 OnFailure=。算不出來時腳本自己推 LINE（一週最多一則）。
+ExecStart=/usr/bin/podman exec shuyu-lending-bot python /app/scripts/weekly_report.py --push-line
+# 逐筆成交一週約 35 頁、每頁停 5 秒，加上模擬約 5 分鐘；留足夠的餘裕。
+TimeoutStartSec=1800

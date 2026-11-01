@@ -1,0 +1,12 @@
+[Unit]
+Description=Shuyu Bitfinex Lending Bot 每週對帳（定時器）
+
+[Timer]
+# 每天跑，腳本自己判斷這一週推過了沒：週日剛好在部署或斷網，隔天會自己補上（D076）。
+# 週日 18:30 之後才算上一週（core/weekly.py），所以訂在 18:35。
+OnCalendar=*-*-* 18:35:00
+# 當天主機沒開機的話，開機後補跑
+Persistent=true
+
+[Install]
+WantedBy=timers.target

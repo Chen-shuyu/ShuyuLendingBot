@@ -393,6 +393,8 @@ CREATE TABLE IF NOT EXISTS bot_kv (
 # 也不會再出現「加了旋鈕、驗收工具隔天就開始說謊」。
 ADD_COLUMNS = (
     ("pricing_decisions", "pricing_knobs_json", "TEXT"),
+    # 掛單類型（D076）：舊列的 NULL 就是 LIMIT，那時候只有這一種。
+    ("loan_offers", "offer_type", "TEXT"),
 )
 
 ALL_STATEMENTS = (

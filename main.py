@@ -13,6 +13,7 @@ from pathlib import Path
 from api.bitfinex_client import BitfinexClient
 from config.settings import load_config, load_secrets_from_disk, resolve_config_path
 from core.bot_engine import EXIT_FATAL, EXIT_OK, EXIT_UNEXPECTED, BotEngine
+from core.frr_test import FrrTestConfig
 from db.repository import Repository
 from notify.line_messaging import LineNotifier
 from strategies.expected_value import ExpectedValueStrategy
@@ -94,6 +95,8 @@ def main() -> int:
         # 錢超過幾小時沒借出去就推一則（D074／待改⑧）。跟 `push_trade_events` 一樣放在 line: 底下
         # ——它管的是「要不要推播」。設 0 就關掉；**它不影響掛單**（放在迴圈層，D052）。
         idle_alert_hours=float(config.get("line", {}).get("idle_alert_hours", 12.0)),
+        # FRR 小額實測（D076 第三節）。設定寫錯就在這裡當場失敗，不要帶著錯的設定去掛真錢。
+        frr_test=FrrTestConfig.from_config(config),
     )
 
     logger.info("開始執行 Bitfinex 放貸機器人")

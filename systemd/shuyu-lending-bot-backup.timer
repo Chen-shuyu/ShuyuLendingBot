@@ -1,0 +1,10 @@
+[Unit]
+Description=Shuyu Bitfinex Lending Bot 資料庫每日備份（定時器）
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+# 當天主機沒開機的話，開機後補跑
+Persistent=true
+
+[Install]
+WantedBy=timers.target

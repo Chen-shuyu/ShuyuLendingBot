@@ -1,0 +1,10 @@
+[Unit]
+Description=Shuyu Bitfinex Lending Bot 資料庫每日備份
+
+[Service]
+Type=oneshot
+# 跑在容器外：機器人壞掉的時候備份更不能停。腳本與告警腳本裝在同一個目錄（CI 負責）。
+# 失敗時腳本自己推 LINE，所以這裡不掛 OnFailure=（告警單元講的是主單元的狀態，會講錯）。
+Environment=BFX_DB_PATH=/workspace/deploy/active-bots/ShuyuLendingBot/data/lending.sqlite3
+ExecStart=/usr/bin/python3 %h/.local/share/shuyu-lending-bot/backup_db.py
+TimeoutStartSec=600

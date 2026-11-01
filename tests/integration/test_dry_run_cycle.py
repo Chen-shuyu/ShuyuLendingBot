@@ -84,8 +84,10 @@ class TestProjectConfig:
 
         🔴 **2026-10-24 改回天期 2 ＋ P12（D074）**：長天期判定 🟡（D073）。反方向的陷阱一樣存在
         ——只把天期改回 2、P 留在 48，天期 2 下全期實得會從 6.33% 掉到 5.16%（模型挑太貴、等太久）。
+
+        🔴 **2026-11-01 天期改成 7、P 維持 12（D075／D076）**：成對比較跑的就是這一組。
         """
-        assert config["strategy"]["offer_period"] == 2
+        assert config["strategy"]["offer_period"] == 7
         assert config["strategy"]["assumed_hold_hours"] == 12
 
     def test_地板釘的是使用者選定的值(self, config):

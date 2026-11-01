@@ -31,7 +31,7 @@ dry-run 仍然保留（`config.yaml` 的 `engine.dry_run`），但不再是主�
   等待成本的權重被壓縮，選出的價位會偏高。**已知但刻意先不改**：要換成什麼值本身
   就是策略問題，得在回測工具上跑過（見 [D040](.project-docs/DECISIONS.md)）。
   隨時可查：`python3 scripts/hold_report.py`
-- **天期仍寫死 2 天**（`offer_period`），還沒納入同一套期望值計算
+- **天期是設定檔裡的固定值**（`offer_period`，目前 7 天），還沒納入同一套期望值計算（各天期的回測見 [D075](.project-docs/DECISIONS.md)）
 - **市場資料尚未落地**，所以策略改動只能用即時快照驗證，不能回測（路線圖第 1 期）
 
 ## 專案文件

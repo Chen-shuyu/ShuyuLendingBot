@@ -212,7 +212,13 @@ jobs:
           mkdir -p ~/.local/share/shuyu-lending-bot
           cp scripts/notify_failure.py ~/.local/share/shuyu-lending-bot/
 
+          # 資料庫每日備份（D076／丙-6）：跟告警一樣跑在容器外，機器人壞掉時也要能備份。
+          # 腳本 import notify_failure 來推 LINE，所以兩支裝在同一個目錄。
+          cp scripts/backup_db.py ~/.local/share/shuyu-lending-bot/
+          cp systemd/shuyu-lending-bot-backup.service systemd/shuyu-lending-bot-backup.timer ~/.config/systemd/user/
+
           systemctl --user daemon-reload
+          systemctl --user enable --now shuyu-lending-bot-backup.timer
 
       - name: 重新啟動服務
         # 不需要也不能用 `systemctl --user enable`：Quadlet 產生的單元是動態產物，
@@ -314,6 +320,19 @@ jobs:
           echo "--- 告警腳本在不在 ---"
           test -f "$HOME/.local/share/shuyu-lending-bot/notify_failure.py" || {
             echo "::error::告警腳本不存在，告警單元會啟動失敗"
+            exit 1
+          }
+
+      - name: 驗證資料庫備份已排程
+        # 同上一步的理由：備份最糟的失敗方式是「以為有在備份、其實沒有」（D076）。
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          systemctl --user is-enabled shuyu-lending-bot-backup.timer
+          systemctl --user is-active shuyu-lending-bot-backup.timer
+          systemctl --user list-timers shuyu-lending-bot-backup.timer --no-pager
+          test -f "$HOME/.local/share/shuyu-lending-bot/backup_db.py" || {
+            echo "::error::備份腳本不存在，備份單元會啟動失敗"
             exit 1
           }
 

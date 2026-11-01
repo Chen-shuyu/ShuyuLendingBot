@@ -35,3 +35,23 @@
 3. `hold_samples.json`、`market_rate_by_hour.json`：`python3 make_inputs.py`（從 DB 副本產生）。
 
 ⚠ **天期 30 的模擬會把等待算快約 3 倍**（排隊看不到）——只能當上限。天期 2 才驗得過。
+
+## 每週對帳（D074 第六節）：`w1101/`
+
+11-01 第一週對帳用的腳本（**丙-4 的工具做好之前，每週照這個跑**）：
+
+| 檔案 | 做什麼 |
+|---|---|
+| `w1101/regress.py` | 先跑這支：重現 D074 第三節的數字（差要在 0.01pp 內），確定工具沒壞 |
+| `w1101/week1.py` | 判準那張表：實得②③、利用率、名目、新舊設定模擬、幾個固定價。**換週要改裡面的日期** |
+| `w1101/others.py` | 「如果沒改」、最佳固定價、換持有樣本、照實際掛價＋實際持有重播 |
+| `w1101/sweep.py`／`paired.py` | P × `ev_window_hours` 掃描與成對比較 |
+
+```
+POLICY_SIM_WORKDIR=<放 K 線與查表的目錄> POLICY_SIM_SNAPSHOT=<DB 副本> \
+POLICY_SIM_CANDLES=dl3 POLICY_SIM_MR=w1101/market_rate_by_hour.json python3 w1101/week1.py
+```
+
+持有樣本預設用 **D074 凍結的那一袋**（`hold_samples_20261024.json`），`POLICY_SIM_BAG` 可換。
+K 線要**重抓到當天**，並先跟 DB 的 `market_candles` 比對過；`market_rate_by_hour.json` 用 `make_inputs.py` 的做法從新的 DB 副本重建。
+⚠ `make_inputs.py` 會用當下的 DB 重建 `hold_samples.json`（已含 10-24 之後的新樣本），那**不是**凍結袋。

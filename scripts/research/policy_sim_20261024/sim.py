@@ -10,6 +10,7 @@
 """
 import json
 import math
+import os
 import statistics
 import sys
 from datetime import datetime, timedelta, timezone
@@ -31,7 +32,7 @@ class Market:
     """一個天期的小時格。`hours[i]` 是第 i 小時的 K（dict）或 None（缺根＝沒成交）。"""
 
     def __init__(self, period, t0=None, t1=None):
-        raw = json.load(open(HERE + f"dl2/candles_p{period}.json"))
+        raw = json.load(open(HERE + os.environ.get("POLICY_SIM_CANDLES", "dl2") + f"/candles_p{period}.json"))
         grid = {m: {"mts": m, "open": o, "close": c, "high": h, "low": l, "volume": v}
                 for m, o, c, h, l, v in raw}
         self.period = period
@@ -63,7 +64,7 @@ def market_rate(mk, i):
     更早沒有快照的時段退回「近 6 小時收盤中位」。近 6 小時同天期完全沒成交就回 None。"""
     global _MR
     if _MR is None:
-        _MR = json.load(open(HERE + "market_rate_by_hour.json"))
+        _MR = json.load(open(HERE + os.environ.get("POLICY_SIM_MR", "market_rate_by_hour.json")))
     if not any(mk.hours[max(0, i - 6):i]):
         return None
     t = mk.t0 + i * H
@@ -158,7 +159,7 @@ class EV:
 
 # ---------------------------------------------------------------- 持有時間
 def load_bags():
-    raw = json.load(open(HERE + "hold_samples.json"))
+    raw = json.load(open(os.environ.get("POLICY_SIM_BAG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hold_samples_20261024.json"))))
     p2 = [h for r, h in raw["2"]]
     # 08-28 那三筆是同一張單的拆單（D057 的 split group），只算一段
     dedup, seen = [], set()

@@ -220,6 +220,9 @@ class FakeExchange:
     def public_get_trades_symbol_hist(self, params=None):
         return self._respond("public_get_trades_symbol_hist", params)
 
+    def public_get_candles_trade_timeframe_symbol_period_section(self, params=None):
+        return self._respond("public_get_candles_trade_timeframe_symbol_period_section", params)
+
     def private_post_auth_r_funding_credits_symbol(self, params=None):
         return self._respond("private_post_auth_r_funding_credits_symbol", params)
 
@@ -1062,3 +1065,67 @@ class TestGetRecentTrades:
         monkeypatch.setattr(client, "_public_exchange", lambda: exchange)
 
         assert client.get_recent_trades("USD")[0]["rate"] == 0.00025
+
+
+class TestGetTradesPage:
+    """對帳工具用的那一支（D076）：**金額要保留正負號**，負號才是掛單被吃（D075）。"""
+
+    def test_保留正負號而且轉型(self, make_client):
+        exchange = FakeExchange(
+            public_get_trades_symbol_hist=[
+                make_trade_row(trade_id=7, mts=100, amount=-347.73, rate=0.0003, period=30),
+                make_trade_row(trade_id=8, mts=101, amount=500.0, rate=0.0002, period=2),
+            ]
+        )
+        rows = make_client(exchange).get_trades_page("USD", 50, 200)
+        assert rows == [(7, 100, -347.73, 0.0003, 30), (8, 101, 500.0, 0.0002, 2)]
+
+    def test_帶窗與由舊到新的排序(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[])
+        make_client(exchange).get_trades_page("USD", 50, 200, limit=123)
+        _, params = exchange.calls[0]
+        assert params == {"symbol": "fUSD", "start": 50, "end": 200, "limit": 123, "sort": 1}
+
+    def test_網路問題可以重試(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=ccxt.NetworkError("timeout"))
+        with pytest.raises(RetryableError):
+            make_client(exchange).get_trades_page("USD", 50, 200)
+
+    def test_格式不對要講出來(self, make_client):
+        exchange = FakeExchange(public_get_trades_symbol_hist=[["only-one-field"]])
+        with pytest.raises(RetryableError):
+            make_client(exchange).get_trades_page("USD", 50, 200)
+
+
+class TestGetRateCandlesEnd:
+    @staticmethod
+    def _row(mts):
+        return [mts, 0.0002, 0.0002, 0.0003, 0.0001, 1000.0]
+
+    def test_機器人不傳end時參數跟以前一模一樣(self, make_client):
+        """🔴 這支在掛單路徑上：多一個參數不能改變機器人送出去的東西。"""
+        exchange = FakeExchange(public_get_candles_trade_timeframe_symbol_period_section=[self._row(1)])
+        make_client(exchange).get_rate_candles("USD", period=7, timeframe="1h", limit=240)
+        _, params = exchange.calls[0]
+        assert params == {
+            "timeframe": "1h",
+            "symbol": "fUSD",
+            "period": "p7",
+            "section": "hist",
+            "limit": 240,
+            "sort": -1,
+        }
+
+    def test_對帳工具可以指定窗尾(self, make_client):
+        exchange = FakeExchange(public_get_candles_trade_timeframe_symbol_period_section=[self._row(1)])
+        make_client(exchange).get_rate_candles("USD", period=7, limit=432, end_ms=999)
+        _, params = exchange.calls[0]
+        assert params["end"] == 999
+        assert params["sort"] == -1
+
+    def test_一律由舊到新(self, make_client):
+        exchange = FakeExchange(
+            public_get_candles_trade_timeframe_symbol_period_section=[self._row(2), self._row(1)]
+        )
+        candles = make_client(exchange).get_rate_candles("USD", period=7)
+        assert [candle["mts"] for candle in candles] == [1, 2]

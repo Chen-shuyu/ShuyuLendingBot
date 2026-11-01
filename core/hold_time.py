@@ -25,7 +25,7 @@
 """
 
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +51,12 @@ MIN_SAMPLES_FOR_QUANTILE = 3
 # 實測（2026-08-28）：一張 344.87 USD 的單被拆成 150.00／134.10／60.77 三筆，
 # `opened_at` 分別是 02:07:35／02:07:46／02:07:49（相隔 14 秒），**同時結清**。
 DEFAULT_SPLIT_WINDOW_SECONDS = 300.0
+
+# `loan` 與它的 `credit` 雙胞胎：同金額、同利率，`opened_at` 相差不超過這個秒數。
+# 實測 08-28 那三組與 10-30 那一組的 `opened_at` 都完全相同，這條線只是留個餘裕。
+DEFAULT_TWIN_WINDOW_SECONDS = 300.0
+TWIN_AMOUNT_TOLERANCE = 0.01
+TWIN_RATE_TOLERANCE = 1e-9
 
 
 @dataclass(frozen=True)
@@ -195,12 +201,19 @@ class PositionScreen:
     - **不在 `Repository.all_positions()` 裡濾**：那支的 docstring 已寫明
       「刻意不在 SQL 裡過濾，否則上層永遠不會發現自己只看到一部分」。
       在那裡加條件，正好犯它自己警告的錯。
+
+    ## 🔴 `orphans`：沒有 `credit` 雙胞胎的 `loan` 是真的放貸
+
+    D057 當初把**所有** `loan` 都排除，但 09-25 的 61668514 與 10-11 的 61946224
+    沒有對應的 `credit`——那段時間只有這一列，而帳本也有入帳（10-12 的 0.0073 USD）。
+    排除它們等於把真的生意刪掉（D071 第三節⑤）。所以它們留在 `kept`，也另外列在這裡讓報告講出來。
     """
 
     kept: List[Dict[str, Any]]
     ghosts: List[Dict[str, Any]]
     split_groups: List[List[Dict[str, Any]]]
     split_window_seconds: float
+    orphans: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def episodes(self) -> int:
@@ -212,17 +225,50 @@ class PositionScreen:
         return len(self.kept) - merged
 
 
+def _opened_moment(position: Dict[str, Any]) -> Optional[datetime]:
+    return parse_moment(position.get("opened_at")) or parse_moment(position.get("first_seen_at"))
+
+
+def _credit_twin_index(
+    loan: Dict[str, Any],
+    credits: List[Dict[str, Any]],
+    twin_window_seconds: float,
+) -> Optional[int]:
+    """`loan` 的 `credit` 雙胞胎在 `credits` 裡的位置；沒有就回 None。**有多筆取開倉最接近的。**"""
+    opened = _opened_moment(loan)
+    if opened is None:
+        return None
+    amount = float(loan.get("amount") or 0.0)
+    rate = float(loan.get("rate") or 0.0)
+    best: Optional[int] = None
+    best_gap = float("inf")
+    for index, credit in enumerate(credits):
+        credit_opened = _opened_moment(credit)
+        if credit_opened is None:
+            continue
+        gap = abs((credit_opened - opened).total_seconds())
+        if (
+            gap <= twin_window_seconds
+            and gap < best_gap
+            and abs(float(credit.get("amount") or 0.0) - amount) <= TWIN_AMOUNT_TOLERANCE
+            and abs(float(credit.get("rate") or 0.0) - rate) <= TWIN_RATE_TOLERANCE
+        ):
+            best, best_gap = index, gap
+    return best
+
+
 def screen_positions(
     positions: List[Dict[str, Any]],
     split_window_seconds: float = DEFAULT_SPLIT_WINDOW_SECONDS,
+    twin_window_seconds: float = DEFAULT_TWIN_WINDOW_SECONDS,
 ) -> PositionScreen:
-    """篩掉 `kind='loan'` 的幽靈樣本（D057），並**標記**出被拆單的那幾組。
+    """篩掉有 `credit` 雙胞胎的 `loan`（幽靈樣本，D057），並**標記**出被拆單的那幾組。
 
     ## 兩種重複，只處理其中一種
 
     | | 是什麼 | 這裡怎麼做 |
     |---|---|---|
-    | `loan`／`credit` | **同一筆錢的兩個狀態** | **排除**（D057，已確認） |
+    | `loan`／`credit` | **同一筆錢的兩個狀態** | **排除**（D057，已確認）；**沒有雙胞胎的 `loan` 留下**（D076） |
     | 拆單 | 一張掛單被交易所配對成多筆部位 | **只標記，不合併** |
 
     ## 🔴 為什麼拆單只標記不合併
@@ -241,12 +287,23 @@ def screen_positions(
     """
     kept: List[Dict[str, Any]] = []
     ghosts: List[Dict[str, Any]] = []
+    orphans: List[Dict[str, Any]] = []
+    # 一筆 credit 只能當一筆 loan 的雙胞胎：同一筆錢的兩個狀態是一對一的。
+    # `kind` 是 None 的舊列一律留著：不確定它是什麼，就不要替它決定。
+    unpaired_credits = [
+        position for position in positions if str(position.get("kind") or "").lower() != "loan"
+    ]
     for position in positions:
-        # `kind` 是 None 的舊列一律留著：不確定它是什麼，就不要替它決定。
-        if str(position.get("kind") or "").lower() == "loan":
-            ghosts.append(position)
-        else:
+        if str(position.get("kind") or "").lower() != "loan":
             kept.append(position)
+            continue
+        twin = _credit_twin_index(position, unpaired_credits, twin_window_seconds)
+        if twin is None:
+            kept.append(position)
+            orphans.append(position)
+        else:
+            del unpaired_credits[twin]
+            ghosts.append(position)
 
     groups: List[List[Dict[str, Any]]] = []
     current: List[Dict[str, Any]] = []
@@ -256,18 +313,14 @@ def screen_positions(
             groups.append(list(current))
 
     for position in kept:
-        opened = parse_moment(position.get("opened_at")) or parse_moment(
-            position.get("first_seen_at")
-        )
+        opened = _opened_moment(position)
         if opened is None:
             flush()
             current.clear()
             continue
         if current:
             previous = current[-1]
-            previous_opened = parse_moment(previous.get("opened_at")) or parse_moment(
-                previous.get("first_seen_at")
-            )
+            previous_opened = _opened_moment(previous)
             same_terms = (
                 previous.get("rate") == position.get("rate")
                 and previous.get("period") == position.get("period")
@@ -291,6 +344,7 @@ def screen_positions(
         ghosts=ghosts,
         split_groups=groups,
         split_window_seconds=split_window_seconds,
+        orphans=orphans,
     )
 
 

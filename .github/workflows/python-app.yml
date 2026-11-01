@@ -217,8 +217,12 @@ jobs:
           cp scripts/backup_db.py ~/.local/share/shuyu-lending-bot/
           cp systemd/shuyu-lending-bot-backup.service systemd/shuyu-lending-bot-backup.timer ~/.config/systemd/user/
 
+          # 每週對帳（D076）：腳本跑在容器裡，主機上只有定時器。
+          cp systemd/shuyu-lending-bot-weekly.service systemd/shuyu-lending-bot-weekly.timer ~/.config/systemd/user/
+
           systemctl --user daemon-reload
           systemctl --user enable --now shuyu-lending-bot-backup.timer
+          systemctl --user enable --now shuyu-lending-bot-weekly.timer
 
       - name: 重新啟動服務
         # 不需要也不能用 `systemctl --user enable`：Quadlet 產生的單元是動態產物，
@@ -333,6 +337,19 @@ jobs:
           systemctl --user list-timers shuyu-lending-bot-backup.timer --no-pager
           test -f "$HOME/.local/share/shuyu-lending-bot/backup_db.py" || {
             echo "::error::備份腳本不存在，備份單元會啟動失敗"
+            exit 1
+          }
+
+      - name: 驗證每週對帳已排程
+        # 沒人看的判準等於沒有判準（D076）：定時器沒掛上去的話，週報會靜悄悄地不來。
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          systemctl --user is-enabled shuyu-lending-bot-weekly.timer
+          systemctl --user is-active shuyu-lending-bot-weekly.timer
+          systemctl --user list-timers shuyu-lending-bot-weekly.timer --no-pager
+          podman exec shuyu-lending-bot test -f /app/scripts/weekly_report.py || {
+            echo "::error::容器裡沒有週報腳本，定時器會每天失敗"
             exit 1
           }
 

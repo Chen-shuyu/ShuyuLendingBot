@@ -273,6 +273,10 @@ def format_report(
             f"它們與 credit 同利率、`opened_at` 也幾乎相同，但**結清時間不同**"
             f"——配到哪一筆是撞運氣的，而配到 loan 那筆算出來的持有時間是錯的。"
         )
+    if screen is not None and screen.orphans:
+        lines.append(
+            f"  ⚠ 另有 {len(screen.orphans)} 筆 kind='loan' 沒有 credit 雙胞胎，當成真實部位參與配對（D076）。"
+        )
     if summary.simultaneous:
         lines.append(
             f"  ⚠ 其中 {summary.simultaneous} 段是「同一輪掛出的另一張單」"

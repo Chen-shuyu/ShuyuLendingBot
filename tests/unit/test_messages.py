@@ -331,3 +331,29 @@ class TestFundsIdle:
         text = messages.funds_idle(13.0, offers=[self.OFFER], last_action=None)
         assert "最近一輪" not in text
 
+
+class TestWeeklyReport:
+    """每週對帳（D076）。大部分的週都應該是 📊 ＋「無需處理」，不是每週都在喊（D023）。"""
+
+    FIELDS = {"實得": "帳本 4.08%／部位 3.96%", "判準 1 重播": "3.96%，差 +0.00pp ✅"}
+
+    def test_判準都過是一般的收益訊息(self):
+        text = messages.weekly_report("週報 10-25～10-31：實得 4.08%，判準都過", self.FIELDS)
+        assert text.startswith("📊【收益】週報 10-25～10-31：實得 4.08%，判準都過\n")
+        assert "實得：帳本 4.08%／部位 3.96%" in text
+        assert text.endswith(messages.FOOTER_NO_ACTION)
+
+    def test_要人處理時圖示與頁尾都要變(self):
+        text = messages.weekly_report(
+            "週報：要看 判準 1", self.FIELDS, level=messages.LEVEL_CRITICAL, action_required=True
+        )
+        assert text.startswith("🔴【收益】")
+        assert text.endswith(messages.FOOTER_ACTION_REQUIRED)
+
+    def test_算不出來要出聲(self):
+        text = messages.weekly_report_failed("10-25～10-31", "RetryableError: 交易所掛了")
+        assert text.startswith("🟠【收益】週報 10-25～10-31 算不出來")
+        assert "原因：RetryableError: 交易所掛了" in text
+        assert "每天 18:35 會自動再試" in text
+        assert "journalctl" not in text  # 這台機器的 user journal 沒有保存，指過去也看不到東西
+        assert text.endswith(messages.FOOTER_ACTION_REQUIRED)

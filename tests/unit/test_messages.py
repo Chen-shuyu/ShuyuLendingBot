@@ -355,4 +355,5 @@ class TestWeeklyReport:
         assert text.startswith("🟠【收益】週報 10-25～10-31 算不出來")
         assert "原因：RetryableError: 交易所掛了" in text
         assert "每天 18:35 會自動再試" in text
+        assert "journalctl" not in text  # 這台機器的 user journal 沒有保存，指過去也看不到東西
         assert text.endswith(messages.FOOTER_ACTION_REQUIRED)

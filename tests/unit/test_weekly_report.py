@@ -199,6 +199,31 @@ class TestPushLine:
         assert notifier.sent == []
 
 
+class TestSaved:
+    """這台機器的 user journal 沒有保存，完整報告只留得住在 DB 裡。"""
+
+    def test_推過的週印得出完整報告而且不打網路(self, database, notifier, capsys):
+        assert run(database, "--push-line") == 0
+        capsys.readouterr()
+        client = FakeClient()
+        assert run(database, "--saved", "2026-10-25", client=client) == 0
+        out = capsys.readouterr().out
+        assert "週報 10-25～10-31" in out
+        assert "判準 1 重播" in out
+        assert client.page_calls == []
+
+    def test_沒有紀錄要講清楚(self, database, notifier, capsys):
+        assert run(database, "--saved", "2026-10-25") == 1
+        assert "沒有 2026-10-25 那週的紀錄" in capsys.readouterr().err
+
+    def test_舊紀錄沒有全文就印摘要(self, database, notifier, capsys):
+        repository = Repository(str(database))
+        repository.set_kv(f"{weekly_report.RECORD_PREFIX}2026-10-18", json.dumps({"earned_pct": 2.84}))
+        repository.close()
+        assert run(database, "--saved", "2026-10-18") == 0
+        assert "2.84" in capsys.readouterr().out
+
+
 class TestReadOnlyByDefault:
     def test_沒給pushline不寫DB也不推(self, database, notifier, capsys):
         before = database.read_bytes()

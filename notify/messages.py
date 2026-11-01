@@ -504,7 +504,7 @@ def weekly_report_failed(week: str, reason: str) -> str:
         f"週報 {week} 算不出來",
         {
             "原因": reason,
-            "後續": "每天 18:35 會自動再試。看 journalctl --user -u shuyu-lending-bot-weekly",
+            "後續": "每天 18:35 會自動再試。要看完整錯誤：podman exec shuyu-lending-bot python /app/scripts/weekly_report.py",
         },
         level=LEVEL_ERROR,
         action_required=True,

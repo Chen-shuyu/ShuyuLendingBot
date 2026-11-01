@@ -6,6 +6,10 @@
     python3 scripts/weekly_report.py --since 2026-10-14 --until 2026-10-23
     python3 scripts/weekly_report.py --period 30 --assumed-hold 48 --floor-annual 8  # 補算舊設定
     python3 scripts/weekly_report.py --push-line            # 定時器用：沒推過才算、算完推 LINE
+    python3 scripts/weekly_report.py --saved 2026-10-25     # 印出當時推播的那份完整報告，不重算
+
+⚠ 補算過去的週要自己帶 `--period --assumed-hold --floor-annual`：天期看得出來（看實際掛單），
+P 與地板只有設定檔的現值。
 
 **只有 `--push-line` 會寫 DB**（`bot_kv` 的紀錄與記號），其餘一律唯讀。算法與判準在
 `core/weekly.py`，這裡只負責抓資料、推播。交易所客戶端用 `dry_run=True` 建立：
@@ -266,12 +270,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--period", type=int, default=None, help="「現行設定」的天期（補算舊設定用）")
     parser.add_argument("--assumed-hold", type=float, default=None, help="「現行設定」的 P（小時）")
     parser.add_argument("--floor-annual", type=float, default=None, help="「現行設定」的地板（年化 %%）")
+    parser.add_argument("--saved", default=None, help="印出存著的完整報告（給週日的日期），不重算")
     parser.add_argument(
         "--push-line",
         action="store_true",
         help="定時器用：算最新一週，沒推過才算，算完存紀錄並推 LINE",
     )
     return parser.parse_args(argv)
+
+
+def print_saved(db_path: Path, first: str) -> int:
+    """印出當時存下來的完整報告。重算要抓 5 分鐘的資料，而且過了那週結果可能不一樣。"""
+    raw = read_kv(db_path, f"{RECORD_PREFIX}{first}")
+    if not raw:
+        print(f"沒有 {first} 那週的紀錄（只有 --push-line 推過的週才有）", file=sys.stderr)
+        return 1
+    print(json.loads(raw).get("text") or raw)
+    return 0
 
 
 def resolve_window(args: argparse.Namespace, now: datetime) -> Optional[tuple]:
@@ -311,6 +326,8 @@ def main(argv: Optional[List[str]] = None, client: Any = None, now: Optional[dat
     if not db_path.exists():
         print(f"找不到資料庫：{db_path}", file=sys.stderr)
         return 1
+    if args.saved:
+        return print_saved(db_path, args.saved)
 
     repository = None
     notifier = None

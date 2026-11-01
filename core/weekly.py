@@ -706,6 +706,8 @@ class WeeklyReport:
             "lost_to_previous": self.lost_to_previous,
             "setting": self.setting.label,
             "level": self.level,
+            # 完整報告也存起來：這台機器的 user journal 沒有保存，stdout 跑完就不見了。
+            "text": format_report(self),
         }
 
 

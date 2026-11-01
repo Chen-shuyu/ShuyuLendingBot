@@ -19,6 +19,7 @@
 """
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -295,3 +296,153 @@ class TestD069利用率分解要印出來:
         )
         assert "不是「掛單價」" in out
         assert "金額加權" in out
+
+
+class TestD076報表的窗:
+    """待改①：窗尾、`--until`、看哪天賺的。"""
+
+    TZ = timezone(timedelta(hours=8))
+
+    @staticmethod
+    def _position(amount, annual_pct, opened, closed):
+        return {
+            "amount": amount,
+            "rate": annual_pct / 365 / 100,
+            "opened_at": opened,
+            "closed_at": closed,
+            "currency": "USD",
+        }
+
+    @staticmethod
+    def _capital():
+        return {"value": 345.0, "days": 3, "first": "2026-09-06", "last": "2026-09-08"}
+
+    def test_白天跑與隔天跑利用率要一樣(self, summary_三天有一天空白):
+        """🔴 **這次被固定住的參數是「跑的時刻」**（D071 第五節①）。
+
+        部位從窗開頭一路借到現在都沒還：09-08 下午跑與 09-09 清晨跑都應該是 100%。
+        修之前窗尾固定 09-09 00:00、部位只算到現在，下午跑會印出 86.1%。
+        """
+        positions = [self._position(345.0, 9.0, "2026-09-06T00:00:00+08:00", None)]
+        for now in (
+            datetime(2026, 9, 8, 14, 0, tzinfo=self.TZ),
+            datetime(2026, 9, 9, 6, 0, tzinfo=self.TZ),
+        ):
+            out = "\n".join(
+                sync_earnings.format_utilization(
+                    summary_三天有一天空白, positions, "2026-09-06", self._capital(), now=now
+                )
+            )
+            assert "資金利用率 **100.0%**" in out
+
+    def test_給了until的過去窗不管什麼時候跑都一樣(self, summary_三天有一天空白):
+        """`--until` 裁出來的窗完全在過去，跑的時刻不能影響任何一段。"""
+        positions = [
+            self._position(
+                345.0, 9.0, "2026-09-06T12:00:00+08:00", "2026-09-07T12:00:00+08:00"
+            )
+        ]
+        outputs = []
+        for now in (
+            datetime(2026, 9, 9, 6, 0, tzinfo=self.TZ),
+            datetime(2026, 11, 1, 14, 0, tzinfo=self.TZ),
+        ):
+            outputs.append(
+                sync_earnings.format_utilization(
+                    summary_三天有一天空白,
+                    positions,
+                    "2026-09-06",
+                    self._capital(),
+                    until="2026-09-08",
+                    now=now,
+                )
+                + sync_earnings.format_reconciliation(
+                    summary_三天有一天空白, positions, "2026-09-06", until="2026-09-08", now=now
+                )
+            )
+        assert outputs[0] == outputs[1]
+        assert "資金利用率 **33.3%**" in "\n".join(outputs[0])
+
+    def test_三段涵蓋同一個窗(self):
+        """🔴 until 之後的部位不能算進毛利息，否則淨毛比又是 D069 那個假警報。"""
+        summary = earnings.summarize([_entry(_mts(2026, 9, 7), 0.08, 345.1)], currency="USD")
+        positions = [
+            self._position(
+                345.0, 9.0, "2026-09-06T00:00:00+08:00", "2026-09-07T00:00:00+08:00"
+            ),
+            self._position(
+                345.0, 9.0, "2026-09-20T00:00:00+08:00", "2026-09-25T00:00:00+08:00"
+            ),
+        ]
+        out = "\n".join(
+            sync_earnings.format_reconciliation(
+                summary,
+                positions,
+                "2026-09-06",
+                until="2026-09-06",
+                earned=True,
+                now=datetime(2026, 11, 1, 14, 0, tzinfo=self.TZ),
+            )
+        )
+        assert "推算毛利息 0.0851 USD" in out
+
+    def test_看哪天賺的時0914那筆歸短天期(self):
+        """🔴 **D072 第五節的原始案例**：09-14 入帳的 0.0728 USD 是天期 2 在 09-13 賺的
+        （長天期第一筆單 09-14 19:10 才成交）。入帳日的算法會把它算給長天期。
+        """
+        entries = [
+            _entry(_mts(2026, 9, 13), 0.0711, 345.1),
+            _entry(_mts(2026, 9, 14), 0.0728, 345.2),
+            _entry(_mts(2026, 9, 15), 0.0104, 345.3),
+        ]
+        短天期 = sync_earnings.select_entries(entries, None, "2026-09-13", earned=True)
+        長天期 = sync_earnings.select_entries(entries, "2026-09-14", None, earned=True)
+        assert [row["amount"] for row in 短天期] == [0.0711, 0.0728]
+        assert [row["amount"] for row in 長天期] == [0.0104]
+        # 沒開 --earned 就是舊算法：同一筆歸給後面那段。
+        入帳日 = sync_earnings.select_entries(entries, "2026-09-14", None, earned=False)
+        assert [row["amount"] for row in 入帳日] == [0.0728, 0.0104]
+
+    def test_看哪天賺的分母還是賺錢窗的曆日數(self):
+        """窗 09-13～09-14（賺錢的日子），帳本讀 09-14、09-15 兩列，分母 2 天。"""
+        entries = sync_earnings.select_entries(
+            [
+                _entry(_mts(2026, 9, 14), 0.08, 345.1),
+                _entry(_mts(2026, 9, 15), 0.07, 345.2),
+            ],
+            "2026-09-13",
+            "2026-09-14",
+            earned=True,
+        )
+        summary = earnings.summarize(entries, currency="USD")
+        out = sync_earnings.format_summary(
+            summary, 345.0, "2026-09-13", None, until="2026-09-14", earned=True
+        )
+        assert "分母是曆日：09-13 → 09-14 共 2 天" in out
+        assert "看哪天賺的" in out
+        assert f"{0.15 / 345 * 365 / 2 * 100:.2f}%" in out
+
+    def test_沒給until時最後一天是最後入帳日的前一天(self):
+        """看哪天賺的，最後入帳日 D 賺錢的日子是 D-1。"""
+        summary = earnings.summarize([_entry(_mts(2026, 9, 15), 0.07, 345.2)], currency="USD")
+        first, last = sync_earnings.report_days(summary, "2026-09-10", None, earned=True)
+        assert first.isoformat() == "2026-09-10"
+        assert last.isoformat() == "2026-09-14"
+        first, last = sync_earnings.report_days(summary, "2026-09-10", None, earned=False)
+        assert last.isoformat() == "2026-09-15"
+
+    def test_本金也裁到until(self, tmp_path):
+        db = tmp_path / "lending.sqlite3"
+        connection = sqlite3.connect(db)
+        connection.execute(
+            "CREATE TABLE earnings_daily (date TEXT, currency TEXT, interest REAL, principal_avg REAL)"
+        )
+        connection.executemany(
+            "INSERT INTO earnings_daily VALUES (?, 'USD', 0.05, ?)",
+            [("2026-10-25", 340.0), ("2026-10-26", 350.0), ("2026-10-27", 500.0)],
+        )
+        connection.commit()
+        connection.close()
+        got = sync_earnings.load_deployed_capital(db, "USD", "2026-10-25", "2026-10-26")
+        assert got["value"] == pytest.approx(345.0)
+        assert got["days"] == 2

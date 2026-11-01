@@ -45,8 +45,9 @@ Bitfinex 每天約 **09:30 CST** 結一次放貸利息，所以按 CST 的日曆
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from datetime import date as Date
+from datetime import datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from utils import clock
 
@@ -129,6 +130,36 @@ def daily_earnings(
             )
         )
     return result
+
+
+def ledger_dates_for_earned(first: Date, last: Date) -> Tuple[Date, Date]:
+    """「賺錢窗」`[first, last]` 要讀哪幾個入帳日（D072 第五節）。
+
+    利息按每筆單子的 24 小時結算點入帳，**入帳日 D 的利息大多是 D-1 賺的**。
+    窗的中段這無所謂（進一筆、出一筆），但在「換設定的那一天」會把一天的錢從一邊搬到另一邊：
+    09-14 入帳的 0.0728 USD 是天期 2 在 09-13 賺的，當時長天期第一筆單還沒成交。
+    所以跨設定比較一律看哪天賺的，入帳日整個往後平移一天。
+    """
+    return first + timedelta(days=1), last + timedelta(days=1)
+
+
+def entries_within(
+    entries: Iterable[Dict[str, Any]],
+    first: Optional[Date] = None,
+    last: Optional[Date] = None,
+    timezone_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """只留 CST 日期落在 `[first, last]`（含頭含尾）的帳本列；`None` 表示那一端不設限。"""
+    tz = clock.get_timezone(timezone_name)
+    picked = []
+    for entry in entries:
+        mts = entry.get("mts")
+        if mts is None:
+            continue
+        day = datetime.fromtimestamp(mts / 1000, tz).date()
+        if (first is None or day >= first) and (last is None or day <= last):
+            picked.append(entry)
+    return picked
 
 
 # Bitfinex 對放貸利息抽的成數。**這個常數只用在對帳，不參與任何定價決策**

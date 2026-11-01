@@ -91,7 +91,9 @@ ShuyuLendingBot/
 │   ├── healthcheck.py          # 容器內：唯讀讀 bot_state 心跳（M4 新增，見 D016）
 │   ├── hold_report.py          # 實際持有時間報告：唯讀開 DB，隨時可跑（D040 新增）
 │   ├── wait_report.py          # 等待時間校準報告：唯讀開 DB，隨時可跑（D045 新增）
-│   └── notify_failure.py       # 主機端：systemd 失效告警（M4 新增，見 D020）
+│   ├── notify_failure.py       # 主機端：systemd 失效告警（M4 新增，見 D020）
+│   ├── backup_db.py            # 主機端：DB 每日備份，失敗推 LINE（D076）
+│   └── weekly_report.py        # 容器內：每週對帳，定時器每天叫一次、一週推一則（D076）
 ├── systemd/
 │   ├── shuyu-lending-bot.container        # 正式部署的 Quadlet 單元（D017、D020）
 │   ├── shuyu-lending-bot-alert.service    # OnFailure= 觸發的告警單元（D020）
@@ -293,6 +295,11 @@ ShuyuLendingBot/
   **D038 之前的掛單沒有預估值**（要說「沒有」而不是填 0）。
   高估倍數用**總量比**而不是逐筆倍數的平均，且逐筆倍數與利率涵蓋帶一起印
   ——校準樣本全部落在模型自己選出來的窄帶，**帶外不能外推**。
+- `core/tape.py`：**逐筆成交的 FRR 管道分類與成交規則，只算不碰網路與 DB**（D075）。
+  負號成交＝掛單被吃；同天期 ≤ N、利率高於掛價的真掃單累積金額夠了才算成交。K 線規則已退役。
+- `core/weekly.py` ＋ `scripts/weekly_report.py`：**每週對帳**（D076）。模擬的掛價直接呼叫
+  `build_offer_plan()`，不另外實作一份定價。判準與十週實跑見 D076 第二節與追記。
+  定時器 `shuyu-lending-bot-weekly.timer` 每天 18:35 叫一次；只有 `--push-line` 會寫 DB（`bot_kv`）。
 - `scripts/wait_report.py`：`core/wait_time.py` 的彙總報告，唯讀開 DB。
   `python3 scripts/wait_report.py` 隨時可跑（`--since` 可只看某個時間之後的掛單）。
 - `utils/logger.py`：`RotatingFileHandler`，固定檔名 + 大小輪替（預設 10MB × 5 份）。

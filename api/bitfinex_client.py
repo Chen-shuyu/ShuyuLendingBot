@@ -425,6 +425,9 @@ class BitfinexClient(ExchangeClient):
                     # 並不划算（與 `_parse_positions` 對 opened_at 的處置一致）。
                     "created_at_ms": _optional_millis(offer[2] if len(offer) > 2 else None),
                     "amount": float(offer[4]),
+                    # 🔴 FRR 單的 rate 是偏移量還是當下的利率，官方文件沒講，上線才知道
+                    # （D076 追記）。**不要拿 FRR 單的 rate 去比價**，一律先看 type。
+                    "type": offer[6] if len(offer) > 6 else None,
                     "rate": float(offer[14]),
                     "period": int(offer[15]),
                 }
@@ -631,8 +634,15 @@ class BitfinexClient(ExchangeClient):
     # 只是回應逾時，重試就會重複掛單，實盤下是真的多借出去。失敗時直接把
     # RetryableError 交給主迴圈，下一輪的「全取消重掛」會自然補回這筆額度。
     # 見 DECISIONS.md D013。
-    def create_loan_offer(self, currency: str, amount: float, rate: float, duration: int) -> Dict[str, Any]:
-        """建立放貸掛單。"""
+    def create_loan_offer(
+        self,
+        currency: str,
+        amount: float,
+        rate: float,
+        duration: int,
+        offer_type: str = "LIMIT",
+    ) -> Dict[str, Any]:
+        """建立放貸掛單。`offer_type` 不是 LIMIT 時，`rate` 是相對 FRR 的偏移量（D076）。"""
         if self.dry_run:
             return {
                 "status": "dry_run",
@@ -649,14 +659,14 @@ class BitfinexClient(ExchangeClient):
         try:
             # create_funding_offer / createFundingOffer 這兩個統一方法在 ccxt 對
             # bitfinex 的實作裡從未存在過（見 .project-docs/CCXT_BITFINEX_API_INVESTIGATION.md、
-            # DECISIONS.md D010），改直接呼叫官方 REST 端點對應的 raw API；
-            # type 固定用 LIMIT（固定利率掛單），對應策略層算好的絕對利率數值。
+            # DECISIONS.md D010），改直接呼叫官方 REST 端點對應的 raw API。
+            # LIMIT 對應策略層算好的絕對利率；FRR 偏移量寫成定點小數，`str(-1e-05)` 會變成科學記號。
             response = self.exchange.private_post_auth_w_funding_offer_submit(
                 {
-                    "type": "LIMIT",
+                    "type": offer_type,
                     "symbol": symbol,
                     "amount": str(amount),
-                    "rate": str(rate),
+                    "rate": str(rate) if offer_type == "LIMIT" else f"{rate:.8f}",
                     "period": int(duration),
                 }
             )

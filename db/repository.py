@@ -146,8 +146,8 @@ class Repository:
             self.connection.execute(
                 """
                 INSERT INTO loan_offers
-                    (offer_id, currency, amount, rate, duration, status, detail, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (offer_id, currency, amount, rate, duration, status, detail, created_at, offer_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(result.get("id")) if result.get("id") is not None else None,
@@ -158,6 +158,7 @@ class Repository:
                     result.get("status") or STATUS_SUBMITTED,
                     result.get("symbol"),
                     now_iso(),
+                    getattr(plan, "offer_type", None),
                 ),
             )
 

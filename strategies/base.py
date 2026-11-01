@@ -11,6 +11,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
+# 掛單類型（D076 第三節）。`LIMIT` 的 rate 是絕對日利率；FRR 兩種的 rate 是**相對 FRR 的偏移量**，
+# 成交前利率跟著 FRR 動。FIX 成交後鎖定，偏移量可正可負；VAR 成交後還是跟著 FRR，偏移量只能是正的。
+OFFER_TYPE_LIMIT = "LIMIT"
+OFFER_TYPE_FRR_FIX = "FRRDELTAFIX"
+OFFER_TYPE_FRR_VAR = "FRRDELTAVAR"
+FRR_OFFER_TYPES = (OFFER_TYPE_FRR_FIX, OFFER_TYPE_FRR_VAR)
+
+
 @dataclass
 class OfferPlan:
     """一筆掛單計畫：策略層與迴圈層之間的契約。
@@ -23,6 +31,7 @@ class OfferPlan:
     amount: float
     rate: float
     duration: int
+    offer_type: str = OFFER_TYPE_LIMIT
 
 
 class Strategy(ABC):

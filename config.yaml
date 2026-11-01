@@ -329,6 +329,18 @@ logging:
   max_bytes: 10485760       # 單一 log 檔上限（10MB），超過就輪替
   backup_count: 5           # 最多保留幾份輪替後的舊檔（.1 ~ .5）
 
+# FRR 小額實測（D076 第三節）。**開著的時候機器人把全部資金掛一張 FRR 單，不走一般定價。**
+# 判準寫死在 core/frr_test.py（10 天沒成交就撤、連兩筆排隊 ≥ 3 天且持有 < 24 小時就停、
+# 否則 2 筆或 45 天後判定），停了就回到上面的一般設定，重啟不會重新開始。
+#
+# 🔴 **打開要使用者確認**（11-08 對帳之後，合併前再問）。守門測試釘著 false。
+frr_test:
+  enabled: false
+  # FRRDELTAFIX：成交前跟著 FRR 動，成交後鎖定。FRRDELTAVAR：成交後還是跟著 FRR。
+  offer_type: FRRDELTAFIX
+  period: 30
+  offset: 0.0               # 相對 FRR 的偏移量（日利率），0 就是貼著 FRR
+
 line:
   enabled: true
   # 兩個值都放 ~/.config/bfx-lending-bot/secrets.env，**不要寫在這裡**（見 D022）：

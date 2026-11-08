@@ -496,6 +496,9 @@ class BitfinexClient(ExchangeClient):
                         "period": int(row[12]),
                         "opened_at": int(row[13]) if row[13] is not None else None,
                         "kind": kind,
+                        # 8=RATE_TYPE：`FIXED` 或 `VAR`（FRR 浮動，D077）。VAR 的 RATE 是什麼意思
+                        # 官方文件沒寫，所以通知裡不把它講成鎖定的利率。
+                        "rate_type": row[8],
                     }
                 )
             except (IndexError, ValueError, TypeError) as exc:

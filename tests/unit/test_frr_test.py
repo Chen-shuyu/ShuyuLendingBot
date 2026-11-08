@@ -81,6 +81,22 @@ class TestFillsSince:
         assert [fill.queue_hours for fill in fills] == [48.0, 96.0]
         assert [fill.hold_hours for fill in fills] == [24.0, 12.0]
 
+    def test_打開開關時錢還在別的部位裡那段不算排隊(self):
+        """D077：開關在晚上打開，天期 7 那筆隔天清晨才還回來，FRR 單從那一刻才開始排。"""
+        rows = [
+            position(days(-3), days(0.5), period=7, position_id="7"),
+            position(days(1.5), days(3), position_id="1"),
+        ]
+        fills = fills_since(rows, 30, START)
+        assert [fill.queue_hours for fill in fills] == [24.0]
+
+    def test_第二筆從上一筆還回來算起(self):
+        rows = [
+            position(days(1), days(2), position_id="1"),
+            position(days(2.5), days(3), position_id="2"),
+        ]
+        assert [fill.queue_hours for fill in fills_since(rows, 30, START)] == [24.0, 12.0]
+
     def test_實測開始之前的不算(self):
         """天期 30 的舊部位（D069 那一段）不能算進這次實測。"""
         assert fills_since([position(days(-30), days(-29))], 30, START) == []

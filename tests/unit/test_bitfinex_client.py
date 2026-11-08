@@ -861,6 +861,7 @@ class TestGetActivePositions:
             "period": 2,
             "opened_at": 1788007933000,   # 2026-08-29T20:52:13+08:00
             "kind": "credit",
+            "rate_type": "FIXED",         # [8]：實打確認；FRR 浮動的部位是 VAR（D077）
         }]
 
     def test_real_credit_has_twenty_two_fields_with_rate_type(self):

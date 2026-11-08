@@ -109,8 +109,10 @@ class TestProjectConfig:
         釘住的理由跟上面一樣：要防的是沒有人注意到它被改了。
         """
         assert config["frr_test"]["enabled"] is False
-        assert config["frr_test"]["offer_type"] == "FRRDELTAFIX"
+        # D077：使用者選 VAR（官方文件的「FRR 單」；借款人沒理由提前還）。
+        assert config["frr_test"]["offer_type"] == "FRRDELTAVAR"
         assert config["frr_test"]["period"] == 30
+        assert config["frr_test"]["offset"] == 0.0
 
     def test_ships_without_credentials(self, config, monkeypatch):
         monkeypatch.delenv("BFX_API_KEY", raising=False)

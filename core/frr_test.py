@@ -108,10 +108,16 @@ def fills_since(
 ) -> List[Fill]:
     """實測開始之後、這個天期的成交，依時間排序。
 
-    排隊時間從上一筆還回來（或實測開始）算起：機器人的錢一回來就會重新掛單，
+    排隊時間從**錢回來的那一刻**算起（任何一筆部位還回來，或實測開始）：機器人的錢一回來就會重新掛單，
     所以這段就是「錢閒著在等」的時間，也是判定要算進去的代價。
+    打開開關時錢可能還在天期 7 的部位裡（D077），那段不算 FRR 單在排隊。
     """
     kept = hold_time.screen_positions(list(positions)).kept
+    returned = sorted(
+        moment
+        for moment in (hold_time.parse_moment(position.get("closed_at")) for position in kept)
+        if moment is not None
+    )
     rows = []
     for position in kept:
         if int(position.get("period") or 0) != period:
@@ -132,11 +138,11 @@ def fills_since(
             groups.append([row])
 
     fills: List[Fill] = []
-    queue_from = started_at
     for group in groups:
         opened = group[0][0]
         closes = [row[1] for row in group]
         closed = None if any(moment is None for moment in closes) else max(closes)
+        queue_from = max([started_at] + [moment for moment in returned if moment <= opened])
         fills.append(
             Fill(
                 opened_at=opened,
@@ -145,8 +151,6 @@ def fills_since(
                 hold_hours=(closed - opened).total_seconds() / 3600 if closed else None,
             )
         )
-        if closed is not None:
-            queue_from = closed
     return fills
 
 

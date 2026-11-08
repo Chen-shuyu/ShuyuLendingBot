@@ -636,13 +636,24 @@ def check_previous(
     )
 
 
-def check_ledger(actual: Actual) -> Check:
-    """帳本與部位是兩條獨立的路：差太多就有一邊缺資料（D072 第五節）。"""
+def check_ledger(actual: Actual, frr_active: bool = False) -> Check:
+    """帳本與部位是兩條獨立的路：差太多就有一邊缺資料（D072 第五節）。
+
+    FRR 實測的週只報不響（D077）：VAR 部位的利率每天跟著 FRR 動，部位推算用的是成交當下的數字，
+    兩邊本來就會分開，響了也不是有東西壞掉。判定一律看帳本。
+    """
     gap = actual.earned_pct - actual.position_pct
     summary = f"差 {gap:+.2f}pp"
     head = f"帳本 {actual.earned_pct:.2f}% 對 部位推算 {actual.position_pct:.2f}%，差 {gap:+.2f}pp"
     if abs(gap) <= LEDGER_GAP_PP:
         return Check("帳本對部位", LEVEL_OK, f"{head}（≤ {LEDGER_GAP_PP}）", f"{summary} ✅")
+    if frr_active:
+        return Check(
+            "帳本對部位",
+            LEVEL_OK,
+            f"{head}（> {LEDGER_GAP_PP}），但這週有 FRR 浮動利率的部位，部位推算只是近似；判定看帳本",
+            f"{summary}（FRR 浮動，只報不響）",
+        )
     return Check(
         "帳本對部位",
         LEVEL_WARNING,
@@ -895,7 +906,7 @@ def build_report(inputs: WeeklyInputs) -> WeeklyReport:
     grid = {annual: fixed(annual) for annual in FIXED_GRID_ANNUAL}
     best_annual = max(grid, key=lambda annual: grid[annual].net_pct)
 
-    checks = [check_ledger(actual), check_replay(actual, replay)]
+    checks = [check_ledger(actual, frr_active), check_replay(actual, replay)]
     lost = None
     if frr_active:
         # 判準 2、3 比的是「模型定的價」：這幾週跑的不是它，比了只會一直響。

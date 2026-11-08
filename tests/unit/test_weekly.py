@@ -642,6 +642,19 @@ class TestCheckLedger:
         assert check.action_required
 
 
+class TestCheckLedgerDuringFrr:
+    """D077：VAR 部位的利率跟著 FRR 動，部位推算只是近似。"""
+
+    def test_FRR實測的週只報不響(self):
+        check = weekly.check_ledger(actual(earned=8.0, positions=9.5), frr_active=True)
+        assert check.passed and not check.action_required
+        assert "只報不響" in check.summary
+
+    def test_一般的週照樣要響(self):
+        check = weekly.check_ledger(actual(earned=8.0, positions=9.5))
+        assert check.level == weekly.LEVEL_WARNING and check.action_required
+
+
 class TestCheckBackup:
     def test_新鮮就過(self):
         assert weekly.check_backup((NOW - timedelta(hours=10)).isoformat(), NOW).passed

@@ -336,8 +336,10 @@ logging:
 # 🔴 **打開要使用者確認**（11-08 對帳之後，合併前再問）。守門測試釘著 false。
 frr_test:
   enabled: false
-  # FRRDELTAFIX：成交前跟著 FRR 動，成交後鎖定。FRRDELTAVAR：成交後還是跟著 FRR。
-  offer_type: FRRDELTAFIX
+  # FRRDELTAVAR：成交後利率還是每天跟著 FRR。FRRDELTAFIX：成交前跟著 FRR 動，成交後鎖定。
+  # 🔴 2026-11-08 使用者選 VAR（D077）：官方文件說要掛「FRR 單」就是 VAR 偏移 0，
+  # 而且利率跟著市場走，借款人沒有理由提前還——FRR 管道值不值得，看的正是持有時間（D075）。
+  offer_type: FRRDELTAVAR
   period: 30
   offset: 0.0               # 相對 FRR 的偏移量（日利率），0 就是貼著 FRR
 

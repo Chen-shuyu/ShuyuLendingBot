@@ -57,7 +57,7 @@ LINE 免費方案每月 200 則，例行巡檢結果只寫日誌（D024）。
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
 
-from strategies.base import FRR_OFFER_TYPES, OFFER_TYPE_LIMIT
+from strategies.base import FRR_OFFER_TYPES, OFFER_TYPE_FRR_VAR, OFFER_TYPE_LIMIT
 from utils import clock
 
 # 分類：第一行 `【】` 裡只能是這四個之一，不要隨手新增。
@@ -122,7 +122,17 @@ def format_plan_rate(plan: Any) -> str:
     offer_type = getattr(plan, "offer_type", OFFER_TYPE_LIMIT)
     if offer_type == OFFER_TYPE_LIMIT:
         return format_rate(plan.rate)
-    return f"FRR 偏移 {plan.rate:+.8f}/日（{offer_type}）"
+    if offer_type == OFFER_TYPE_FRR_VAR:
+        return f"跟著 FRR 浮動，偏移 {plan.rate:+.8f}/日（{offer_type}）"
+    return f"FRR 偏移 {plan.rate:+.8f}/日，成交時鎖定（{offer_type}）"
+
+
+def format_position_rate(item: Dict[str, Any]) -> str:
+    """部位的利率。VAR（FRR 浮動）部位的 rate 是什麼意思官方文件沒寫，不講成鎖定的利率（D077）。"""
+    rate = float(item["rate"])
+    if item.get("rate_type") == "VAR":
+        return f"跟著 FRR 浮動（交易所回報 {format_rate(rate)}）"
+    return format_rate(rate)
 
 
 def format_amount(amount: float, currency: str = "USD") -> str:
@@ -306,7 +316,7 @@ def _describe_positions(positions: Iterable[Any]) -> Dict[str, Any]:
     if len(positions) == 1:
         item = positions[0]
         fields["金額"] = format_amount(float(item["amount"]))
-        fields["利率"] = format_rate(float(item["rate"]))
+        fields["利率"] = format_position_rate(item)
         fields["天期"] = f"{int(item['period'])} 天"
         return fields
 
@@ -315,7 +325,7 @@ def _describe_positions(positions: Iterable[Any]) -> Dict[str, Any]:
     for index, item in enumerate(positions, start=1):
         fields[f"第 {index} 筆"] = (
             f"{format_amount(float(item['amount']))}／"
-            f"{format_rate(float(item['rate']))}／{int(item['period'])} 天"
+            f"{format_position_rate(item)}／{int(item['period'])} 天"
         )
     return fields
 

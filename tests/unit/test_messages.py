@@ -367,7 +367,26 @@ class TestFrrOfferMessages:
     def test_掛單通知不會印成年化零(self):
         text = messages.offers_placed([self.PLAN])
         assert "年化 0.00%" not in text
-        assert "FRR 偏移 +0.00000000/日（FRRDELTAFIX）" in text
+        assert "FRR 偏移 +0.00000000/日，成交時鎖定（FRRDELTAFIX）" in text
+
+    def test_VAR單講得出利率會跟著FRR動(self):
+        """D077：使用者選的是 VAR。"""
+        plan = OfferPlan(currency="USD", amount=348.6, rate=0.0, duration=30, offer_type="FRRDELTAVAR")
+        text = messages.offers_placed([plan])
+        assert "跟著 FRR 浮動，偏移 +0.00000000/日（FRRDELTAVAR）" in text
+        assert "年化 0.00%" not in text
+
+    def test_VAR部位不講成鎖定的利率(self):
+        """VAR 部位回報的 rate 是什麼意思官方文件沒寫（D077）。"""
+        position = {"amount": 348.6, "rate": 0.0003, "period": 30, "rate_type": "VAR"}
+        text = messages.positions_opened([position])
+        assert "跟著 FRR 浮動（交易所回報 0.00030000/日（年化 10.95%））" in text
+
+    def test_一般部位照舊(self):
+        position = {"amount": 348.6, "rate": 0.0003, "period": 7, "rate_type": "FIXED"}
+        text = messages.positions_opened([position])
+        assert "利率：0.00030000/日（年化 10.95%）" in text
+        assert "浮動" not in text
 
     def test_拒單通知也一樣(self):
         text = messages.offer_failed(self.PLAN, "rate invalid", retryable=False)

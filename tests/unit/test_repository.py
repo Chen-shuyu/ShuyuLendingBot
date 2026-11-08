@@ -1055,3 +1055,44 @@ class TestD064定價旋鈕要跟著決策一起落地:
             "SELECT pricing_knobs_json FROM pricing_decisions WHERE id = ?", (row_id,)
         ).fetchone()[0]
         assert stored is None
+
+
+class TestOfferType:
+    """掛單類型（D076）：FRR 單的 rate 是偏移量，事後要分得出來。"""
+
+    @staticmethod
+    def _offer_type(repository):
+        return repository.connection.execute(
+            "SELECT offer_type FROM loan_offers ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+
+    def test_一般單記LIMIT(self, repository):
+        plan = OfferPlan(currency="USD", amount=200.0, rate=0.0004, duration=7)
+        repository.record_offer(plan, {"status": "submitted", "id": 1})
+        assert self._offer_type(repository) == "LIMIT"
+
+    def test_FRR單記下類型(self, repository):
+        plan = OfferPlan(currency="USD", amount=348.11, rate=0.0, duration=30, offer_type="FRRDELTAFIX")
+        repository.record_offer(plan, {"status": "submitted", "id": 1})
+        assert self._offer_type(repository) == "FRRDELTAFIX"
+
+    def test_既有資料庫會補上欄位而且舊列是NULL(self, tmp_path):
+        """舊列的 NULL 就是「當時只有 LIMIT」，不是 0。"""
+        path = tmp_path / "old.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE loan_offers (id INTEGER PRIMARY KEY AUTOINCREMENT, offer_id TEXT, currency TEXT NOT NULL, "
+            "amount REAL NOT NULL, rate REAL NOT NULL, duration INTEGER NOT NULL, status TEXT NOT NULL, "
+            "detail TEXT, created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO loan_offers (currency, amount, rate, duration, status, created_at) "
+            "VALUES ('USD', 1.0, 0.1, 2, 'submitted', 'x')"
+        )
+        connection.commit()
+        connection.close()
+        repository = Repository(str(path))
+        try:
+            assert self._offer_type(repository) is None
+        finally:
+            repository.close()

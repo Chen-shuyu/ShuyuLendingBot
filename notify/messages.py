@@ -57,6 +57,7 @@ LINE 免費方案每月 200 則，例行巡檢結果只寫日誌（D024）。
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
 
+from strategies.base import FRR_OFFER_TYPES, OFFER_TYPE_FRR_VAR, OFFER_TYPE_LIMIT
 from utils import clock
 
 # 分類：第一行 `【】` 裡只能是這四個之一，不要隨手新增。
@@ -114,6 +115,24 @@ def format_rate(rate: float) -> str:
     通知與日誌因此都看不出兩者的差別（D033）。
     """
     return f"{rate:.8f}/日（年化 {rate * DAYS_PER_YEAR * 100:.2f}%）"
+
+
+def format_plan_rate(plan: Any) -> str:
+    """掛單計畫的利率。FRR 單的 rate 是偏移量，照一般利率印會變成「年化 0.00%」。"""
+    offer_type = getattr(plan, "offer_type", OFFER_TYPE_LIMIT)
+    if offer_type == OFFER_TYPE_LIMIT:
+        return format_rate(plan.rate)
+    if offer_type == OFFER_TYPE_FRR_VAR:
+        return f"跟著 FRR 浮動，偏移 {plan.rate:+.8f}/日（{offer_type}）"
+    return f"FRR 偏移 {plan.rate:+.8f}/日，成交時鎖定（{offer_type}）"
+
+
+def format_position_rate(item: Dict[str, Any]) -> str:
+    """部位的利率。VAR（FRR 浮動）部位的 rate 是什麼意思官方文件沒寫，不講成鎖定的利率（D077）。"""
+    rate = float(item["rate"])
+    if item.get("rate_type") == "VAR":
+        return f"跟著 FRR 浮動（交易所回報 {format_rate(rate)}）"
+    return format_rate(rate)
 
 
 def format_amount(amount: float, currency: str = "USD") -> str:
@@ -237,7 +256,7 @@ def _describe_offers(plans: Iterable[Any], dry_run: bool = False) -> Dict[str, A
     if len(plans) == 1:
         plan = plans[0]
         fields["金額"] = format_amount(plan.amount, plan.currency)
-        fields["利率"] = format_rate(plan.rate)
+        fields["利率"] = format_plan_rate(plan)
         fields["天期"] = f"{plan.duration} 天"
         return fields
 
@@ -246,7 +265,7 @@ def _describe_offers(plans: Iterable[Any], dry_run: bool = False) -> Dict[str, A
     for index, plan in enumerate(plans, start=1):
         fields[f"第 {index} 筆"] = (
             f"{format_amount(plan.amount, plan.currency)}／"
-            f"{format_rate(plan.rate)}／{plan.duration} 天"
+            f"{format_plan_rate(plan)}／{plan.duration} 天"
         )
     return fields
 
@@ -297,7 +316,7 @@ def _describe_positions(positions: Iterable[Any]) -> Dict[str, Any]:
     if len(positions) == 1:
         item = positions[0]
         fields["金額"] = format_amount(float(item["amount"]))
-        fields["利率"] = format_rate(float(item["rate"]))
+        fields["利率"] = format_position_rate(item)
         fields["天期"] = f"{int(item['period'])} 天"
         return fields
 
@@ -306,7 +325,7 @@ def _describe_positions(positions: Iterable[Any]) -> Dict[str, Any]:
     for index, item in enumerate(positions, start=1):
         fields[f"第 {index} 筆"] = (
             f"{format_amount(float(item['amount']))}／"
-            f"{format_rate(float(item['rate']))}／{int(item['period'])} 天"
+            f"{format_position_rate(item)}／{int(item['period'])} 天"
         )
     return fields
 
@@ -410,7 +429,7 @@ def offer_failed(plan: Any, reason: str, retryable: bool = True) -> str:
         "掛單被交易所拒絕",
         {
             "金額": format_amount(plan.amount, plan.currency),
-            "利率": format_rate(plan.rate),
+            "利率": format_plan_rate(plan),
             "天期": f"{plan.duration} 天",
             "原因": reason,
             "後續": "下一輪會自動重算金額並重試" if retryable else "機器人已停止，不會自行重試",
@@ -463,6 +482,9 @@ def funds_idle(
         rate_text = format_rate(min(rates)) if len(set(rates)) == 1 else (
             f"{format_rate(min(rates))} ～ {format_rate(max(rates))}"
         )
+        if any(offer.get("type") in FRR_OFFER_TYPES for offer in offers):
+            # FRR 單的 rate 不是利率（D076），印出來只會讓人以為掛了 0%。
+            rate_text = "FRR 單"
         period_text = f"、天期 {'／'.join(str(p) for p in periods)} 天" if periods else ""
         fields["場上掛單"] = f"{len(offers)} 筆、{format_amount(total)}、{rate_text}{period_text}"
     fields["最近一輪"] = last_action
@@ -477,6 +499,31 @@ def funds_idle(
         fields,
         level=LEVEL_WARNING,
         action_required=not offers,
+    )
+
+
+def frr_test_started(plan: Any) -> str:
+    """FRR 小額實測開始（D076 第三節）。判準先寫死，所以訊息裡講得出它什麼時候會停。"""
+    return build(
+        CATEGORY_TRADE,
+        "FRR 實測開始",
+        {
+            **_describe_offers([plan]),
+            "判準": "10 天沒成交就撤；連兩筆排隊 ≥ 3 天且持有 < 24 小時就停；否則 2 筆或 45 天後判定",
+        },
+    )
+
+
+def frr_test_stopped(summary: str, action_required: bool = False) -> str:
+    """FRR 實測結束，機器人回到一般的掛單。**只有「該判定了」要人看**，其餘的結論已經有了。"""
+    return build(
+        CATEGORY_TRADE,
+        f"FRR 實測結束：{summary}",
+        {
+            "後續": "機器人已回到一般掛單"
+            + ("。比實得與同期天期 7 的模擬（scripts/weekly_report.py --since --until），決定要不要留" if action_required else ""),
+        },
+        action_required=action_required,
     )
 
 

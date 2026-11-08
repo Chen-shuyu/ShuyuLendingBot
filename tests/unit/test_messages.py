@@ -357,3 +357,64 @@ class TestWeeklyReport:
         assert "每天 18:35 會自動再試" in text
         assert "journalctl" not in text  # 這台機器的 user journal 沒有保存，指過去也看不到東西
         assert text.endswith(messages.FOOTER_ACTION_REQUIRED)
+
+
+class TestFrrOfferMessages:
+    """FRR 單的 rate 是偏移量（D076）：照一般利率印會變成「年化 0.00%」。"""
+
+    PLAN = OfferPlan(currency="USD", amount=348.11, rate=0.0, duration=30, offer_type="FRRDELTAFIX")
+
+    def test_掛單通知不會印成年化零(self):
+        text = messages.offers_placed([self.PLAN])
+        assert "年化 0.00%" not in text
+        assert "FRR 偏移 +0.00000000/日，成交時鎖定（FRRDELTAFIX）" in text
+
+    def test_VAR單講得出利率會跟著FRR動(self):
+        """D077：使用者選的是 VAR。"""
+        plan = OfferPlan(currency="USD", amount=348.6, rate=0.0, duration=30, offer_type="FRRDELTAVAR")
+        text = messages.offers_placed([plan])
+        assert "跟著 FRR 浮動，偏移 +0.00000000/日（FRRDELTAVAR）" in text
+        assert "年化 0.00%" not in text
+
+    def test_VAR部位不講成鎖定的利率(self):
+        """VAR 部位回報的 rate 是什麼意思官方文件沒寫（D077）。"""
+        position = {"amount": 348.6, "rate": 0.0003, "period": 30, "rate_type": "VAR"}
+        text = messages.positions_opened([position])
+        assert "跟著 FRR 浮動（交易所回報 0.00030000/日（年化 10.95%））" in text
+
+    def test_一般部位照舊(self):
+        position = {"amount": 348.6, "rate": 0.0003, "period": 7, "rate_type": "FIXED"}
+        text = messages.positions_opened([position])
+        assert "利率：0.00030000/日（年化 10.95%）" in text
+        assert "浮動" not in text
+
+    def test_拒單通知也一樣(self):
+        text = messages.offer_failed(self.PLAN, "rate invalid", retryable=False)
+        assert "年化 0.00%" not in text
+        assert "FRR 偏移" in text
+
+    def test_一般單照舊(self):
+        plan = OfferPlan(currency="USD", amount=348.11, rate=0.00016, duration=7)
+        assert "年化 5.84%" in messages.offers_placed([plan])
+
+    def test_閒置通知不會把FRR單印成零(self):
+        offer = {"rate": 0.0, "amount": 348.11, "period": 30, "type": "FRRDELTAFIX"}
+        text = messages.funds_idle(13.0, offers=[offer])
+        assert "年化 0.00%" not in text
+        assert "FRR 單" in text
+
+    def test_實測開始講得出什麼時候會停(self):
+        text = messages.frr_test_started(self.PLAN)
+        assert "FRR 實測開始" in text
+        assert "10 天沒成交就撤" in text
+        assert text.endswith(messages.FOOTER_NO_ACTION)
+
+    def test_有結論的結束不用人處理(self):
+        text = messages.frr_test_stopped("掛出 10.0 天還沒成交，結論：排不到")
+        assert text.startswith("💰【交易】FRR 實測結束：掛出 10.0 天還沒成交")
+        assert text.endswith(messages.FOOTER_NO_ACTION)
+
+    def test_該判定了要人處理(self):
+        text = messages.frr_test_stopped("完成 2 筆，可以判定了", action_required=True)
+        assert "scripts/weekly_report.py" in text
+        assert text.endswith(messages.FOOTER_ACTION_REQUIRED)

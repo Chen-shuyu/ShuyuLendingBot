@@ -102,6 +102,18 @@ class TestProjectConfig:
         assert config["strategy"]["minimum_rate"] * 365 * 100 == pytest.approx(5.0, abs=0.001)
         assert config["strategy"]["market_floor_pct"] == 0.85
 
+    def test_FRR實測釘著關閉(self, config):
+        """🔴 **D076 第三節：打開要使用者確認**（11-08 對帳之後）。
+
+        開著的時候全部資金掛一張 FRR 單、天期 30，而且可能一借就是 30 天。
+        釘住的理由跟上面一樣：要防的是沒有人注意到它被改了。
+        """
+        assert config["frr_test"]["enabled"] is False
+        # D077：使用者選 VAR（官方文件的「FRR 單」；借款人沒理由提前還）。
+        assert config["frr_test"]["offer_type"] == "FRRDELTAVAR"
+        assert config["frr_test"]["period"] == 30
+        assert config["frr_test"]["offset"] == 0.0
+
     def test_ships_without_credentials(self, config, monkeypatch):
         monkeypatch.delenv("BFX_API_KEY", raising=False)
         monkeypatch.delenv("BFX_API_SECRET", raising=False)

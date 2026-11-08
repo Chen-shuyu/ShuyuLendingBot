@@ -99,7 +99,7 @@ def load_rows(db_path: Path) -> Dict[str, Any]:
             ),
             "positions": rows("SELECT * FROM funding_positions WHERE currency = ?", CURRENCY),
             "offers": rows(
-                "SELECT created_at, rate, duration, amount, status FROM loan_offers "
+                "SELECT created_at, rate, duration, amount, status, offer_type FROM loan_offers "
                 "WHERE currency = ? AND status = 'submitted' ORDER BY created_at",
                 CURRENCY,
             ),

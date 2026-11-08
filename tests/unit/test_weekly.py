@@ -392,6 +392,79 @@ class TestRealOffers:
         assert weekly.periods_used(offers, START_MS, ms(FIRST, 8)) == {2: 1.0}
 
 
+class TestFrrOffers:
+    """FRR 實測中的掛單（D076 第三節）：rate 是偏移量，配不上部位的利率。"""
+
+    @staticmethod
+    def _row(created_at, period=30):
+        row = offer_row(created_at, annual=0.0, period=period)
+        row["offer_type"] = "FRRDELTAFIX"
+        return row
+
+    def test_靠天期與時間配上部位真正的利率來自部位(self):
+        positions = [position(annual=10.8, period=30, opened=iso(FIRST, 2), closed=iso(FIRST, 12))]
+        offer = weekly.real_offers([self._row(iso(FIRST, 1))], positions, END_MS, END_MS)[0]
+        assert offer.is_frr
+        assert offer.filled_at_ms == ms(FIRST, 2)
+        assert offer.hold_hours == 10.0
+        assert offer.fill_rate == pytest.approx(daily(10.8))
+        assert offer.filled_amount == 348.0
+
+    def test_別的天期的部位配不上(self):
+        positions = [position(annual=10.8, period=7, opened=iso(FIRST, 2), closed=iso(FIRST, 12))]
+        offer = weekly.real_offers([self._row(iso(FIRST, 1))], positions, END_MS, END_MS)[0]
+        assert offer.filled_at_ms is None
+
+    def test_舊列沒有類型就是一般單(self):
+        offer = weekly.real_offers([offer_row(iso(FIRST, 1))], [], END_MS, END_MS)[0]
+        assert not offer.is_frr
+
+    def test_FRR單不決定現行設定是哪個天期(self):
+        """🔴 D076 第三節的對照組是天期 7；拿 FRR 的天期 30 去跑模型定價就比錯對象了。"""
+        offers = weekly.real_offers([self._row(iso(FIRST, 1))], [], END_MS, END_MS)
+        assert weekly.periods_used(offers, START_MS, END_MS) == {}
+        config = {"strategy": {"offer_period": 7, "assumed_hold_hours": 12, "minimum_rate": 0.00013699}}
+        setting = weekly.default_setting(config, [self._row(iso(FIRST, 1))], [], START_MS, END_MS, END_MS)
+        assert setting.offer_period == 7
+
+    def test_重播裡照實際算而且佔住資金(self):
+        """逐筆規則管不到 FRR 單（D075），但錢借出去的那段不能再成交別的單。"""
+        positions = [position(annual=10.8, period=30, opened=iso(FIRST, 2), closed=iso(FIRST, 12))]
+        rows = [self._row(iso(FIRST, 1)), offer_row(iso(FIRST, 3), annual=6.0, period=7)]
+        offers = weekly.real_offers(rows, positions, END_MS, END_MS)
+        tape = build_tape([(1, ms(FIRST, 5), -1000.0, daily(7.0), 7)], lambda _moment: None)
+        got = weekly.replay_real_offers(tape, offers, positions, START_MS, END_MS, 348.0, 10.0, END_MS)
+        assert (got.fills, got.real_fills) == (0, 0)
+        assert got.net_pct == pytest.approx(10 / (7 * 24) * 10.8 * 0.85, abs=1e-6)
+
+    def test_實測中的週判準2與3不適用(self, first_week):
+        """判準 2、3 比的是模型定的價，這幾週跑的不是它，比了只會一直響。"""
+        rows = first_week["offers"] + [self._row(iso(date(2026, 10, 29), 5))]
+        setting = weekly.make_setting(7, 12.0, 0.00013699)
+        report = weekly.build_report(_inputs(first_week, offer_rows=rows, setting=setting))
+        labels = [check.label for check in report.checks]
+        assert "FRR 實測" in labels
+        assert "判準 2 現行設定" not in labels
+        assert "判準 3 上一版設定" not in labels
+        assert report.lost_to_previous is None
+        assert any("FRR 實測中" in caveat for caveat in report.caveats)
+        assert not report.action_required
+        frr_check = next(check for check in report.checks if check.label == "FRR 實測")
+        assert "不看單週" in frr_check.detail
+
+    def test_對照組不繼承週初的FRR部位(self, first_week):
+        """週初那筆 FRR 部位不是天期 7 掛的。"""
+        rows = [self._row(iso(FIRST - timedelta(days=1), 1))]
+        positions = [
+            position(annual=10.8, period=30, opened=iso(FIRST - timedelta(days=1), 2), closed=iso(LAST, 12))
+        ]
+        setting = weekly.make_setting(7, 12.0, 0.00013699)
+        report = weekly.build_report(
+            _inputs(first_week, offer_rows=rows, position_rows=positions, setting=setting)
+        )
+        assert report.current.net_pct < 1.0  # 不會憑空多一筆 10.8% 借滿一週
+
+
 class TestDefaultSetting:
     CONFIG = {"strategy": {"offer_period": 7, "assumed_hold_hours": 12, "minimum_rate": 0.00013699}}
 
@@ -567,6 +640,19 @@ class TestCheckLedger:
         check = weekly.check_ledger(got)
         assert check.level == weekly.LEVEL_WARNING
         assert check.action_required
+
+
+class TestCheckLedgerDuringFrr:
+    """D077：VAR 部位的利率跟著 FRR 動，部位推算只是近似。"""
+
+    def test_FRR實測的週只報不響(self):
+        check = weekly.check_ledger(actual(earned=8.0, positions=9.5), frr_active=True)
+        assert check.passed and not check.action_required
+        assert "只報不響" in check.summary
+
+    def test_一般的週照樣要響(self):
+        check = weekly.check_ledger(actual(earned=8.0, positions=9.5))
+        assert check.level == weekly.LEVEL_WARNING and check.action_required
 
 
 class TestCheckBackup:

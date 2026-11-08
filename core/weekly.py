@@ -42,6 +42,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from core import earnings, hold_time, tape as tape_module
 from core.tape import HOUR_MS, PathSummary, Tape
+from strategies.base import FRR_OFFER_TYPES, OFFER_TYPE_LIMIT
 from strategies.expected_value import ExpectedValueStrategy
 from utils import clock
 
@@ -293,6 +294,14 @@ class RealOffer:
     amount: float
     filled_at_ms: Optional[int] = None
     hold_hours: Optional[float] = None
+    offer_type: str = OFFER_TYPE_LIMIT
+    # 實際成交的金額與金額加權利率。FRR 單的 `rate` 是偏移量，真正的利率只有成交之後才知道。
+    filled_amount: float = 0.0
+    fill_rate: Optional[float] = None
+
+    @property
+    def is_frr(self) -> bool:
+        return self.offer_type in FRR_OFFER_TYPES
 
 
 def _position_span_ms(position: Dict[str, Any], now_ms: int) -> Optional[Tuple[int, int]]:
@@ -355,15 +364,20 @@ def real_offers(
             else horizon_ms
         )
         rate, period = float(row["rate"]), int(row["duration"])
+        offer_type = row.get("offer_type") or OFFER_TYPE_LIMIT
+        is_frr = offer_type in FRR_OFFER_TYPES
         fills = [
             (opened, closed, position)
             for opened, closed, position in spans
             if posted - 2000 <= opened < until
-            and abs(float(position.get("rate") or 0.0) - rate) < 2e-8
+            # FRR 單的 rate 是偏移量，配不上部位的利率，只能看天期與時間。
+            and (is_frr or abs(float(position.get("rate") or 0.0) - rate) < 2e-8)
             and int(position.get("period") or 0) == period
         ]
         filled_at = min((fill[0] for fill in fills), default=None)
         hold = None
+        total = 0.0
+        fill_rate = None
         if fills:
             # 拆單：用金額加權的持有時數，USD × 小時才對得上實際。
             total = sum(float(fill[2].get("amount") or 0.0) for fill in fills)
@@ -376,6 +390,12 @@ def real_offers(
                 if total
                 else 0.0
             )
+            fill_rate = (
+                sum(float(fill[2].get("rate") or 0.0) * float(fill[2].get("amount") or 0.0) for fill in fills)
+                / total
+                if total
+                else None
+            )
         offers.append(
             RealOffer(
                 posted_ms=posted,
@@ -385,6 +405,9 @@ def real_offers(
                 amount=float(row["amount"]),
                 filled_at_ms=filled_at,
                 hold_hours=hold,
+                offer_type=offer_type,
+                filled_amount=total,
+                fill_rate=fill_rate,
             )
         )
     return offers
@@ -394,6 +417,9 @@ def periods_used(offers: Sequence[RealOffer], start_ms: int, end_ms: int) -> Dic
     """窗內每個天期的掛單活了幾小時（成交之後不算），用來判斷這週實際跑的是哪個天期。"""
     used: Dict[int, float] = {}
     for offer in offers:
+        # FRR 單不是模型定的價，不能拿它來決定「現行設定」是哪個天期（D076 第三節的對照組是天期 7）。
+        if offer.is_frr:
+            continue
         stop = offer.filled_at_ms if offer.filled_at_ms is not None else offer.until_ms
         hours = (min(stop, end_ms) - max(offer.posted_ms, start_ms)) / HOUR_MS
         if hours > 0:
@@ -428,6 +454,7 @@ def replay_real_offers(
     - 重播的單不會因為真的那張成交了就消失，它一直活到下一張真單送出；
       規則比實際晚成交，後面的路徑就跟著偏掉，這正是要量的東西。
     - 第 k 次成交用第 k 筆實際持有；規則多成交出來的（實際沒有的）用 `fallback_hold_hours`。
+    - FRR 單不在逐筆規則管得到的範圍（D075），它的成交照實際算，只佔住資金。
     """
     fee = (100 - earnings.FUNDING_FEE_PCT) / 100
     usd_interest = usd_hours = 0.0
@@ -456,11 +483,17 @@ def replay_real_offers(
     holds = deque(
         offer.hold_hours
         for offer in in_window
-        if offer.filled_at_ms is not None and offer.filled_at_ms < end_ms
+        if offer.filled_at_ms is not None and offer.filled_at_ms < end_ms and not offer.is_frr
     )
     real_fills = len(holds)
     fills = 0
     for offer in in_window:
+        if offer.is_frr:
+            if offer.filled_at_ms is not None and offer.filled_at_ms < end_ms:
+                released = offer.filled_at_ms + int(offer.hold_hours * HOUR_MS)
+                book(offer.filled_amount, offer.fill_rate or 0.0, offer.filled_at_ms, released)
+                free_at = max(free_at, released)
+            continue
         begin = max(offer.posted_ms + 3000, free_at, start_ms)
         stop = min(offer.until_ms, end_ms)
         if begin >= stop:
@@ -558,6 +591,18 @@ def check_current(
     )
 
 
+def check_frr(actual: Actual, comparator: PathSummary, label: str) -> Check:
+    """FRR 實測中的週。**判定看累積，不看單週**（D076 第三節），所以這裡只報數字、不響。"""
+    gap = actual.earned_pct - comparator.net_pct
+    return Check(
+        "FRR 實測",
+        LEVEL_OK,
+        f"帳本實得 {actual.earned_pct:.2f}% 對 同期 {label} 模擬 {comparator.net_pct:.2f}%，差 {gap:+.2f}pp。"
+        "判定看累積（完成 2 筆或滿 45 天），不看單週",
+        f"對 {label} 模擬 {comparator.net_pct:.2f}%，差 {gap:+.2f}pp",
+    )
+
+
 def lost_to_previous(actual: Actual, previous: PathSummary) -> bool:
     return actual.earned_pct < previous.net_pct - PREVIOUS_TIE_PP
 
@@ -591,13 +636,24 @@ def check_previous(
     )
 
 
-def check_ledger(actual: Actual) -> Check:
-    """帳本與部位是兩條獨立的路：差太多就有一邊缺資料（D072 第五節）。"""
+def check_ledger(actual: Actual, frr_active: bool = False) -> Check:
+    """帳本與部位是兩條獨立的路：差太多就有一邊缺資料（D072 第五節）。
+
+    FRR 實測的週只報不響（D077）：VAR 部位的利率每天跟著 FRR 動，部位推算用的是成交當下的數字，
+    兩邊本來就會分開，響了也不是有東西壞掉。判定一律看帳本。
+    """
     gap = actual.earned_pct - actual.position_pct
     summary = f"差 {gap:+.2f}pp"
     head = f"帳本 {actual.earned_pct:.2f}% 對 部位推算 {actual.position_pct:.2f}%，差 {gap:+.2f}pp"
     if abs(gap) <= LEDGER_GAP_PP:
         return Check("帳本對部位", LEVEL_OK, f"{head}（≤ {LEDGER_GAP_PP}）", f"{summary} ✅")
+    if frr_active:
+        return Check(
+            "帳本對部位",
+            LEVEL_OK,
+            f"{head}（> {LEDGER_GAP_PP}），但這週有 FRR 浮動利率的部位，部位推算只是近似；判定看帳本",
+            f"{summary}（FRR 浮動，只報不響）",
+        )
     return Check(
         "帳本對部位",
         LEVEL_WARNING,
@@ -790,10 +846,14 @@ def build_report(inputs: WeeklyInputs) -> WeeklyReport:
             cap_hours=inputs.setting.offer_period * 24.0,
         )
 
+    frr_active = any(
+        offer.is_frr and offer.posted_ms < end_ms and offer.until_ms > start_ms for offer in offers
+    )
     # 現行設定：從真實的週初狀態開始（模組說明），因為週初那張單就是現行設定掛的。
+    # FRR 實測中例外：模擬是對照組（同期天期 7），週初那筆 FRR 部位不是它掛的。
     fallback_holds, holds_label = pick_holds(samples, inputs.setting.offer_period)
     current_prices = prices_for(inputs.setting)
-    carried = carried_in(positions, start_ms, capital, now_ms)
+    carried = None if frr_active else carried_in(positions, start_ms, capital, now_ms)
     current_evidence = inputs.tape.evidence(inputs.setting.offer_period)
     current = tape_module.across_starts(
         current_evidence,
@@ -811,6 +871,7 @@ def build_report(inputs: WeeklyInputs) -> WeeklyReport:
         if offer.filled_at_ms is not None
         and start_ms <= offer.filled_at_ms < end_ms
         and offer.hold_hours is not None
+        and not offer.is_frr
     ]
     current_actual_holds = tape_module.across_starts(
         current_evidence,
@@ -845,18 +906,23 @@ def build_report(inputs: WeeklyInputs) -> WeeklyReport:
     grid = {annual: fixed(annual) for annual in FIXED_GRID_ANNUAL}
     best_annual = max(grid, key=lambda annual: grid[annual].net_pct)
 
-    checks = [
-        check_ledger(actual),
-        check_replay(actual, replay),
-        check_current(actual, current, current_actual_holds, inputs.setting.label),
-    ]
+    checks = [check_ledger(actual, frr_active), check_replay(actual, replay)]
     lost = None
-    if previous is not None:
-        lost = lost_to_previous(actual, previous)
-        checks.append(check_previous(actual, previous, PREVIOUS_SETTING.label, inputs.lost_last_week))
+    if frr_active:
+        # 判準 2、3 比的是「模型定的價」：這幾週跑的不是它，比了只會一直響。
+        checks.append(check_frr(actual, current, inputs.setting.label))
+    else:
+        checks.append(check_current(actual, current, current_actual_holds, inputs.setting.label))
+        if previous is not None:
+            lost = lost_to_previous(actual, previous)
+            checks.append(
+                check_previous(actual, previous, PREVIOUS_SETTING.label, inputs.lost_last_week)
+            )
     checks.append(check_backup(inputs.backup_last_ok_at, now))
 
     caveats = list(inputs.caveats)
+    if frr_active:
+        caveats.append("FRR 實測中：判準 2、3 不適用，重播裡的 FRR 單照實際算")
     if len(used) > 1:
         detail = "、".join(f"天期 {period} {hours:.0f} 小時" for period, hours in sorted(used.items()))
         caveats.append(f"這週換過天期（掛單時間：{detail}），實際不是單一設定跑出來的")

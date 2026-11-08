@@ -21,8 +21,9 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from core import earnings, hold_time, market_snapshot
+from core import earnings, frr_test as frr_test_module, hold_time, market_snapshot
 from notify import messages
+from strategies.base import FRR_OFFER_TYPES, OfferPlan
 from utils import clock
 from utils.exceptions import FatalError, RetryableError, SkipCycleError
 
@@ -100,6 +101,7 @@ class BotEngine:
         queue_clear_usd_per_hour: float = 540_000.0,
         earnings_sync_hours: float = 6.0,
         idle_alert_hours: float = 12.0,
+        frr_test: Optional[frr_test_module.FrrTestConfig] = None,
     ):
         self.logger = logger
         self.notifier = notifier
@@ -120,6 +122,8 @@ class BotEngine:
         # 錢超過幾小時沒借出去就推一則（D074／待改⑧，使用者 2026-10-24 選 12）。
         # 0 或負數 = 關掉。理由與判準見 `_maybe_alert_idle()`。
         self.idle_alert_hours = float(idle_alert_hours)
+        # FRR 小額實測（D076 第三節）。關著的時候不碰任何一條路徑。
+        self.frr_test = frr_test or frr_test_module.FrrTestConfig()
         # 排隊的錢被吃掉的速率，用來把「前方多少錢」換算成「要等多久」
         # （見 `_cheaper_repost_is_not_worth_it`）。**只有一個校準樣本**，
         # 目前僅用於分母差異不大的比較，敏感度低；D032 會把它換成每輪自己算。
@@ -187,6 +191,13 @@ class BotEngine:
         # 而那些正好是「市場走弱、單子空掛」的輪次——也就是最需要留下市場長相的輪次。
         # 這是 D038 的同一課：閒置量測原本擺在提早 return 之後，於是永遠量不到閒置最久的那些輪。
         snapshot_id = self._record_market_snapshot(frr, book, trades, candles)
+
+        # FRR 實測走自己的路（D076 第三節）。放在市場落地之後：實測期間的行情一樣要留著。
+        # **一般路徑一行都不改**：實測關著或停了，這裡就是一個 None。
+        frr_state = self._frr_test_state()
+        if frr_state is not None:
+            self._run_frr_test_cycle(frr_state, existing, balance_usd, frr)
+            return
 
         # 掛在場上的錢也是我們的錢。只看 `get_available_balance()` 的話，單子一掛出去
         # 餘額就變成 0，策略會以為沒錢可放而回傳空計畫——於是每一輪都在「取消才有錢、
@@ -371,6 +382,143 @@ class BotEngine:
         # 每輪推一則的話不到兩天就把整個月的額度用光，之後真正的故障告警
         # 一則都送不出去（見 DECISIONS.md D024）。
         self.logger.info(f"本輪巡檢完成：掛出 {len(plans)} 筆，合計 {total_amount} USD")
+
+    def _frr_test_state(self) -> Optional[frr_test_module.FrrTestState]:
+        """實測正在跑就回傳狀態；沒開、已停、或狀態壞掉都是 None，走一般路徑。"""
+        if not self.frr_test.enabled:
+            return None
+        raw = self.repository.get_kv(frr_test_module.STATE_KEY)
+        if raw is None:
+            state = frr_test_module.FrrTestState(started_at=clock.now())
+            self.repository.set_kv(frr_test_module.STATE_KEY, state.to_json())
+            self.logger.info(f"FRR 實測開始：{self.frr_test}")
+            return state
+        try:
+            state = frr_test_module.FrrTestState.from_json(raw)
+        except ValueError as exc:
+            # 看不懂就不要拿真錢賭它還在跑。一般路徑是已知會動的那一條。
+            self.logger.warning(f"FRR 實測的狀態看不懂，走一般路徑：{exc}")
+            return None
+        return None if state.stopped_at else state
+
+    def _run_frr_test_cycle(self, state, existing, balance_usd, frr) -> None:
+        """實測中的一輪：該停就停；場上 FRR 單不動；錢回來就再掛一張。
+
+        🔴 **FRR 單絕不重掛**：排隊位置就是這個實測要量的東西，一般路徑的
+        `_plans_match()` 比的是利率，而 FRR 單的 rate 是偏移量，每輪都會判定「不一樣」。
+        所以不走那條路，而是自己一條短路徑，不去改那條路。
+        """
+        now = clock.now()
+        ours = [offer for offer in existing if offer.get("type") in FRR_OFFER_TYPES]
+        others = [offer for offer in existing if offer.get("type") not in FRR_OFFER_TYPES]
+        fills = frr_test_module.fills_since(
+            self.repository.all_positions("USD"), self.frr_test.period, state.started_at
+        )
+        created = [
+            datetime.fromtimestamp(offer["created_at_ms"] / 1000, clock.get_timezone())
+            for offer in ours
+            if offer.get("created_at_ms")
+        ]
+        stop = frr_test_module.decide_stop(
+            state.started_at, now, fills, min(created) if created else None
+        )
+        if stop is not None:
+            self._stop_frr_test(state, stop, existing, frr)
+            return
+
+        if others:
+            # 第一輪：場上是一般的單。跟一般路徑一樣，取消後要確定真的離場才動（D031）。
+            self.client.cancel_active_offers("USD")
+            time.sleep(self.cancel_settle_seconds)
+            still_live = self.client.get_active_offers("USD")
+            if still_live:
+                self.repository.save_state(
+                    last_frr=frr,
+                    last_action=f"FRR 實測：取消未生效，場上仍有 {len(still_live)} 筆掛單",
+                )
+                self._note_offers_unchanged(still_live)
+                raise SkipCycleError("FRR 實測：取消尚未生效，本輪不掛")
+            balance_usd = self.client.get_available_balance("USD")
+
+        plan = self._frr_test_plan(balance_usd)
+        if plan is None:
+            self.repository.save_state(
+                last_frr=frr,
+                last_action=f"FRR 實測：場上 {len(ours)} 筆，可用餘額 {balance_usd:.2f} USD 不夠再掛",
+            )
+            self._note_offers_unchanged(ours)
+            return
+
+        is_first_offer = self.repository.get_kv(self.FRR_STARTED_KEY) is None
+        try:
+            result = self.client.create_loan_offer(
+                plan.currency, plan.amount, plan.rate, plan.duration, offer_type=plan.offer_type
+            )
+        except FatalError as exc:
+            # 交易所拒單（例如偏移量 0 不被接受）：實測做不下去，但機器人不能為此停掉。
+            # 金鑰壞掉也會走到這裡，那種情況下一輪的一般路徑會再次遇到，照常停下來。
+            self.repository.record_offer_failure(plan, str(exc))
+            self._stop_frr_test(
+                state,
+                frr_test_module.Stop("rejected", f"交易所拒絕 FRR 單：{exc}", action_required=True),
+                [],
+                frr,
+            )
+            return
+        except (RetryableError, SkipCycleError) as exc:
+            self.repository.record_offer_failure(plan, str(exc))
+            self._offers_live = False
+            raise
+        self.logger.info(f"FRR 實測掛單結果：{result}")
+        self.repository.record_offer(plan, result)
+        if is_first_offer:
+            self.repository.set_kv(self.FRR_STARTED_KEY, now.isoformat())
+            self._push_trade_event(messages.frr_test_started(plan))
+            self._offers_live = True
+        else:
+            self._note_offers_placed(
+                [plan], isinstance(result, dict) and result.get("status") == "dry_run"
+            )
+        self.repository.save_state(
+            last_frr=frr,
+            last_action=f"FRR 實測：掛出 {plan.amount} USD、天期 {plan.duration} 天",
+        )
+
+    # 第一張 FRR 單送出去過沒。開始通知只推一次，重啟不重推。
+    FRR_STARTED_KEY = "frr_test_first_offer_at"
+
+    def _frr_test_plan(self, balance_usd: float) -> Optional[OfferPlan]:
+        """這一輪可以再掛多少。金額照策略的規則（風控上限、向下取到分位，D025）。"""
+        strategy = self.strategy
+        if balance_usd < strategy.min_required_usd:
+            return None
+        lendable = strategy._apply_lend_limit(balance_usd)
+        if lendable < strategy.min_loan_size_usd:
+            return None
+        return OfferPlan(
+            currency="USD",
+            amount=strategy._split_amount(lendable, 1)[0],
+            rate=self.frr_test.offset,
+            duration=self.frr_test.period,
+            offer_type=self.frr_test.offer_type,
+        )
+
+    def _stop_frr_test(self, state, stop, existing, frr) -> None:
+        """結束實測：先撤場上的單（撤不掉就丟例外，下一輪再來，狀態還沒寫），再記、再推。
+
+        這一輪不掛新單，下一輪走一般路徑。一般路徑看到還留在場上的 FRR 單會直接撤
+        （`_plans_match()`／`_cheaper_repost_is_not_worth_it()`），不會拿它去比價。
+        """
+        if existing:
+            self.client.cancel_active_offers("USD")
+            time.sleep(self.cancel_settle_seconds)
+        state.stopped_at = clock.now()
+        state.reason = stop.summary
+        self.repository.set_kv(frr_test_module.STATE_KEY, state.to_json())
+        self.logger.info(f"FRR 實測結束（{stop.code}）：{stop.summary}")
+        self._push_trade_event(messages.frr_test_stopped(stop.summary, stop.action_required))
+        self.repository.save_state(last_frr=frr, last_action=f"FRR 實測結束：{stop.summary}")
+        self._offers_live = False
 
     def _sync_positions(self) -> bool:
         """核對已借出部位，推出成交／收回通知。回傳「本輪是否偵測到新成交」。
@@ -930,6 +1078,10 @@ class BotEngine:
         if not existing or not plans:
             return None
 
+        # FRR 單的 rate 不是利率（D076），沒有「往下重掛划不划算」這回事，撤掉就對了。
+        if any(offer.get("type") in FRR_OFFER_TYPES for offer in existing):
+            return None
+
         live = min(existing, key=lambda offer: float(offer["rate"]))
         candidate = min(plans, key=lambda plan: plan.rate)
 
@@ -1070,6 +1222,10 @@ class BotEngine:
         這次會把排隊位置燒光。
         """
         if len(existing) != len(plans):
+            return False
+
+        # FRR 單的 rate 不是利率（D076）：實測結束後還留在場上的，一律當成不一樣，撤掉。
+        if any(offer.get("type") in FRR_OFFER_TYPES for offer in existing):
             return False
 
         existing_sorted = sorted(existing, key=lambda offer: float(offer["rate"]))

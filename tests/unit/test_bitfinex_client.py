@@ -475,6 +475,7 @@ class TestCancelActiveOffers:
             "symbol": "fUSD",
             "created_at_ms": 1787087004000,
             "amount": 150.5,
+            "type": "LIMIT",
             "rate": 0.00042,
             "period": 30,
         }
@@ -860,6 +861,7 @@ class TestGetActivePositions:
             "period": 2,
             "opened_at": 1788007933000,   # 2026-08-29T20:52:13+08:00
             "kind": "credit",
+            "rate_type": "FIXED",         # [8]：實打確認；FRR 浮動的部位是 VAR（D077）
         }]
 
     def test_real_credit_has_twenty_two_fields_with_rate_type(self):
@@ -951,6 +953,7 @@ class TestGetActiveOffers:
             "symbol": "fUSD",
             "created_at_ms": 1787989255000,
             "amount": 345.02,
+            "type": "LIMIT",           # [6]：實打確認，FRR 單靠這一欄認出來（D076）
             "rate": 0.0003,
             "period": 2,
         }]
@@ -1129,3 +1132,52 @@ class TestGetRateCandlesEnd:
         )
         candles = make_client(exchange).get_rate_candles("USD", period=7)
         assert [candle["mts"] for candle in candles] == [1, 2]
+
+
+class TestFrrOffer:
+    """FRR 單（D076 第三節）：`rate` 是偏移量。"""
+
+    @staticmethod
+    def _exchange():
+        return FakeExchange(private_post_auth_w_funding_offer_submit=make_submit_response())
+
+    def test_預設還是LIMIT而且參數跟以前一模一樣(self, make_client):
+        """🔴 這支是掛單路徑：一般掛單送出去的東西不能變。"""
+        exchange = self._exchange()
+        make_client(exchange).create_loan_offer("USD", 200.0, 0.0004, 2)
+        _, params = exchange.calls[0]
+        assert params == {
+            "type": "LIMIT",
+            "symbol": "fUSD",
+            "amount": "200.0",
+            "rate": "0.0004",
+            "period": 2,
+        }
+
+    def test_FRR單帶類型(self, make_client):
+        exchange = self._exchange()
+        make_client(exchange).create_loan_offer("USD", 348.11, 0.0, 30, offer_type="FRRDELTAFIX")
+        _, params = exchange.calls[0]
+        assert params["type"] == "FRRDELTAFIX"
+        assert params["rate"] == "0.00000000"
+        assert params["period"] == 30
+
+    def test_負的偏移量不能寫成科學記號(self, make_client):
+        """`str(-1e-05)` 是 `-1e-05`，交易所看不看得懂沒人保證。"""
+        exchange = self._exchange()
+        make_client(exchange).create_loan_offer("USD", 348.11, -0.00001, 30, offer_type="FRRDELTAFIX")
+        _, params = exchange.calls[0]
+        assert params["rate"] == "-0.00001000"
+
+    def test_dry_run不送出去(self, fake_logger):
+        result = BitfinexClient({}, fake_logger, dry_run=True).create_loan_offer(
+            "USD", 348.11, 0.0, 30, offer_type="FRRDELTAFIX"
+        )
+        assert result["status"] == "dry_run"
+
+    def test_場上掛單讀得出類型(self, make_client):
+        """一般路徑靠它認出 FRR 單，不拿它的 rate 去比價。"""
+        offer = make_offer_array()
+        offer[6] = "FRRDELTAFIX"
+        exchange = FakeExchange(private_post_auth_r_funding_offers_symbol=[offer])
+        assert make_client(exchange).get_active_offers("USD")[0]["type"] == "FRRDELTAFIX"

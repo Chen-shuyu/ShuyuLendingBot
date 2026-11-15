@@ -990,7 +990,10 @@ class BotEngine:
         if rate is None:
             self.logger.warning("近期成交樣本不足，無法算出常態成交價，本輪不掛單。")
             return
-        self.logger.info(f"市場常態成交價：{rate:.8f}/日（年化 {rate * 365 * 100:.2f}%）")
+        source = getattr(self.strategy, "last_market_rate_source", None)
+        # 同天期湊不到改看較短天期時要講出來（D078）：那時的下限是另一個市場的價格。
+        note = f"（同天期成交不夠，改看{source}的成交）" if source and source != "同天期" else ""
+        self.logger.info(f"市場常態成交價：{rate:.8f}/日（年化 {rate * 365 * 100:.2f}%）{note}")
 
     def _describe_queue(self, book, rate, period=None) -> Optional[Dict[str, Any]]:
         """向策略問排隊位置的原始回覆；策略沒有這個概念、或簿子是空的就回 `None`。

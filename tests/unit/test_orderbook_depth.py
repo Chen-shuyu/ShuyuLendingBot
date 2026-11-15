@@ -359,6 +359,44 @@ class TestMarketRate:
     def test_too_few_samples_means_no_answer(self, make_strategy):
         assert make_strategy().market_rate(market_trades(count=10)) is None
 
+
+class TestMarketRateFallback:
+    """D078：同天期湊不到 50 筆時，改看天期 ≤ 掛單天期的成交（能吃到這張單的那些）。
+
+    真實形狀（2026-11-15 18:32）：最新 1 萬筆涵蓋 8 小時，天期 2 約 4,900 筆（5.1%）、
+    天期 30 約 3,700 筆（11%）、天期 7 只有 28 筆。改之前天期 7 整輪不掛，錢就閒著。
+    """
+
+    def test_同天期湊得到就只看同天期行為不變(self, make_strategy):
+        """熱的時候天期 7 自己的價（10%）比天期 2（5%）高，下限照天期 7 自己的算。"""
+        trades = market_trades(rate=0.000137, count=60, period=2) + market_trades(rate=0.000274, count=60, period=7)
+        strategy = make_strategy(offer_period=7)
+        assert strategy.market_rate(trades) == pytest.approx(0.000274)
+        assert strategy.last_market_rate_source == "同天期"
+
+    def test_同天期湊不到就看天期2到7(self, make_strategy):
+        trades = market_trades(rate=0.000140, count=60, period=2) + market_trades(rate=0.000274, count=28, period=7)
+        strategy = make_strategy(offer_period=7)
+        rate = strategy.market_rate(trades)
+        assert rate == pytest.approx(0.000140, abs=0.000003)
+        assert strategy.last_market_rate_source == "天期 ≤ 7"
+
+    def test_比掛單天期長的成交不算(self, make_strategy):
+        """天期 30 的 11% 吃不到天期 7 的單，不能拿來當它的下限（會掛空）。"""
+        trades = market_trades(rate=0.000301, count=200, period=30) + market_trades(rate=0.000274, count=28, period=7)
+        strategy = make_strategy(offer_period=7)
+        assert strategy.market_rate(trades) is None
+        assert strategy.last_market_rate_source is None
+
+    def test_天期2的單沒有更短的可以看(self, make_strategy):
+        strategy = make_strategy(offer_period=2)
+        assert strategy.market_rate(market_trades(count=10, period=2) + market_trades(count=60, period=7)) is None
+
+    def test_窗外的舊成交照樣不算(self, make_strategy):
+        stale = [trade(-60 * 10 + index * 0.25, 0.00014, period=2) for index in range(60)]
+        strategy = make_strategy(offer_period=7, trade_window_hours=6)
+        assert strategy.market_rate(stale + market_trades(rate=0.000274, count=28, period=7)) is None
+
     def test_stale_trades_outside_the_window_are_dropped(self, make_strategy):
         """市場冷清時，半天前的成交不能拿來當「現在的價格」。"""
         stale = [trade(-60 * 10 + index * 0.25, 0.00025) for index in range(60)]

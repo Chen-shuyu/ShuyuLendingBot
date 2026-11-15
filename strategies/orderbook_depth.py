@@ -99,8 +99,10 @@ class OrderBookDepthStrategy(Strategy):
         # `market_floor_pct` 是「常態成交價的幾成」，1.0 = 完全不肯低於常態價。
         # 調低 = 更容易成交但可能賤賣；調高 = 守住價格但市場真的走低時會掛空。
         self.market_floor_pct = float(strategy_config.get("market_floor_pct", 0.85))
-        # 少於這麼多筆同天期成交就當樣本不足，本輪不掛（見 `market_rate()`）。
+        # 少於這麼多筆同天期成交就改看天期 ≤ 掛單天期的成交，還不夠才本輪不掛（見 `market_rate()`）。
         self.min_trade_samples = int(strategy_config.get("min_trade_samples", 50))
+        # 上一次 `market_rate()` 用的是哪一批成交（日誌用）；算不出來是 None。
+        self.last_market_rate_source: Optional[str] = None
         # 只採用最近這段時間的成交。市場冷清時一批成交可能橫跨大半天，
         # 那種舊資料拿來當「現在的價格」並不合適。
         self.trade_window_hours = float(strategy_config.get("trade_window_hours", 6))
@@ -227,7 +229,13 @@ class OrderBookDepthStrategy(Strategy):
         **只算同天期**：天期溢價非常大（2026-08-16 實測同一小時內，2 天期中位數
         0.000261、30 天期 0.000319、120 天期 0.000320）。混在一起會讓短天期的下限
         被長天期拉高，掛出去就是掛空——那正是 FRR 落後問題換個來源重演。
-        代價是天期冷門時樣本會不足，那時寧可不掛。
+
+        🔴 **同天期湊不到 `min_trade_samples` 筆時，改看天期 ≤ 掛單天期的成交**（D078，2026-11-15）。
+        原本是「寧可不掛」，而天期 7 在冷市場常常湊不到：10 月估計 9% 的時間、最長連續 14 小時掛不出單，
+        錢就閒著。能吃到這張單的借款人本來就是天期 ≤ N 的那些（D075：掃單照價格吃、跨天期），
+        所以它們的成交價就是這張單真正面對的市場；天期 2 的 6 小時窗從沒湊不到過。
+        方向跟上面那段擔心的相反（用較短的天期，下限只會比較低），賣便宜的風險由 `minimum_rate` 擋。
+        同天期湊得到的時候行為完全不變。
         """
         if not trades:
             return None
@@ -235,16 +243,21 @@ class OrderBookDepthStrategy(Strategy):
         latest_mts = max(int(trade["mts"]) for trade in trades)
         window_start = latest_mts - int(self.trade_window_hours * 3600 * 1000)
 
-        sample = [
-            (float(trade["rate"]), float(trade["amount"]))
+        recent = [
+            (int(trade["period"]), float(trade["rate"]), float(trade["amount"]))
             for trade in trades
-            if int(trade["period"]) == self.offer_period
-            and int(trade["mts"]) >= window_start
+            if int(trade["mts"]) >= window_start
             and float(trade["rate"]) > 0
             and float(trade["amount"]) > 0
         ]
+        sample = [(rate, amount) for period, rate, amount in recent if period == self.offer_period]
+        self.last_market_rate_source = "同天期"
         if len(sample) < self.min_trade_samples:
-            return None
+            sample = [(rate, amount) for period, rate, amount in recent if period <= self.offer_period]
+            self.last_market_rate_source = f"天期 ≤ {self.offer_period}"
+            if len(sample) < self.min_trade_samples:
+                self.last_market_rate_source = None
+                return None
 
         sample.sort()
         half = sum(amount for _, amount in sample) / 2

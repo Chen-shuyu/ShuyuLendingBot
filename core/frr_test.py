@@ -12,9 +12,13 @@
 |---|---|
 | 掛出後 10 天還沒成交 | 撤單、回天期 7，結論「排不到」 |
 | 連續兩筆都是「排隊 ≥ 3 天、持有 < 24 小時」 | 提前停 |
-| 其餘情況 | 跑到完成 2 筆或滿 45 天，停下來判定 |
+| 其餘情況 | **從第一張單起滿 14 天**，停下來判定 |
 
-**停了就是停了**：`bot_kv` 記著停止的時間，重啟不會重新開始；要再測一次得刻意清掉那個鍵。
+🔴 **第一輪（11-08）是「完成 2 筆或滿 45 天」，一天就停了**（D078）：當初以為 FRR 要排很久、一借好幾週，
+現實是排得快、還得快、馬上又借出去，兩筆一天就到。所以第二輪改看時間。
+
+**停了就是停了**：`bot_kv` 記著停止的時間，重啟不會重新開始。要再測一次就把設定檔的 `frr_test.run` 換一個值
+（第二輪是 `"2"`），**不手動改正式 DB**。
 """
 
 import json
@@ -31,8 +35,7 @@ QUEUE_LIMIT_DAYS = 10
 LONG_QUEUE_DAYS = 3
 SHORT_HOLD_HOURS = 24.0
 CONSECUTIVE_SHORT_FILLS = 2
-FILLS_TO_JUDGE = 2
-DAYS_TO_JUDGE = 45
+DAYS_TO_JUDGE = 14
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,8 @@ class FrrTestConfig:
     period: int = 30
     # 相對 FRR 的偏移量（日利率）。
     offset: float = 0.0
+    # 第幾輪。換一個值就是重新開始一輪實測（D078），舊的停止紀錄不會擋住它。
+    run: str = "1"
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "FrrTestConfig":
@@ -51,6 +56,7 @@ class FrrTestConfig:
             offer_type=str(section.get("offer_type", OFFER_TYPE_FRR_FIX)),
             period=int(section.get("period", 30)),
             offset=float(section.get("offset", 0.0)),
+            run=str(section.get("run", "1")),
         )
         if built.offer_type not in FRR_OFFER_TYPES:
             raise ValueError(f"frr_test.offer_type 只能是 {FRR_OFFER_TYPES}：{built.offer_type}")
@@ -67,11 +73,17 @@ class FrrTestState:
     started_at: datetime
     stopped_at: Optional[datetime] = None
     reason: Optional[str] = None
+    # 第一輪的紀錄沒有這兩個欄位：讀回來就是第 "1" 輪、不知道第一張單的時間。
+    run: str = "1"
+    # 第一張 FRR 單掛出的時間。14 天從這裡算起：打開開關時錢可能還借在別處（D077）。
+    first_offer_at: Optional[datetime] = None
 
     def to_json(self) -> str:
         return json.dumps(
             {
+                "run": self.run,
                 "started_at": self.started_at.isoformat(),
+                "first_offer_at": self.first_offer_at.isoformat() if self.first_offer_at else None,
                 "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
                 "reason": self.reason,
             },
@@ -88,6 +100,8 @@ class FrrTestState:
             started_at=started,
             stopped_at=hold_time.parse_moment(data.get("stopped_at")),
             reason=data.get("reason"),
+            run=str(data.get("run", "1")),
+            first_offer_at=hold_time.parse_moment(data.get("first_offer_at")),
         )
 
 
@@ -164,12 +178,12 @@ class Stop:
 
 
 def decide_stop(
-    started_at: datetime,
     now: datetime,
     fills: Sequence[Fill],
     offer_created_at: Optional[datetime],
+    first_offer_at: Optional[datetime],
 ) -> Optional[Stop]:
-    """該不該停。`offer_created_at`：場上那張 FRR 單掛出的時間，沒有就是 None。"""
+    """該不該停。`offer_created_at`：場上那張 FRR 單掛出的時間；`first_offer_at`：這一輪第一張單的時間。"""
     if offer_created_at is not None:
         waited = now - offer_created_at
         filled_after = any(fill.opened_at >= offer_created_at for fill in fills)
@@ -191,8 +205,10 @@ def decide_stop(
             f"{SHORT_HOLD_HOURS:.0f} 小時：利用率不到 25%，提前停",
         )
 
-    if len(completed) >= FILLS_TO_JUDGE:
-        return Stop("ready_to_judge", f"完成 {len(completed)} 筆，可以判定了", action_required=True)
-    if now - started_at >= timedelta(days=DAYS_TO_JUDGE):
-        return Stop("ready_to_judge", f"滿 {DAYS_TO_JUDGE} 天，可以判定了", action_required=True)
+    if first_offer_at is not None and now - first_offer_at >= timedelta(days=DAYS_TO_JUDGE):
+        return Stop(
+            "ready_to_judge",
+            f"滿 {DAYS_TO_JUDGE} 天（完成 {len(completed)} 筆），可以判定了",
+            action_required=True,
+        )
     return None

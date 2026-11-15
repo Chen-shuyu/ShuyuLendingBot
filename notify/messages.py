@@ -128,10 +128,12 @@ def format_plan_rate(plan: Any) -> str:
 
 
 def format_position_rate(item: Dict[str, Any]) -> str:
-    """部位的利率。VAR（FRR 浮動）部位的 rate 是什麼意思官方文件沒寫，不講成鎖定的利率（D077）。"""
+    """部位的利率。VAR（FRR 浮動）部位交易所回報 0，機器人改記成交時的 FRR（D078），不講成鎖定的利率。"""
     rate = float(item["rate"])
     if item.get("rate_type") == "VAR":
-        return f"跟著 FRR 浮動（交易所回報 {format_rate(rate)}）"
+        if rate > 0:
+            return f"跟著 FRR 浮動（成交時 FRR {format_rate(rate)}）"
+        return "跟著 FRR 浮動（交易所沒有回報利率）"
     return format_rate(rate)
 
 
@@ -509,7 +511,7 @@ def frr_test_started(plan: Any) -> str:
         "FRR 實測開始",
         {
             **_describe_offers([plan]),
-            "判準": "10 天沒成交就撤；連兩筆排隊 ≥ 3 天且持有 < 24 小時就停；否則 2 筆或 45 天後判定",
+            "判準": "10 天沒成交就撤；連兩筆排隊 ≥ 3 天且持有 < 24 小時就停；否則從這張單起滿 14 天判定",
         },
     )
 

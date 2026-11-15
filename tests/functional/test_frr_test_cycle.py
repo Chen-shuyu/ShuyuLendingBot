@@ -309,17 +309,35 @@ class TestStops:
         assert client.offers == []
         assert "提前停" in state_of(repository).reason
 
-    def test_完成2筆就停下來要人判定(self, fake_logger, fake_notifier, repository):
+    def test_從第一張單起滿14天就停下來要人判定(self, fake_logger, fake_notifier, repository):
         now = clock.now()
-        started = now - timedelta(days=30)
-        start_state(repository, started)
-        add_closed_position(repository, started + timedelta(days=1), started + timedelta(days=11), "1")
-        add_closed_position(repository, started + timedelta(days=12), started + timedelta(days=22), "2")
+        started = now - timedelta(days=15)
+        repository.set_kv(
+            frr_test.STATE_KEY,
+            FrrTestState(started_at=started, first_offer_at=started + timedelta(hours=10)).to_json(),
+        )
+        add_closed_position(repository, started + timedelta(days=1), started + timedelta(days=1, hours=8), "1")
+        add_closed_position(repository, started + timedelta(days=2), started + timedelta(days=2, hours=8), "2")
         client = FakeClient(balance=348.11)
         engine_for(fake_logger, fake_notifier, client, repository).run_once()
-        assert "可以判定了" in state_of(repository).reason
+        assert "滿 14 天" in state_of(repository).reason
         stopped = [message for message in fake_notifier.sent if "FRR 實測結束" in message]
         assert stopped[0].endswith("——— 需人工介入")
+
+    def test_一天兩筆不會讓實測停下來(self, fake_logger, fake_notifier, repository):
+        """🔴 D078：第一輪就是這樣停的。這一輪排得快、還得快，照樣繼續掛。"""
+        now = clock.now()
+        started = now - timedelta(days=1, hours=2)
+        repository.set_kv(
+            frr_test.STATE_KEY,
+            FrrTestState(started_at=started, first_offer_at=started + timedelta(hours=1)).to_json(),
+        )
+        add_closed_position(repository, started + timedelta(hours=4), started + timedelta(hours=20), "1")
+        add_closed_position(repository, started + timedelta(hours=20), started + timedelta(hours=25), "2")
+        client = FakeClient(balance=348.11)
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        assert state_of(repository).stopped_at is None
+        assert client.offers[0]["type"] == "FRRDELTAFIX"
 
     def test_實測之前的天期30舊部位不算(self, fake_logger, fake_notifier, repository):
         """D069 那一段的部位有好幾筆，算進來會第一輪就「完成 2 筆」。"""
@@ -347,6 +365,122 @@ class TestStops:
         client = FakeClient()
         engine_for(fake_logger, fake_notifier, client, repository).run_once()
         assert [offer["type"] for offer in client.offers] == ["LIMIT"]
+
+
+class TestRuns:
+    """D078：換一輪（設定檔的 `frr_test.run`）就重新開始，不手動改正式 DB。"""
+
+    STOPPED_RUN_1 = (
+        '{"started_at": "2026-11-08T20:29:27.422789+08:00", '
+        '"stopped_at": "2026-11-10T05:59:56.921436+08:00", "reason": "完成 2 筆，可以判定了"}'
+    )
+
+    def test_第一輪停了之後換成第2輪會重新開始(self, fake_logger, fake_notifier, repository):
+        repository.set_kv(frr_test.STATE_KEY, self.STOPPED_RUN_1)
+        client = FakeClient()
+        config = FrrTestConfig(enabled=True, offer_type="FRRDELTAVAR", period=30, offset=0.0, run="2")
+        engine_for(fake_logger, fake_notifier, client, repository, config).run_once()
+        state = state_of(repository)
+        assert state.run == "2" and state.stopped_at is None
+        assert state.first_offer_at is not None
+        assert client.offers[0]["type"] == "FRRDELTAVAR"
+        assert any("FRR 實測開始" in message for message in fake_notifier.sent)
+
+    def test_同一輪停了就不會重新開始(self, fake_logger, fake_notifier, repository):
+        repository.set_kv(frr_test.STATE_KEY, self.STOPPED_RUN_1)
+        client = FakeClient()
+        config = FrrTestConfig(enabled=True, offer_type="FRRDELTAVAR", period=30, offset=0.0, run="1")
+        engine_for(fake_logger, fake_notifier, client, repository, config).run_once()
+        assert [offer["type"] for offer in client.offers] == ["LIMIT"]
+
+    def test_錢還借在別處時不記第一張單的時間(self, fake_logger, fake_notifier, repository):
+        """14 天要從真的掛出 FRR 單那一刻算（D077 那次開關打開時錢還在天期 7）。"""
+        client = FakeClient(balance=0.48)
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        assert state_of(repository).first_offer_at is None
+        client.balance = 348.74
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        assert state_of(repository).first_offer_at is not None
+
+    def test_上一輪的成交不算進這一輪(self, fake_logger, fake_notifier, repository):
+        add_closed_position(repository, clock.now() - timedelta(days=6), clock.now() - timedelta(days=5), "1")
+        add_closed_position(repository, clock.now() - timedelta(days=5), clock.now() - timedelta(days=4), "2")
+        repository.set_kv(frr_test.STATE_KEY, self.STOPPED_RUN_1)
+        config = FrrTestConfig(enabled=True, offer_type="FRRDELTAVAR", period=30, offset=0.0, run="2")
+        client = FakeClient()
+        engine_for(fake_logger, fake_notifier, client, repository, config).run_once()
+        assert state_of(repository).stopped_at is None
+
+
+class TestVarRate:
+    """D078 實測：VAR 借款交易所回報利率 0。改記成交當下的 FRR（近似值，判定看帳本）。"""
+
+    @staticmethod
+    def _var_position(position_id="62487227", rate=0.0):
+        return {
+            "id": position_id,
+            "symbol": "fUSD",
+            "amount": 348.67,
+            "rate": rate,
+            "period": 30,
+            "opened_at": int(clock.now().timestamp() * 1000),
+            "kind": "loan",
+            "rate_type": "VAR",
+        }
+
+    def test_新的VAR部位記成當下的FRR(self, fake_logger, fake_notifier, repository):
+        client = FakeClient(balance=0.48)
+        client.get_active_positions = lambda _currency: [self._var_position()]
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        row = repository.connection.execute(
+            "SELECT rate, rate_type FROM funding_positions WHERE position_id = '62487227'"
+        ).fetchone()
+        assert row[0] == pytest.approx(daily(10.8))
+        assert row[1] == "VAR"
+        opened = [message for message in fake_notifier.sent if "資金已借出" in message]
+        assert "跟著 FRR 浮動（成交時 FRR" in opened[0]
+        assert "年化 0.00%" not in opened[0]
+
+    def test_交易所有回報利率就照它記(self, fake_logger, fake_notifier, repository):
+        client = FakeClient(balance=0.48)
+        client.get_active_positions = lambda _currency: [self._var_position(rate=0.00031)]
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        row = repository.connection.execute("SELECT rate FROM funding_positions").fetchone()
+        assert row[0] == pytest.approx(0.00031)
+
+    def test_查不到FRR也不能讓對帳失敗(self, fake_logger, fake_notifier, repository):
+        client = FakeClient(balance=0.48)
+        client.get_active_positions = lambda _currency: [self._var_position()]
+        calls = {"n": 0}
+        original = client.get_frr
+
+        def flaky(currency):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RetryableError("逾時")
+            return original(currency)
+
+        client.get_frr = flaky
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        row = repository.connection.execute("SELECT rate FROM funding_positions").fetchone()
+        assert row[0] == 0.0
+        assert any("查不到 FRR" in line for line in fake_logger.messages["warning"])
+
+    def test_一般部位不多打FRR(self, fake_logger, fake_notifier, repository):
+        client = FakeClient(balance=0.48)
+        position = self._var_position(rate=0.00027)
+        position.update({"rate_type": "FIXED", "period": 7, "kind": "credit"})
+        client.get_active_positions = lambda _currency: [position]
+        calls = {"n": 0}
+        original = client.get_frr
+
+        def counted(currency):
+            calls["n"] += 1
+            return original(currency)
+
+        client.get_frr = counted
+        engine_for(fake_logger, fake_notifier, client, repository).run_once()
+        assert calls["n"] == 1  # 只有 run_once 本來那一次
 
 
 class TestOfferFailure:

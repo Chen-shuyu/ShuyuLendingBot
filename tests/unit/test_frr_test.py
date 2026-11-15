@@ -36,9 +36,12 @@ class TestConfig:
 
     def test_讀設定(self):
         got = FrrTestConfig.from_config(
-            {"frr_test": {"enabled": True, "offer_type": "FRRDELTAVAR", "period": 60, "offset": 0.00001}}
+            {"frr_test": {"enabled": True, "offer_type": "FRRDELTAVAR", "period": 60, "offset": 0.00001, "run": 2}}
         )
-        assert got == FrrTestConfig(True, "FRRDELTAVAR", 60, 0.00001)
+        assert got == FrrTestConfig(True, "FRRDELTAVAR", 60, 0.00001, "2")
+
+    def test_沒寫第幾輪就是第1輪(self):
+        assert FrrTestConfig.from_config({"frr_test": {"enabled": True}}).run == "1"
 
     @pytest.mark.parametrize(
         "section",
@@ -59,8 +62,16 @@ class TestConfig:
 
 class TestState:
     def test_存進去讀得回來(self):
-        state = FrrTestState(started_at=START, stopped_at=days(3), reason="排不到")
+        state = FrrTestState(started_at=START, stopped_at=days(3), reason="排不到", run="2", first_offer_at=days(1))
         assert FrrTestState.from_json(state.to_json()) == state
+
+    def test_第一輪的舊紀錄讀得回來而且是第1輪(self):
+        """11-08 那一輪存的 JSON 沒有 run 與 first_offer_at。"""
+        raw = '{"started_at": "2026-11-08T20:29:27.422789+08:00", "stopped_at": "2026-11-10T05:59:56.921436+08:00", "reason": "完成 2 筆，可以判定了"}'
+        state = FrrTestState.from_json(raw)
+        assert state.run == "1"
+        assert state.first_offer_at is None
+        assert state.stopped_at is not None
 
     def test_還在跑的沒有停止時間(self):
         assert FrrTestState.from_json(FrrTestState(started_at=START).to_json()).stopped_at is None
@@ -134,6 +145,8 @@ class TestFillsSince:
 
 
 class TestDecideStop:
+    """D078：第二輪的停止條件。從第一張單起滿 14 天判定；10 天撤單與提前停不變。"""
+
     def fill(self, queue_days, hold_hours, opened=None):
         opened = opened or days(1)
         return frr_test.Fill(
@@ -144,29 +157,29 @@ class TestDecideStop:
         )
 
     def test_剛開始不停(self):
-        assert decide_stop(START, days(1), [], days(0)) is None
+        assert decide_stop(days(1), [], days(0), days(0)) is None
 
     def test_掛滿10天沒成交就停(self):
-        stop = decide_stop(START, days(10), [], days(0))
+        stop = decide_stop(days(10), [], days(0), days(0))
         assert stop.code == "queue_timeout"
         assert "排不到" in stop.summary
         assert not stop.action_required
 
     def test_差一點還不停(self):
-        assert decide_stop(START, days(9.9), [], days(0)) is None
+        assert decide_stop(days(9.9), [], days(0), days(0)) is None
 
     def test_10月最長空窗167小時不會誤殺(self):
         """D076：少於 7 天就判是不公平的，10 天留了餘裕。"""
-        assert decide_stop(START, START + timedelta(hours=167), [], days(0)) is None
+        assert decide_stop(START + timedelta(hours=167), [], days(0), days(0)) is None
 
     def test_掛單之後有成交過就不算排不到(self):
         """部分成交：剩下的那一點還在場上，但這張單已經證明排得到。"""
         fills = [frr_test.Fill(days(5), None, 120.0, None)]
-        assert decide_stop(START, days(11), fills, days(0)) is None
+        assert decide_stop(days(11), fills, days(0), days(0)) is None
 
     def test_連兩筆排隊久又持有短就提前停(self):
         fills = [self.fill(3, 23.9), self.fill(4, 2.0)]
-        stop = decide_stop(START, days(20), fills, None)
+        stop = decide_stop(days(10), fills, None, days(0))
         assert stop.code == "short_holds"
         assert not stop.action_required
 
@@ -176,8 +189,7 @@ class TestDecideStop:
         ids=["排隊不夠久", "持有夠長"],
     )
     def test_只要有一筆不是就不算提前停(self, first, second):
-        stop = decide_stop(START, days(20), [self.fill(*first), self.fill(*second)], None)
-        assert stop.code == "ready_to_judge"
+        assert decide_stop(days(10), [self.fill(*first), self.fill(*second)], None, days(0)) is None
 
     def test_判準的方向是對的(self):
         """🔴 D071／D072 的教訓：提前停要真的是不好的結果。
@@ -186,20 +198,23 @@ class TestDecideStop:
         assert utilization == 0.25
         assert utilization * 10.8 * 0.85 < 4.0
 
-    def test_完成2筆就該判定了要人看(self):
-        stop = decide_stop(START, days(20), [self.fill(1, 100), self.fill(1, 100)], None)
+    def test_第一輪那種一天兩筆的情況不會停(self):
+        """🔴 D078：第一輪「完成 2 筆就判定」一天就停了。排得快、還得快是好事，不是停下來的理由。"""
+        fills = [self.fill(0.14, 15.8), self.fill(0.0, 5.4)]
+        assert decide_stop(days(1), fills, None, days(0)) is None
+
+    def test_從第一張單起滿14天該判定了要人看(self):
+        fills = [self.fill(0.1, 10) for _ in range(20)]
+        stop = decide_stop(days(14), fills, None, days(0))
         assert stop.code == "ready_to_judge"
         assert stop.action_required
+        assert "滿 14 天（完成 20 筆）" in stop.summary
+        assert decide_stop(days(13.9), fills, None, days(0)) is None
 
-    def test_只完成1筆繼續跑(self):
-        assert decide_stop(START, days(20), [self.fill(1, 100)], None) is None
+    def test_14天從第一張單算不是從打開開關算(self):
+        """D077：打開開關時錢可能還借在別處，那段不算這一輪的時間。"""
+        assert decide_stop(days(14), [], None, days(2)) is None
+        assert decide_stop(days(16), [], None, days(2)).code == "ready_to_judge"
 
-    def test_還借著的不算完成(self):
-        fills = [self.fill(1, 100), frr_test.Fill(days(10), None, 24.0, None)]
-        assert decide_stop(START, days(20), fills, None) is None
-
-    def test_滿45天該判定了(self):
-        stop = decide_stop(START, days(45), [], None)
-        assert stop.code == "ready_to_judge"
-        assert "滿 45 天" in stop.summary
-        assert decide_stop(START, days(44.9), [], None) is None
+    def test_還沒掛出第一張單就不會因為時間停(self):
+        assert decide_stop(days(100), [], None, None) is None

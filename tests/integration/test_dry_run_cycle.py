@@ -109,6 +109,8 @@ class TestProjectConfig:
         釘住的理由跟上面一樣：要防的是沒有人注意到它被改了，不論往哪個方向。
         """
         assert config["frr_test"]["enabled"] is True
+        # D078：第二輪（第一輪一天就照「完成 2 筆」停了）。換值就是重新開始一輪。
+        assert str(config["frr_test"]["run"]) == "2"
         # D077：使用者選 VAR（官方文件的「FRR 單」；借款人沒理由提前還）。
         assert config["frr_test"]["offer_type"] == "FRRDELTAVAR"
         assert config["frr_test"]["period"] == 30

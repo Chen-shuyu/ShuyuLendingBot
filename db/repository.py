@@ -671,8 +671,8 @@ class Repository:
                     """
                     INSERT OR IGNORE INTO funding_positions
                         (position_id, currency, amount, rate, period, kind,
-                         opened_at, first_seen_at, closed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                         opened_at, first_seen_at, closed_at, rate_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (
                         str(position["id"]),
@@ -683,6 +683,7 @@ class Repository:
                         position.get("kind", "credit"),
                         _millis_to_iso(position.get("opened_at")),
                         timestamp,
+                        position.get("rate_type"),
                     ),
                 )
             for row in closed:

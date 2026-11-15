@@ -377,10 +377,16 @@ class TestFrrOfferMessages:
         assert "年化 0.00%" not in text
 
     def test_VAR部位不講成鎖定的利率(self):
-        """VAR 部位回報的 rate 是什麼意思官方文件沒寫（D077）。"""
+        """D078：交易所回報 0，機器人改記成交時的 FRR。"""
         position = {"amount": 348.6, "rate": 0.0003, "period": 30, "rate_type": "VAR"}
         text = messages.positions_opened([position])
-        assert "跟著 FRR 浮動（交易所回報 0.00030000/日（年化 10.95%））" in text
+        assert "跟著 FRR 浮動（成交時 FRR 0.00030000/日（年化 10.95%））" in text
+
+    def test_VAR部位沒有利率就講清楚(self):
+        position = {"amount": 348.6, "rate": 0.0, "period": 30, "rate_type": "VAR"}
+        text = messages.positions_opened([position])
+        assert "跟著 FRR 浮動（交易所沒有回報利率）" in text
+        assert "年化 0.00%" not in text
 
     def test_一般部位照舊(self):
         position = {"amount": 348.6, "rate": 0.0003, "period": 7, "rate_type": "FIXED"}

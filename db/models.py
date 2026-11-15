@@ -395,6 +395,8 @@ ADD_COLUMNS = (
     ("pricing_decisions", "pricing_knobs_json", "TEXT"),
     # 掛單類型（D076）：舊列的 NULL 就是 LIMIT，那時候只有這一種。
     ("loan_offers", "offer_type", "TEXT"),
+    # `FIXED` 或 `VAR`（FRR 浮動，D078）。舊列 NULL：那時候只有固定利率。
+    ("funding_positions", "rate_type", "TEXT"),
 )
 
 ALL_STATEMENTS = (

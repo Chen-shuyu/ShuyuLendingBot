@@ -388,17 +388,20 @@ class BotEngine:
         if not self.frr_test.enabled:
             return None
         raw = self.repository.get_kv(frr_test_module.STATE_KEY)
-        if raw is None:
-            state = frr_test_module.FrrTestState(started_at=clock.now())
+        state = None
+        if raw is not None:
+            try:
+                state = frr_test_module.FrrTestState.from_json(raw)
+            except ValueError as exc:
+                # 看不懂就不要拿真錢賭它還在跑。一般路徑是已知會動的那一條。
+                self.logger.warning(f"FRR 實測的狀態看不懂，走一般路徑：{exc}")
+                return None
+        if state is None or state.run != self.frr_test.run:
+            # 沒跑過，或設定檔換了一輪（D078）：上一輪的停止紀錄不擋這一輪。
+            state = frr_test_module.FrrTestState(started_at=clock.now(), run=self.frr_test.run)
             self.repository.set_kv(frr_test_module.STATE_KEY, state.to_json())
-            self.logger.info(f"FRR 實測開始：{self.frr_test}")
+            self.logger.info(f"FRR 實測開始（第 {state.run} 輪）：{self.frr_test}")
             return state
-        try:
-            state = frr_test_module.FrrTestState.from_json(raw)
-        except ValueError as exc:
-            # 看不懂就不要拿真錢賭它還在跑。一般路徑是已知會動的那一條。
-            self.logger.warning(f"FRR 實測的狀態看不懂，走一般路徑：{exc}")
-            return None
         return None if state.stopped_at else state
 
     def _run_frr_test_cycle(self, state, existing, balance_usd, frr) -> None:
@@ -420,7 +423,7 @@ class BotEngine:
             if offer.get("created_at_ms")
         ]
         stop = frr_test_module.decide_stop(
-            state.started_at, now, fills, min(created) if created else None
+            now, fills, min(created) if created else None, state.first_offer_at
         )
         if stop is not None:
             self._stop_frr_test(state, stop, existing, frr)
@@ -449,7 +452,7 @@ class BotEngine:
             self._note_offers_unchanged(ours)
             return
 
-        is_first_offer = self.repository.get_kv(self.FRR_STARTED_KEY) is None
+        is_first_offer = state.first_offer_at is None
         try:
             result = self.client.create_loan_offer(
                 plan.currency, plan.amount, plan.rate, plan.duration, offer_type=plan.offer_type
@@ -472,7 +475,9 @@ class BotEngine:
         self.logger.info(f"FRR 實測掛單結果：{result}")
         self.repository.record_offer(plan, result)
         if is_first_offer:
-            self.repository.set_kv(self.FRR_STARTED_KEY, now.isoformat())
+            # 14 天從這一刻算起；開始通知也只推這一次，重啟不重推。
+            state.first_offer_at = now
+            self.repository.set_kv(frr_test_module.STATE_KEY, state.to_json())
             self._push_trade_event(messages.frr_test_started(plan))
             self._offers_live = True
         else:
@@ -483,9 +488,6 @@ class BotEngine:
             last_frr=frr,
             last_action=f"FRR 實測：掛出 {plan.amount} USD、天期 {plan.duration} 天",
         )
-
-    # 第一張 FRR 單送出去過沒。開始通知只推一次，重啟不重推。
-    FRR_STARTED_KEY = "frr_test_first_offer_at"
 
     def _frr_test_plan(self, balance_usd: float) -> Optional[OfferPlan]:
         """這一輪可以再掛多少。金額照策略的規則（風控上限、向下取到分位，D025）。"""
@@ -536,6 +538,7 @@ class BotEngine:
         # **在這裡取是因為這一行已經跟交易所要過這份資料了**——為了同一個數字
         # 再打一次 API，是替報表向定價路徑借風險。
         self._position_usd = sum(float(item.get("amount") or 0.0) for item in positions)
+        self._fill_var_rates(positions)
         changes = self.repository.sync_positions("USD", positions)
 
         opened = changes["opened"]
@@ -557,6 +560,34 @@ class BotEngine:
             self._push_trade_event(messages.positions_closed(closed))
 
         return bool(opened)
+
+    def _fill_var_rates(self, positions) -> None:
+        """FRR 浮動（VAR）的新部位，交易所回報的利率是 0（D078 實測）：改記成交當下的 FRR。
+
+        **這是近似值**：VAR 的利率每天跟著 FRR 動，DB 只記第一次看到的那一刻。
+        判定一律看帳本（D076 第三節）；這個數字是為了通知與部位推算不要寫成「年化 0%」。
+        只有真的出現新的 VAR 部位才多打一次 FRR，一般掛單完全不受影響。
+        """
+        fresh = [
+            item
+            for item in positions
+            if item.get("rate_type") == "VAR" and not float(item.get("rate") or 0.0)
+        ]
+        if not fresh:
+            return
+        known = {str(row["position_id"]) for row in self.repository.open_positions("USD")}
+        fresh = [item for item in fresh if str(item["id"]) not in known]
+        if not fresh:
+            return
+        try:
+            frr = self.client.get_frr("USD")
+        except Exception as exc:  # noqa: BLE001 - 查不到就照交易所回報的記，不能讓對帳失敗
+            self.logger.warning(f"查不到 FRR，VAR 部位的利率照交易所回報記：{exc}")
+            return
+        if not frr or frr <= 0:
+            return
+        for item in fresh:
+            item["rate"] = frr
 
     def _log_hold_times(self, closed) -> None:
         """把剛收回的每一筆「實際借了多久」寫進日誌（見 DECISIONS.md D040）。
